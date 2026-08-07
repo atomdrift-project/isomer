@@ -1,0 +1,44 @@
+[package]
+name = "isomer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+description = "Supply-chain attack detection at a molecular level"
+repository = "https://codeberg.org/atomdrift/isomer"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+# default-features = false drops cleave's jemalloc default (matches scan).
+cleave = { path = "../cleave", default-features = false }
+# Same major as cleave's, so the theme's painters and our override agree on
+# one global colorize state.
+colored = "3.1"
+serde_json = "1"
+
+# atomdrift-scan (lib name `scan`) supplies the azoth ML model for risk
+# scoring each side of the diff, and will later drive purl/oci fetching,
+# bloom skipping, and hopper mirroring.
+atomdrift-scan = { path = "../scan" }
+
+[lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[patch.crates-io]
+# Mirrors cleave's patch section — patches only apply at the workspace root,
+# so isomer must carry them itself. tree-sitter 0.27 is unpublished
+# (crates.io tops out at 0.26.x) and cleave requires it; both tree-sitter
+# crates must come from the same source. Keep the rev in lockstep with
+# cleave/scan; remove when a crates.io release lands.
+wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
+tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
+tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }

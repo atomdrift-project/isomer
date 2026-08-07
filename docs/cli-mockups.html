@@ -1,0 +1,326 @@
+<title>isomer · CLI visual directions</title>
+
+<style>
+  /* ─ Tokens: theme-aware page chrome ─────────────────────────────── */
+  :root {
+    --bg: #eef2f2;
+    --surface: #ffffff;
+    --ink: #0f1a1e;
+    --muted: #566068;
+    --faint: #7c8890;
+    --line: #d7e0e0;
+    --brand: #067e6d;      /* teal, darkened for light ground */
+    --brand-soft: #e0f3ef;
+    --shadow: 0 1px 2px rgba(16,26,30,.06), 0 12px 30px rgba(16,26,30,.09);
+  }
+  :root:not([data-theme="light"]) {
+    @media (prefers-color-scheme: dark) {
+      --bg: #090c10;
+      --surface: #10161d;
+      --ink: #e9eff1;
+      --muted: #8d9aa2;
+      --faint: #67757d;
+      --line: #202b33;
+      --brand: #3dd4c0;
+      --brand-soft: #10261f;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 18px 44px rgba(0,0,0,.5);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #090c10;
+    --surface: #10161d;
+    --ink: #e9eff1;
+    --muted: #8d9aa2;
+    --faint: #67757d;
+    --line: #202b33;
+    --brand: #3dd4c0;
+    --brand-soft: #10261f;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 18px 44px rgba(0,0,0,.5);
+  }
+
+  /* ─ Terminal palette: fixed dark, both themes (terminals are dark) ─ */
+  :root {
+    --term-bg: #0b0f14;
+    --term-chrome: #161d25;
+    --term-edge: #232c35;
+    --term-ink: #ccd6dd;
+    --term-dim: #66757f;
+    --term-faint: #465059;
+    --hostile: #e0625f;
+    --suspicious: #ffb02e;
+    --notable: #38b6ff;
+    --baseline: #63c07a;
+    --brand-term: #3dd4c0;
+    --ink-on-hot: #120708;
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 1180px; margin: 0 auto; padding: clamp(28px, 5vw, 72px) clamp(18px, 4vw, 44px) 80px; }
+
+  /* ─ Masthead ─────────────────────────────────────────────────────── */
+  .eyebrow {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, monospace;
+    font-size: 12px; letter-spacing: .22em; text-transform: uppercase;
+    color: var(--brand); margin: 0 0 14px;
+  }
+  h1 {
+    font-size: clamp(30px, 5vw, 50px); line-height: 1.02; margin: 0 0 16px;
+    letter-spacing: -.02em; font-weight: 680; text-wrap: balance;
+  }
+  h1 .mono {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, monospace;
+    font-weight: 600; color: var(--brand);
+  }
+  .lede { max-width: 64ch; color: var(--muted); font-size: clamp(15px, 1.6vw, 18px); margin: 0; }
+  .lede b { color: var(--ink); font-weight: 620; }
+
+  .rule { height: 1px; background: var(--line); border: 0; margin: 34px 0 40px; }
+
+  /* ─ Mockup grid ──────────────────────────────────────────────────── */
+  .grid { display: grid; grid-template-columns: 1fr; gap: 40px; }
+  @media (min-width: 1080px) { .grid { grid-template-columns: 1fr 1fr; gap: 40px 36px; } }
+
+  figure { margin: 0; display: flex; flex-direction: column; gap: 16px; }
+  figure.hero { margin-top: 30px; }
+  .mono-in { font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--brand); font-size: .92em; }
+
+  .cap { display: flex; flex-direction: column; gap: 4px; }
+  .cap .n {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace;
+    font-size: 12px; letter-spacing: .16em; text-transform: uppercase; color: var(--faint);
+    display: flex; align-items: baseline; gap: 10px;
+  }
+  .cap .n b { color: var(--brand); font-weight: 700; }
+  .cap h2 { font-size: 20px; margin: 0; letter-spacing: -.01em; font-weight: 640; }
+  .cap p { margin: 2px 0 0; color: var(--muted); font-size: 14.5px; max-width: 52ch; }
+  .cap .aud { color: var(--faint); font-style: italic; }
+
+  /* ─ Terminal window ──────────────────────────────────────────────── */
+  .term {
+    background: var(--term-bg);
+    border: 1px solid var(--term-edge);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  .term .bar {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--term-chrome);
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--term-edge);
+  }
+  .term .bar i { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+  .dot-r { background: #ec6a5e; } .dot-y { background: #f4bf4f; } .dot-g { background: #61c554; }
+  .term .bar span {
+    margin-left: 8px;
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace;
+    font-size: 12px; color: var(--term-dim); letter-spacing: .02em;
+  }
+
+  pre.cli {
+    margin: 0; padding: 20px 20px 22px;
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, monospace;
+    font-size: 13px; line-height: 1.62;
+    color: var(--term-ink);
+    white-space: pre; overflow-x: auto;
+    font-variant-ligatures: none;
+    tab-size: 2;
+  }
+
+  /* CLI semantic spans */
+  .cli b   { font-weight: 700; }
+  .hot  { color: var(--hostile); }
+  .sus  { color: var(--suspicious); }
+  .not  { color: var(--notable); }
+  .base { color: var(--baseline); }
+  .brand{ color: var(--brand-term); }
+  .dim  { color: var(--term-dim); }
+  .faint{ color: var(--term-faint); }
+  .badge-hot {
+    background: var(--hostile); color: var(--ink-on-hot);
+    font-weight: 700; padding: 0 .6ch; border-radius: 3px;
+  }
+  .badge-out {
+    border: 1px solid var(--suspicious); color: var(--suspicious);
+    font-weight: 700; padding: 0 .5ch; border-radius: 3px;
+  }
+  .stamp {
+    color: var(--hostile); border: 1.5px solid var(--hostile);
+    font-weight: 700; padding: 1px .7ch; border-radius: 4px; letter-spacing: .08em;
+  }
+
+  footer { margin-top: 54px; color: var(--faint); font-size: 13.5px; }
+  footer code {
+    font-family: ui-monospace, Menlo, monospace; color: var(--brand);
+    background: var(--brand-soft); padding: 1px 6px; border-radius: 5px; font-size: 12.5px;
+  }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">isomer · terminal identity</p>
+  <h1>Four ways <span class="mono">isomer&nbsp;fs</span> could look<br>when it has something to say.</h1>
+  <p class="lede">isomer leads with <b>impact</b>, then proves it: the same context windows scan and cleave
+  render — hex for binaries, source for scripts — filtered to exactly the traits that appeared in the
+  diff. No second tool to investigate. Below the hero, four ways to treat the verdict header. Everything
+  here is real terminal output: 24-bit color, bold, background badges, box-drawing, hex dumps.</p>
+
+  <figure class="hero">
+    <div class="cap">
+      <div class="n"><b>◆</b> The full picture</div>
+      <h2>Impact up front — then the evidence</h2>
+      <p>What <span class="mono-in">isomer fs</span> prints today for the xz-utils backdoor. The verdict and
+      why it's disproportionate, then the actual backdoor bytes at their file offsets.</p>
+    </div>
+    <div class="term">
+      <div class="bar"><i class="dot-r"></i><i class="dot-y"></i><i class="dot-g"></i><span>isomer fs liblzma.so.5.4.5 liblzma.so.5.6.0</span></div>
+<pre class="cli"><span class="hot">●</span> <span class="hot"><b>HOSTILE</b></span>    <b>liblzma.so</b>   5.4.5 <span class="dim">→</span> 5.6.0   <span class="dim">minor bump</span>
+  <span class="sus">disproportionate — a minor bump gained a high-severity capability</span>
+
+  <span class="sus">●●</span>  <b>behavioral</b>  execution-hijack <span class="dim">—</span> gained an <span class="sus">ifunc resolver</span>
+                 <span class="dim">+runtime-linkage, hidden-byte-strings, xor-encoding (6 total)</span>
+  <span class="hot">●●●</span> <b>signature</b>   4 known-bad rules matched <span class="hot">(CVE-2024-3094)</span>
+
+  <span class="dim">deps 1→2 · init_array 2→1 · code</span> <span class="sus">+37%</span>
+
+  <span class="dim">evidence — where the change lives</span>
+
+ <span class="dim">47e9</span>   <span class="brand">41 5c c3 0f 1f 40 00 f3 0f 1e fa</span>  <span class="dim">A\...@.....</span>  <span class="hot">// liblzma backdoored</span>
+ <span class="dim">bda7</span>   <span class="brand">ff ff b9 12 00 00 00 4d 8b 6c 24</span>  <span class="dim">.......M.l$</span>  <span class="hot">// injected backdoor code</span>
+ <span class="dim">2bdd4</span>  <span class="brand">c6 0f 82 bb 03 00 00 48 bf 30 30</span>  <span class="dim">.......H.00</span>  <span class="hot">// liblzma backdoored</span>
+ <span class="dim">2ddf9</span>  <span class="brand">00 00 00 00 00 00 00 04 00 10 08</span>  <span class="dim">...........</span>  <span class="hot">// encoded strings</span></pre>
+    </div>
+  </figure>
+
+  <hr class="rule">
+
+  <p class="eyebrow" style="margin-bottom:6px">The verdict header · four treatments</p>
+  <p class="lede" style="margin-bottom:34px">Same finding, four ways to frame the top of the report. The evidence
+  block above sits beneath whichever you pick.</p>
+
+  <div class="grid">
+
+    <!-- ════ 1 · LAB REPORT ════ -->
+    <figure>
+      <div class="cap">
+        <div class="n"><b>01</b> Lab Report</div>
+        <h2>The bordered verdict card</h2>
+        <p>A framed certificate. Background-color badge, molecular delta, one boxed proportionality
+        callout, axis rows. <span class="aud">Reads clean in a CI log a CTO skims.</span></p>
+      </div>
+      <div class="term">
+        <div class="bar"><i class="dot-r"></i><i class="dot-y"></i><i class="dot-g"></i><span>isomer fs — liblzma</span></div>
+<pre class="cli"><span class="dim">╭─</span> <span class="brand">isomer</span> <span class="dim">──────────────────────────────────────────────╮</span>
+<span class="dim">│</span>  <span class="badge-hot"> HOSTILE </span>  <b>liblzma.so</b>   5.4.5 <span class="dim">→</span> 5.6.0   <span class="dim">⬆ minor</span>   <span class="dim">│</span>
+<span class="dim">│</span>  <span class="faint">H(Db)Md₃(BiBkHe)</span> <span class="brand">───▶</span> <span class="faint">…(BiBkHe)</span><span class="hot">Th₃</span>              <span class="dim">│</span>
+<span class="dim">├────────────────────────────────────────────────────┤</span>
+<span class="dim">│</span>  <span class="sus">⚠ DISPROPORTIONATE</span>                                <span class="dim">│</span>
+<span class="dim">│</span>  <span class="dim">a minor release added a high-severity capability</span>  <span class="dim">│</span>
+<span class="dim">│</span>                                                    <span class="dim">│</span>
+<span class="dim">│</span>  <span class="sus">●●</span>  <b>behavioral</b>  execution-hijack <span class="dim">·</span> <span class="sus">ifunc resolver</span>  <span class="dim">│</span>
+<span class="dim">│</span>      <span class="dim">+runtime-linkage +hidden-strings +xor  (6)</span>    <span class="dim">│</span>
+<span class="dim">│</span>  <span class="hot">●●●</span> <b>signature</b>   4 known-bad <span class="dim">·</span> <span class="hot">CVE-2024-3094</span>       <span class="dim">│</span>
+<span class="dim">│</span>  <span class="base">·</span>   <b>identity</b>    <span class="base">signer unchanged</span>                 <span class="dim">│</span>
+<span class="dim">├────────────────────────────────────────────────────┤</span>
+<span class="dim">│</span>  <span class="brand">Δ</span> <span class="dim">deps 1→2   ·   init_array 2→1   ·   code +37%</span>  <span class="dim">│</span>
+<span class="dim">╰────────────────────────────────────────────────────╯</span></pre>
+      </div>
+    </figure>
+
+    <!-- ════ 2 · REACTOR ════ -->
+    <figure>
+      <div class="cap">
+        <div class="n"><b>02</b> Reactor</div>
+        <h2>The instrument panel</h2>
+        <p>Every axis is a gauge. Block-char meters, emoji instruments, severity in word and length.
+        <span class="aud">Feels like monitoring; the bars pull the eye to what's hot.</span></p>
+      </div>
+      <div class="term">
+        <div class="bar"><i class="dot-r"></i><i class="dot-y"></i><i class="dot-g"></i><span>isomer fs — liblzma</span></div>
+<pre class="cli"> <span class="brand">🧬 isomer</span> <span class="dim">· differential scan</span>
+
+ <span class="dim">📦</span> <b>liblzma.so</b>          5.4.5 <span class="dim">→</span> 5.6.0   <span class="dim">minor</span>
+ <span class="hot">🔥 HOSTILE</span>   <span class="hot">██████████████████</span><span class="faint">░░</span>  <span class="sus">disproportionate</span>
+
+    <span class="dim">🧪 behavioral</span>  <span class="sus"><b>HIGH</b></span>      <span class="sus">██████████████</span><span class="faint">░░░░░░</span>
+       <span class="dim">execution-hijack ·</span> <span class="sus">ifunc resolver</span>
+    <span class="dim">🛰 signature</span>   <span class="hot"><b>CRIT</b></span>      <span class="hot">████████████████████</span>
+       <span class="dim">4 rules ·</span> <span class="hot">CVE-2024-3094</span>
+    <span class="dim">🔏 identity</span>    <span class="base"><b>OK</b></span>        <span class="faint">░░░░░░░░░░░░░░░░░░░░</span>
+       <span class="dim">signer unchanged</span>
+
+ <span class="dim">📈 deps 1→2 · init_array 2→1 · code</span> <span class="sus">+37%</span></pre>
+      </div>
+    </figure>
+
+    <!-- ════ 3 · INCIDENT BRIEF ════ -->
+    <figure>
+      <div class="cap">
+        <div class="n"><b>03</b> Incident Brief</div>
+        <h2>The analyst's note</h2>
+        <p>A sentence, then the smoking gun. Prose leads, the ifunc finding is called out by name with
+        its full trait id. <span class="aud">For the engineer who wants the story, not a table.</span></p>
+      </div>
+      <div class="term">
+        <div class="bar"><i class="dot-r"></i><i class="dot-y"></i><i class="dot-g"></i><span>isomer fs — liblzma</span></div>
+<pre class="cli"> <span class="brand">isomer</span> <span class="dim">── supply-chain differential</span>
+
+   <b>liblzma.so</b>   5.4.5 <span class="brand">──▶</span> 5.6.0   <span class="dim">· minor release ·</span>  <span class="stamp">HOSTILE</span>
+
+   <span class="hot">┃</span> <span class="dim">A compression library gained an</span> <span class="sus">execution-hijack</span>
+   <span class="hot">┃</span> <span class="dim">primitive in a minor bump — that is</span> <span class="sus">disproportionate</span><span class="dim">.</span>
+
+   <span class="sus">⌁ smoking gun</span>   an <b>ifunc resolver</b> appeared where none existed
+                 <span class="faint">binary/linking/runtime::</span><span class="sus">ifunc</span>            <span class="sus">●● high</span>
+
+   <span class="dim">also new</span>      <span class="dim">runtime-linkage · hidden-byte-strings · xor-encoding</span>
+   <span class="dim">confirmed</span>     4 known xz-backdoor rules · <span class="hot">CVE-2024-3094</span>   <span class="hot">●●● crit</span>
+   <span class="dim">unchanged</span>    <span class="base">signer / publisher</span>
+
+   <span class="faint">evidence</span>     <span class="dim">code</span> <span class="sus">+37%</span> <span class="dim">· new loader dep · init_array 2→1</span></pre>
+      </div>
+    </figure>
+
+    <!-- ════ 4 · MINIMAL ════ -->
+    <figure>
+      <div class="cap">
+        <div class="n"><b>04</b> Isotope</div>
+        <h2>Restraint as signal</h2>
+        <p>Mostly negative space. One large verdict, one line of why, the two facts that matter.
+        <span class="aud">Silence when clean makes the loud moments land harder.</span></p>
+      </div>
+      <div class="term">
+        <div class="bar"><i class="dot-r"></i><i class="dot-y"></i><i class="dot-g"></i><span>isomer fs — liblzma</span></div>
+<pre class="cli">   <span class="dim">liblzma.so</span>
+   <span class="dim">5.4.5 → 5.6.0 · minor</span>
+
+
+   <span class="hot"><b>HOSTILE</b></span>
+   <span class="sus">disproportionate for a minor release</span>
+
+
+   <span class="dim">ifunc resolver appeared</span>        <span class="sus">●● high</span>
+   <span class="dim">4 known-bad signatures</span>         <span class="hot">●●● crit</span>
+   <span class="faint">CVE-2024-3094</span>
+
+   <span class="faint">──────────────────────────</span>
+   <span class="dim">code +37%   init_array 2→1   deps 1→2</span></pre>
+      </div>
+    </figure>
+
+  </div>
+
+  <footer>
+    Same engine, four faces. Whichever you pick becomes the <code>--format terminal</code> default;
+    the others stay one flag away. Clean diffs still print nothing at all.
+  </footer>
+</div>
