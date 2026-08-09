@@ -1,0 +1,133 @@
+<title>isomer · risk delta — 3 spins</title>
+
+<style>
+  :root {
+    --bg:#eef2f2; --surface:#fff; --ink:#0f1a1e; --muted:#54606a; --faint:#7c8890;
+    --line:#d7e0e0; --brand:#0a8f9c; --brand-soft:#dff2f3;
+    --shadow: 0 1px 2px rgba(16,26,30,.06), 0 14px 34px rgba(16,26,30,.10);
+  }
+  :root:not([data-theme="light"]) { @media (prefers-color-scheme: dark) {
+    --bg:#090c10; --surface:#10161d; --ink:#e9eff1; --muted:#8d9aa2; --faint:#67757d;
+    --line:#202b33; --brand:#3ad0d8; --brand-soft:#0c2427;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 18px 44px rgba(0,0,0,.5);
+  } }
+  :root[data-theme="dark"] {
+    --bg:#090c10; --surface:#10161d; --ink:#e9eff1; --muted:#8d9aa2; --faint:#67757d;
+    --line:#202b33; --brand:#3ad0d8; --brand-soft:#0c2427;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 18px 44px rgba(0,0,0,.5);
+  }
+  :root {
+    --term-bg:#0b0f14; --ink0:#cdd6dd; --dim:#66757f; --faint2:#455059;
+    --hostile:#e0625f; --suspicious:#ffb02e; --notable:#38b6ff; --baseline:#63c07a;
+    --cyan:#3ecfd6; --slate:#5f7488;
+    --mono: ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,monospace;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; line-height:1.55; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:960px; margin:0 auto; padding:clamp(28px,5vw,68px) clamp(18px,4vw,40px) 80px; }
+  .eyebrow { font-family:var(--mono); font-size:12px; letter-spacing:.22em; text-transform:uppercase; color:var(--brand); margin:0 0 14px; }
+  h1 { font-size:clamp(28px,4.6vw,42px); line-height:1.05; margin:0 0 15px; letter-spacing:-.02em; font-weight:660; text-wrap:balance; }
+  .lede { max-width:66ch; color:var(--muted); font-size:clamp(15px,1.6vw,17.5px); margin:0; }
+  .lede b { color:var(--ink); font-weight:620; }
+  .rule { height:1px; background:var(--line); border:0; margin:30px 0 0; }
+  .stack { display:flex; flex-direction:column; gap:40px; margin-top:38px; }
+  figure { margin:0; display:flex; flex-direction:column; gap:13px; }
+  .cap .n { font-family:var(--mono); font-size:12px; letter-spacing:.16em; text-transform:uppercase; color:var(--faint); display:flex; gap:10px; align-items:baseline; }
+  .cap .n b { color:var(--brand); font-weight:700; }
+  .cap h2 { font-size:20px; margin:5px 0 0; letter-spacing:-.01em; font-weight:640; }
+  .cap p { margin:3px 0 0; color:var(--muted); font-size:14.5px; max-width:64ch; }
+  .cap .who { color:var(--brand); font-weight:600; }
+
+  .term { background:var(--term-bg); border:1px solid #222b34; border-radius:12px; overflow:hidden; box-shadow:var(--shadow); }
+  .bar { display:flex; align-items:center; gap:8px; background:#161d25; padding:10px 14px; border-bottom:1px solid #222b34; }
+  .bar i { width:11px; height:11px; border-radius:50%; }
+  .r{background:#ec6a5e;} .y{background:#f4bf4f;} .grn{background:#61c554;}
+  .bar span { margin-left:8px; font-family:var(--mono); font-size:12px; color:var(--dim); }
+  .screen { padding:18px 22px; font-family:var(--mono); font-size:13px; line-height:1.75; color:var(--ink0); overflow-x:auto; white-space:pre; }
+  .ico { display:inline-block; width:2.2ch; }
+  .badge { font-weight:700; color:#fff; background:#b8302f; padding:1px .6ch; border-radius:3px; }
+  b.w{color:#eef3f5;font-weight:700;}
+  .hot{color:var(--hostile);} .sus{color:var(--suspicious);} .not{color:var(--notable);}
+  .base{color:var(--baseline);} .cy{color:var(--cyan);} .dim{color:var(--dim);} .fnt{color:var(--faint2);} .slate{color:var(--slate);}
+  .bignew{color:var(--hostile);font-weight:700;font-size:1.05em;}
+
+  footer{margin-top:52px;color:var(--faint);font-size:13.5px;}
+  footer code{font-family:var(--mono);color:var(--brand);background:var(--brand-soft);padding:1px 6px;border-radius:5px;font-size:12.5px;}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">isomer · masthead · risk delta</p>
+  <h1>Make the jump the point, not the floor.</h1>
+  <p class="lede">The single bar read as "risk is 0.40". These three make the <b>new value and its severity</b>
+  the loudest thing and the <b>change</b> unmistakable — for node-ipc, <b>0.40 → 0.97</b>, a jump from
+  <span style="color:#ffb02e">elevated</span> to <span style="color:#e0625f">malware</span>. Shown in the
+  masthead so you can judge them in place.</p>
+
+  <hr class="rule">
+
+  <div class="stack">
+
+    <!-- 1 · TWIN BARS -->
+    <figure>
+      <div class="cap">
+        <div class="n"><b>1</b> Twin bars · was / now</div>
+        <h2>Both levels, stacked and labeled</h2>
+        <p>Two bars, <span style="color:#e0625f">now</span> beneath <span class="dim">was</span>. You see the
+        old floor and the new height, each with its severity word. Unambiguous — costs one extra line.
+        <span class="who">Clearest for a review.</span></p>
+      </div>
+      <div class="term">
+        <div class="bar"><i class="r"></i><i class="y"></i><i class="grn"></i><span>twin bars</span></div>
+<div class="screen"> <span class="badge"> HOSTILE </span>  <b class="w">node-ipc</b>   <span class="dim">12.0.0 → 12.0.1 · patch release</span>
+ <span class="ico">✨</span><span class="cy">Supply chain compromise with data stealer payload</span>
+ <span class="ico">📊</span><span class="dim">malware risk</span>
+    <span class="dim">was  0.40</span>  <span class="sus">████████</span><span class="fnt">░░░░░░░░░░░░</span>  <span class="sus">elevated</span>
+    <span class="dim">now</span>  <span class="hot"><b>0.97</b></span>  <span class="hot">███████████████████</span><span class="fnt">░</span>  <span class="hot"><b>malware</b></span>   <span class="hot">▲ +0.57</span></div>
+      </div>
+    </figure>
+
+    <!-- 2 · GROWTH BAR -->
+    <figure>
+      <div class="cap">
+        <div class="n"><b>2</b> Growth bar · the jump in red</div>
+        <h2>One bar, the increase colored</h2>
+        <p>A single bar filled to <span style="color:#e0625f">0.97</span>: the old <span class="not">0.40</span>
+        base in blue, the <span style="color:#e0625f">+0.57 jump</span> in red — so the alarming part is
+        literally the red stretch. One line. <span class="who">Densest, still obvious.</span></p>
+      </div>
+      <div class="term">
+        <div class="bar"><i class="r"></i><i class="y"></i><i class="grn"></i><span>growth bar</span></div>
+<div class="screen"> <span class="badge"> HOSTILE </span>  <b class="w">node-ipc</b>   <span class="dim">12.0.0 → 12.0.1 · patch release</span>
+ <span class="ico">✨</span><span class="cy">Supply chain compromise with data stealer payload</span>
+ <span class="ico">📊</span><span class="dim">malware risk</span>  <span class="not">0.40</span> <span class="fnt">▏</span><span class="not">████████</span><span class="hot">███████████</span><span class="fnt">░</span><span class="fnt">▏</span> <span class="hot"><b>0.97</b></span>   <span class="hot">▲ +0.57</span>
+              <span class="fnt">                 └ was          └─ jumped ─┘</span></div>
+      </div>
+    </figure>
+
+    <!-- 3 · DANGER SCALE -->
+    <figure>
+      <div class="cap">
+        <div class="n"><b>3</b> Danger scale · markers on an axis</div>
+        <h2>Where it moved on a benign→malware line</h2>
+        <p>A fixed axis from benign to malware with two markers — <span class="dim">○ was</span> at 0.40,
+        <span class="hot">● now</span> at 0.97 — so the reader sees the distance travelled and which band it
+        landed in. <span class="who">Best sense of "how bad".</span></p>
+      </div>
+      <div class="term">
+        <div class="bar"><i class="r"></i><i class="y"></i><i class="grn"></i><span>danger scale</span></div>
+<div class="screen"> <span class="badge"> HOSTILE </span>  <b class="w">node-ipc</b>   <span class="dim">12.0.0 → 12.0.1 · patch release</span>
+ <span class="ico">✨</span><span class="cy">Supply chain compromise with data stealer payload</span>
+ <span class="ico">📊</span><span class="dim">malware risk</span>   <span class="base">benign</span> <span class="fnt">▏</span><span class="base">────</span><span class="sus">○</span><span class="sus">───────────</span><span class="hot">──────</span><span class="hot">●</span><span class="fnt">▏</span> <span class="hot">malware</span>
+ <span class="dim">                       0.40 was                    0.97 now   ▲ +0.57</span></div>
+      </div>
+    </figure>
+
+  </div>
+
+  <footer>
+    All three lead with the new number and its word (<span class="hot">0.97 · malware</span>) and state the
+    delta (<span class="hot">▲ +0.57</span>); they differ in whether the old value is a second bar, a blue base
+    segment, or a marker on a scale. Pick one for <code>--format terminal</code>.
+  </footer>
+</div>

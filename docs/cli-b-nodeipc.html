@@ -1,0 +1,148 @@
+<title>isomer · Design B on node-ipc</title>
+
+<style>
+  :root {
+    --bg:#eef2f2; --surface:#fff; --ink:#0f1a1e; --muted:#54606a; --faint:#7c8890;
+    --line:#d7e0e0; --brand:#0a8f9c; --brand-soft:#dff2f3;
+    --shadow: 0 1px 2px rgba(16,26,30,.06), 0 14px 34px rgba(16,26,30,.10);
+  }
+  :root:not([data-theme="light"]) { @media (prefers-color-scheme: dark) {
+    --bg:#090c10; --surface:#10161d; --ink:#e9eff1; --muted:#8d9aa2; --faint:#67757d;
+    --line:#202b33; --brand:#3ad0d8; --brand-soft:#0c2427;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 18px 44px rgba(0,0,0,.5);
+  } }
+  :root[data-theme="dark"] {
+    --bg:#090c10; --surface:#10161d; --ink:#e9eff1; --muted:#8d9aa2; --faint:#67757d;
+    --line:#202b33; --brand:#3ad0d8; --brand-soft:#0c2427;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 18px 44px rgba(0,0,0,.5);
+  }
+  :root {
+    --term-bg:#0b0f14; --ink0:#cdd6dd; --dim:#66757f; --faint2:#455059;
+    --hostile:#e0625f; --suspicious:#ffb02e; --notable:#38b6ff; --baseline:#63c07a;
+    --cyan:#3ecfd6; --slate:#5f7488;
+    --mono: ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,monospace;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; line-height:1.55; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:980px; margin:0 auto; padding:clamp(28px,5vw,68px) clamp(18px,4vw,40px) 80px; }
+  .eyebrow { font-family:var(--mono); font-size:12px; letter-spacing:.22em; text-transform:uppercase; color:var(--brand); margin:0 0 14px; }
+  h1 { font-size:clamp(28px,4.6vw,42px); line-height:1.05; margin:0 0 15px; letter-spacing:-.02em; font-weight:660; text-wrap:balance; }
+  .lede { max-width:66ch; color:var(--muted); font-size:clamp(15px,1.6vw,17.5px); margin:0; }
+  .lede b { color:var(--ink); font-weight:620; }
+  .rule { height:1px; background:var(--line); border:0; margin:30px 0 34px; }
+  h3.sec { font-size:12px; letter-spacing:.18em; text-transform:uppercase; color:var(--faint); font-family:var(--mono); margin:38px 0 12px; }
+  .note { color:var(--muted); font-size:14.5px; max-width:64ch; margin:0 0 14px; }
+  .note b { color:var(--ink); }
+
+  /* ── terminal ── */
+  .term { background:var(--term-bg); border:1px solid #222b34; border-radius:12px; overflow:hidden; box-shadow:var(--shadow); }
+  .bar { display:flex; align-items:center; gap:8px; background:#161d25; padding:10px 14px; border-bottom:1px solid #222b34; }
+  .bar i { width:11px; height:11px; border-radius:50%; }
+  .r{background:#ec6a5e;} .y{background:#f4bf4f;} .grn{background:#61c554;}
+  .bar span { margin-left:8px; font-family:var(--mono); font-size:12px; color:var(--dim); }
+  .screen { padding:20px 22px; font-family:var(--mono); font-size:13px; line-height:1.65; color:var(--ink0); overflow-x:auto; }
+
+  /* fixed-width emoji cell so ✨ and 📊 line up with each other */
+  .ico { display:inline-block; width:2.2ch; }
+  .badge { font-weight:700; color:#fff; background:#b8302f; padding:1px .6ch; border-radius:3px; }
+  b.w { color:#eef3f5; font-weight:700; }
+  .hot{color:var(--hostile);} .sus{color:var(--suspicious);} .not{color:var(--notable);}
+  .base{color:var(--baseline);} .cy{color:var(--cyan);} .dim{color:var(--dim);} .fnt{color:var(--faint2);} .slate{color:var(--slate);}
+
+  .mast { display:flex; flex-direction:column; gap:2px; margin-bottom:6px; }
+  .mast .row { display:flex; align-items:baseline; gap:1ch; white-space:nowrap; }
+  .gauge { letter-spacing:-.5px; }
+
+  hr.hair { border:0; border-top:1px solid #223; margin:10px 0; }
+
+  /* ── the one detail grid: pill · dots · name · locator ── */
+  .grid { display:grid; grid-template-columns: 11ch 3ch 21ch 1fr; align-items:baseline; row-gap:2px; column-gap:1ch; }
+  .grid .pill { justify-self:start; align-self:baseline; font-weight:700; color:#fff; border-radius:3px; padding:1px 0; width:10ch; text-align:center; font-size:12px; }
+  .p-plum{background:#3c1e4b;} .p-hot{background:#7f2b2b;} .p-teal{background:#0c3f3a;} .p-ocean{background:#0c3a4b;}
+  .grid .dots { white-space:pre; }
+  .grid .name { color:#dbe3e8; }
+  .grid .loc  { color:var(--dim); }
+  .grid .span2 { grid-column: 3 / 5; }
+  .grid .count { color:inherit; }
+
+  /* ── evidence: its own line · code · note grid ── */
+  .evhead { display:flex; gap:1ch; align-items:baseline; margin:6px 0 4px; }
+  .ev { display:grid; grid-template-columns: 6ch minmax(0,1fr) 26ch; column-gap:2ch; row-gap:3px; align-items:baseline; }
+  .ev .ln { color:var(--faint2); text-align:right; }
+  .ev .code { color:var(--ink0); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ev .desc { color:var(--dim); }
+
+  footer{margin-top:52px;color:var(--faint);font-size:13.5px;}
+  footer code{font-family:var(--mono);color:var(--brand);background:var(--brand-soft);padding:1px 6px;border-radius:5px;font-size:12.5px;}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">isomer · design B · node-ipc</p>
+  <h1>Design B, on grid, on a real case.</h1>
+  <p class="lede">The pill layout applied to <b>node-ipc 12.0.0 → 12.0.1</b> — richer than xz: four new
+  capability classes, two expanded, six signatures, archive evidence, and <b>no metrics or identity</b> (a
+  multi-file diff with no publisher change), so you can see it stay tidy when sections drop out. Built with a
+  real grid, so every column actually lines up.</p>
+
+  <hr class="rule">
+
+  <div class="term">
+    <div class="bar"><i class="r"></i><i class="y"></i><i class="grn"></i><span>isomer fs node-ipc-12.0.0.tgz node-ipc-12.0.1.tgz</span></div>
+    <div class="screen">
+
+      <div class="mast">
+        <div class="row"><span class="badge">&nbsp;HOSTILE&nbsp;</span>&nbsp;<b class="w">node-ipc</b><span class="dim">&nbsp;&nbsp;12.0.0 → 12.0.1 · patch release · 3 of 14 files</span></div>
+        <div class="row"><span class="ico">✨</span><span class="cy">Supply chain compromise with data stealer payload</span></div>
+        <div class="row"><span class="ico">📊</span><span class="dim">malware risk</span>&nbsp;&nbsp;<span class="base">0.40</span>&nbsp;<span class="fnt">▏</span><span class="sus">░░░░░</span><span class="hot">███████████████</span><span class="fnt">▏</span>&nbsp;<span class="hot"><b>0.97</b></span>&nbsp;&nbsp;<span class="hot">▲ +0.57</span></div>
+      </div>
+
+      <hr class="hair">
+
+      <div class="grid">
+        <!-- NEW -->
+        <span class="pill p-plum">new</span><span class="dots hot">●●●</span><span class="name">C2</span><span class="loc">command-and-control/<b class="w" style="font-weight:600">channel/websocket · dropper/delivery/fetch-eval</b></span>
+        <span></span><span class="dots sus">●● </span><span class="name">process execution</span><span class="loc">process/create/shell/bridge</span>
+        <span></span><span class="dots not">●  </span><span class="name">obfuscation</span><span class="loc">anti-static/obfuscation/…&nbsp;&nbsp;<span class="dim">20 traits</span></span>
+        <span></span><span class="dots not">●  </span><span class="name">base64</span><span class="loc">data/decode/base64</span>
+
+        <!-- EXPANDED -->
+        <span class="pill p-plum" style="opacity:.72">expanded</span><span class="dots not">●● </span><span class="name">network</span><span class="loc">communications/dns/label · lookup/txt&nbsp;&nbsp;<span class="dim">+2</span></span>
+        <span></span><span class="dots not">●● </span><span class="name">install hook</span><span class="loc">supply-chain/install-hook/scripts/hook-file&nbsp;&nbsp;<span class="dim">+1</span></span>
+
+        <!-- SIGNATURE -->
+        <span class="pill p-hot">signature</span><span class="dots hot">●●●</span><span class="span2 name">obfuscated-bundle-dns-and-exec</span>
+        <span></span><span class="dots hot">●●●</span><span class="span2 name">tampered-prebuilt-bundle</span>
+        <span></span><span class="dots hot">●●●</span><span class="span2 name">obfuscated-bundle-stealer-toolkit</span>
+        <span></span><span class="dots fnt"> · </span><span class="span2 loc">+3 more</span>
+      </div>
+
+      <div class="evhead"><span class="pill p-ocean" style="font-weight:700;color:#fff;border-radius:3px;padding:1px .8ch;font-size:12px;">evidence</span><span class="dim">📄 node-ipc.cjs · JAVASCRIPT · 114.6 KB</span></div>
+      <div class="ev">
+        <span class="ln">1271</span><span class="code">(function(_0xaed59b,_0x282d65){var _0x4524e4=_0x1a49,_0x41d0c3=_0xaed59b();while(!![]){…</span><span class="desc">obfuscated stealer toolkit</span>
+        <span class="ln">1271</span><span class="code">…'hzeUT','/etc/hosts','arch','lSJiX','isIPv6','136SgKJjU','gzbTa','FoWu'…</span><span class="desc">DNS lookup + shell-exec, co-located</span>
+        <span class="ln">8</span><span class="code">var __markAsModule = (target) =&gt; __defProp(target, "__esModule", { value: true …</span><span class="desc">prebuilt bundle, obfuscator markers</span>
+      </div>
+
+    </div>
+  </div>
+
+  <h3 class="sec">Reading the grid</h3>
+  <p class="note">Four columns, one edge each: the <b>pill</b> names the section once, the <b>dots</b> carry
+  severity, the <b>name</b> is the capability class (or rule), and the <b>locator</b> is where it lives
+  (namespace, or the trait count). Sub-rows leave the pill empty, so a section reads as a block. Signatures
+  have no locator, so the rule name spans that column. When a section has nothing (no metrics here, no
+  identity), it simply isn't drawn — no empty headers.</p>
+
+  <h3 class="sec">Evidence, reworked</h3>
+  <p class="note">Evidence is <b>not</b> forced into the capability columns anymore. It gets its own three
+  columns — <b>line</b>, <b>code</b> (truncated with … , never wrapped), <b>description</b> — under a member
+  header. So the proof scans as its own table: line numbers align right, the code forms one left edge, and the
+  plain-English note forms another. This is the part of B you didn't like; this is the fix.</p>
+
+  <footer>
+    Everything here is grid-aligned rather than space-counted, which is how the real CLI will pad it. If this
+    reads clean, it becomes <code>--format terminal</code>. The one open call: whether the risk gauge should
+    also align its <code>0.40 … 0.97</code> to the grid's columns, or stay a free masthead element.
+  </footer>
+</div>

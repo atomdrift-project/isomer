@@ -141,6 +141,29 @@ axis (see below). On 5.4.5 → 5.6.0 the **behavioral axis alone reads `high`**
 xor-encoding) with every signature ignored — enough to fail `--fail-on high`
 on release day.
 
+### Detection signals (the expert system → Valence)
+
+The verdict folds several signals; the hand-coded rubric is a stand-in for
+**Valence**, the eventual ML engine that will score the whole change vector
+(size, entropy, traits, metrics, facts) directly.
+
+- **ML risk is the primary detector.** Azoth scores both sides; a **jump into a
+  worse band** (benign→malware) drives the verdict on its own — `verdict =
+  max(rubric axes, risk_band(new))`, and a band jump counts as newly-introduced
+  risk for the `--gate new` exit. So an xz-class attack fires from the risk
+  jump alone, with no trait or signature. Falls back to the rubric when no model
+  is present.
+- **Structure axis** (`rubric::structural_facts`) — raw ELF/Mach-O/PE kv facts,
+  not rule matches: a new **loader dependency** (High), functions turned into
+  **ifunc resolvers** (High), **new imports** (Medium). These fold into the
+  verdict and `new_severity`, so xz fires on structure alone too. Verified:
+  strip every trait and signature and xz still reads Critical (risk) / High
+  (structure).
+- **Version distance** — `5.4.5 → 5.6.0` is stated as **"2 minor releases"**,
+  not "a minor release"; the proportionality tolerance is keyed on the moved
+  component, not the distance (two minors still don't license an execution
+  primitive).
+
 ### The v0 rubric — three axes (`src/rubric.rs`)
 
 The verdict is the worst of three independently-computed axes. Everything
@@ -214,6 +237,189 @@ Rules that keep it scannable:
 - **`--explain`** — widens the evidence set and appends cleave's full diff
   ledger. Broken-pipe-safe (`| head` no longer panics); `--color
   auto|always|never` controls ANSI.
+
+### Header — masthead + grid (`src/fs.rs::header`)
+
+The shipped terminal layout (chosen over the Command Rail after a mockup
+series). A **masthead** carries what a human reads first, then a single
+**pill grid** carries the detail:
+
+```
+  HOSTILE   node-ipc  12.0.0 → 12.0.1 · patch release · 3 of 14 files · disproportionate
+ ✨ Supply chain compromise with data stealer payload        (only with --llm)
+ 📊 malware risk
+    was  0.40  ████████░░░░░░░░░░░░  elevated
+    now  0.97  ███████████████████░  malware   ▲ +0.57
+
+  new        ●●● C2                  command-and-control/channel/websocket · …  2 new
+  expanded   ●●  network             communications/dns/label · lookup/txt  +2
+  signature  ●●● obfuscated-bundle-dns-and-exec
+  metrics        deps 1→2 · init_array 2→1 · code ↑37%
+
+  evidence
+   📄 package/node-ipc.cjs
+    1265  eton = new IPCModule();  Obfuscated stealer toolkit (host-fingerprint + base64)
+```
+
+- **Twin-bar risk** — `was`/`now` each on a benign→malware bar, the jump and
+  new severity word dominant (a single bar read as "risk is 0.40").
+- **One grid** — `pill · dots · name · locator`; behavioral (new/expanded),
+  signature, metrics, and identity all share the columns. Sections with nothing
+  (no metrics on a multi-file diff, no identity when only the version changed)
+  are simply not drawn.
+- **✨ read** sits in the masthead (only under `--llm`); the emoji pairs with
+  📊 so neither floats alone. No rail.
+- **Evidence** is its own `locator · code · description` table under a member
+  header, ranked **hostile-first** and de-duplicated by description
+  (`evidence::windows`), so the backdoor bytes lead, not the ELF header.
+
+(The Command Rail below is retired.)
+
+### (retired) Header — the Command Rail
+
+The shipped terminal verdict (chosen from a set of colored mockups). It adopts
+cleave's diff color language: a cyan brand rule, bold names over dimmed
+connectives, numbers tinted by magnitude, background pills for section headers,
+and scan's bold-white-on-color verdict badge.
+
+```
+ isomer ───────────────────────────── supply-chain differential
+
+  HOSTILE   liblzma.so   5.4.5 → 5.6.0 · minor release
+ risk   5.4.5  0.00  ▏░░░░░░░░░░░░░░░░░░░░▏  benign
+        5.6.0  0.98  ▏████████████████████▏  malware   ▲ +0.98
+
+ ┃ liblzma.so gained new execution hijack behavior — disproportionate…
+ ┃
+ ┃  behavioral   new · absent in 5.4.5
+ ┃   ●●  binary/linking/runtime   execution hijack   4 new
+ ┃   ●   data/encode/xor          xor encoding       1 new
+ ┃  signature    ●●● 4 known-bad rules · CVE-2024-3094
+ ┃  metrics      deps 1→2 · init_array 2→1 · code ↑37%
+ └  evidence
+```
+
+- **Two-bar risk gauge** — each version on a benign→malware scale, so the delta
+  is visual; azoth scores drive the fill and the word (benign/elevated/
+  suspicious/malware).
+- **Behavioral grouped by capability class, split new vs expanded** — see below.
+- **Pills** (equal width) for behavioral · signature · metrics · evidence;
+  **metrics** tinted by magnitude with ↑/↓.
+
+### Behavioral: capability class, new vs expanded
+
+The behavioral block groups gained traits by **capability class**
+(`execution-hijack`, `network`, `C2`, `obfuscation`, …) — *not* taxonomy
+segment. Class is the right granularity: every ELF has `binary/*` structural
+traits, so a segment-level "new category" is meaningless, but the *class*
+`execution-hijack` (the ifunc) is genuinely new while `runtime-linkage` (loader
+deps) is not. Two subsections:
+
+```
+ ┃  behavioral
+ ┃    new behavior · absent in 5.4.5
+ ┃      ●●  execution hijack   binary/linking/runtime   1 new
+ ┃      ●   xor encoding       data/encode/xor          1 new
+ ┃    expanded · already in 5.4.5
+ ┃      ●   runtime linkage    binary/linking/runtime   +3
+```
+
+- **new behavior** — classes with *no* trait in the base version (the strong
+  signal). **expanded** — classes the base already had, now with more traits.
+- The split needs the base's classes, so isomer does one cached
+  `analyze_file(old)` (`evidence::base_classes`) and counts a class present
+  only at **notable+** criticality — a baseline substring match doesn't mean
+  the base "did C2", and erring toward notable+ keeps genuinely new
+  capabilities flagged as new rather than dismissed as expanded.
+- Within a class, the **common namespace prefix** is shown once and only
+  divergent tails are listed — no stutter (`communications/dns/label ·
+  lookup/txt`). Real result: node-ipc's C2/process-execution read **new**
+  (it never phoned home) while network/install-hook read **expanded** (it was
+  always an IPC library); xz's ifunc is **new**, its loaders **expanded**.
+
+### Signature and identity tell the story, not a count
+
+- **signature** lists the matched rules by name (`obfuscated-bundle-dns-and-exec`,
+  `CRAIU/Backdoor`, …) under a count/CVE header, capped with `+N more` — not an
+  opaque "6 known-bad rules".
+- **identity** shows the actual field delta (`signer: X → unsigned`,
+  `authors: A → A, B`) and — critically — only fires on **meaningful** fields.
+  Version is excluded: a version bump is not a publisher change. This fixed a
+  real false positive where node-ipc read "signer/publisher changed" when the
+  *only* difference was `12.0.0 → 12.0.1`; the protestware was shipped by the
+  same trusted maintainer, which is itself the correct (quieter) story.
+- **evidence** renders the code/bytes **plain** (no match highlighting), with a
+  full `// SEV description (trait-id)` annotation per window — the rail and the
+  annotation carry emphasis, the code stays readable.
+
+### New-vs-existing exit gate (`--gate`)
+
+isomer is inherently differential — a finding present *unchanged* in both
+versions never enters the diff, so it never affects the verdict. `--gate`
+controls the rest:
+
+- `--gate new` (default) — the exit code fails only on **newly-introduced**
+  risk (`Assessment::new_severity()`: namespaces with new traits, newly-matched
+  signatures, identity drift). A pre-existing issue isn't re-litigated every CI
+  run.
+- `--gate any` — also fails on **escalations** of findings that existed in the
+  base version.
+
+`--fail-on` sets the threshold within the gate. Both are stable CI contract.
+
+### No-change, existing-risk note (`evidence::existing_risk`)
+
+When the diff surfaces nothing but the new artifact still carries
+suspicious/hostile traits, isomer prints a concise note instead of staying
+fully silent — "nothing changed, but heads up" — and still exits 0 (it's not
+new risk):
+
+```
+ liblzma.so · no behavioral change · existing hostile traits:
+   ●●● CRAIU/Unk/Liblzma/Backdoor
+   ●●● SigBase/BKDR/Xzutil/Binary/CVE/2024/3094/Mar24
+```
+
+A genuinely clean artifact still prints nothing at all.
+
+### (historical) Incident Brief
+
+The terminal verdict is written as an analyst's note (mockup direction #3):
+
+```
+ isomer · supply-chain differential
+
+   liblzma.so   5.4.5 ──▶ 5.6.0   · minor release   [ HOSTILE ]
+   risk         0.00 ──▶ 0.98    ▲ +0.98   azoth malware probability
+
+   ┃ liblzma.so gained an ifunc resolver — disproportionate for a
+   ┃ minor release.
+
+   smoking gun  execution-hijack — an ifunc resolver
+                metadata/binary/linking/runtime::ifunc   ●●  high
+   also new     runtime-linkage · hidden-byte-strings · xor-encoding (6 …)
+   confirmed    4 known-bad rules · CVE-2024-3094   ●●● critical
+   metrics      deps 1→2 · init_array 2→1 · code +37%
+```
+
+- The **smoking gun** names the single worst gained capability in full — its
+  complete hierarchical trait id — so the engineer can grep for it directly.
+- **metrics** highlights the largest relative movers (labeled: `code`, `deps`,
+  `init_array`, `relocs`).
+- Evidence windows (below) follow the brief.
+
+### Risk scoring via azoth (`src/risk.rs`)
+
+isomer scores **both sides** with the same azoth ML model scan uses
+(`scan::Analyzer` over `scan::models_repo::model_dir()`), and reports the pair
+plus the delta: `risk 0.00 ──▶ 0.98  ▲ +0.98`. Because both sides are the same
+artifact on the same classifier route, the scores are directly comparable and
+the delta is meaningful — the model's opinion of *how much more dangerous the
+new release is*. (True featurize-the-delta scoring isn't supported by a model
+trained on whole artifacts; new − old is the honest v0.) Scoring degrades
+gracefully: no model bundle → risk simply absent, never an error. Observed:
+xz 0.00→0.98, rand-user-agent 0.00→1.00, node-ipc 0.40→0.97 (the base package
+already scored 0.40; the protestware added +0.57).
 
 ### Evidence — the proof (`src/evidence.rs`)
 

@@ -176,23 +176,29 @@
 
   <figure class="hero">
     <div class="cap">
-      <div class="n"><b>◆</b> The full picture</div>
-      <h2>Impact up front — then the evidence</h2>
-      <p>What <span class="mono-in">isomer fs</span> prints today for the xz-utils backdoor. The verdict and
-      why it's disproportionate, then the actual backdoor bytes at their file offsets.</p>
+      <div class="n"><b>◆</b> The full report</div>
+      <h2>Incident brief, ML risk delta, then the proof</h2>
+      <p>What <span class="mono-in">isomer fs</span> prints today for the xz-utils backdoor: an analyst's
+      note, the azoth model's risk for each side and the change between them, the smoking gun named in
+      full, then the actual backdoor bytes at their file offsets.</p>
     </div>
     <div class="term">
       <div class="bar"><i class="dot-r"></i><i class="dot-y"></i><i class="dot-g"></i><span>isomer fs liblzma.so.5.4.5 liblzma.so.5.6.0</span></div>
-<pre class="cli"><span class="hot">●</span> <span class="hot"><b>HOSTILE</b></span>    <b>liblzma.so</b>   5.4.5 <span class="dim">→</span> 5.6.0   <span class="dim">minor bump</span>
-  <span class="sus">disproportionate — a minor bump gained a high-severity capability</span>
+<pre class="cli"> <span class="dim">isomer · supply-chain differential</span>
 
-  <span class="sus">●●</span>  <b>behavioral</b>  execution-hijack <span class="dim">—</span> gained an <span class="sus">ifunc resolver</span>
-                 <span class="dim">+runtime-linkage, hidden-byte-strings, xor-encoding (6 total)</span>
-  <span class="hot">●●●</span> <b>signature</b>   4 known-bad rules matched <span class="hot">(CVE-2024-3094)</span>
+   <b>liblzma.so</b>   5.4.5 <span class="dim">──▶</span> <b>5.6.0</b>   <span class="dim">· minor release</span>   <span class="hot"><b>[ HOSTILE ]</b></span>
+   <span class="dim">risk</span>         0.00 <span class="dim">──▶</span> <span class="hot"><b>0.98</b></span>    <span class="hot">▲ +0.98</span>   <span class="dim">azoth malware probability</span>
 
-  <span class="dim">deps 1→2 · init_array 2→1 · code</span> <span class="sus">+37%</span>
+   <span class="hot">┃</span> <span class="dim">liblzma.so gained an</span> <span class="sus">ifunc resolver</span> <span class="dim">— disproportionate for a</span>
+   <span class="hot">┃</span> <span class="dim">minor release.</span>
 
-  <span class="dim">evidence — where the change lives</span>
+   <span class="dim">smoking gun</span>  <span class="sus">execution-hijack</span> <span class="dim">—</span> an ifunc resolver
+                <span class="dim">metadata/binary/linking/runtime::</span><span class="sus">ifunc</span>   <span class="sus">●●  high</span>
+   <span class="dim">also new</span>     <span class="dim">runtime-linkage · hidden-byte-strings · xor-encoding (6)</span>
+   <span class="dim">confirmed</span>    4 known-bad rules · <span class="hot">CVE-2024-3094</span>   <span class="hot">●●● critical</span>
+   <span class="dim">metrics</span>      <span class="dim">deps 1→2 · init_array 2→1 · code</span> <span class="sus">+37%</span>
+
+   <span class="dim">evidence — where the change lives</span>
 
  <span class="dim">47e9</span>   <span class="brand">41 5c c3 0f 1f 40 00 f3 0f 1e fa</span>  <span class="dim">A\...@.....</span>  <span class="hot">// liblzma backdoored</span>
  <span class="dim">bda7</span>   <span class="brand">ff ff b9 12 00 00 00 4d 8b 6c 24</span>  <span class="dim">.......M.l$</span>  <span class="hot">// injected backdoor code</span>
@@ -203,9 +209,9 @@
 
   <hr class="rule">
 
-  <p class="eyebrow" style="margin-bottom:6px">The verdict header · four treatments</p>
-  <p class="lede" style="margin-bottom:34px">Same finding, four ways to frame the top of the report. The evidence
-  block above sits beneath whichever you pick.</p>
+  <p class="eyebrow" style="margin-bottom:6px">Earlier exploration · four header treatments</p>
+  <p class="lede" style="margin-bottom:34px">The hero above adopts direction 03 (Incident Brief). These were the four
+  candidates; the evidence block and risk delta sit beneath whichever header you choose.</p>
 
   <div class="grid">
 

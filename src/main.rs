@@ -16,6 +16,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod evidence;
 mod fs;
+mod json;
+mod llm;
 mod risk;
 mod rubric;
 mod version;
@@ -30,6 +32,13 @@ struct Cli {
     /// Minimum severity that fails the run (exit code 1).
     #[arg(long, global = true, value_enum, default_value_t = Severity::High)]
     fail_on: Severity,
+
+    /// What the exit code gates on. `new` (default) fails only on
+    /// newly-introduced risk — the CI-relevant case, so a pre-existing issue
+    /// isn't re-litigated every run. `any` also fails on escalations of
+    /// findings that already existed in the base version.
+    #[arg(long, global = true, value_enum, default_value_t = Gate::New)]
+    gate: Gate,
 
     /// Output format.
     #[arg(long, global = true, value_enum, default_value_t = Format::Terminal)]
@@ -58,6 +67,23 @@ struct Cli {
     /// Override the detected head version. See `--base-version`.
     #[arg(long, global = true, value_name = "VER")]
     head_version: Option<String>,
+
+    /// Interpret the diff with a small LLM at this OpenAI-compatible base URL
+    /// (env: ISOMER_LLM). Bare `--llm` uses the default local endpoint.
+    #[arg(long, global = true, value_name = "URL", num_args = 0..=1, default_missing_value = "local")]
+    llm: Option<String>,
+
+    /// Model name for `--llm` (env: ISOMER_LLM_MODEL); autodetected if omitted.
+    #[arg(long, global = true, value_name = "NAME")]
+    llm_model: Option<String>,
+
+    /// Bearer token for `--llm` (env: ISOMER_LLM_KEY); omit for local endpoints.
+    #[arg(long, global = true, value_name = "KEY")]
+    llm_key: Option<String>,
+
+    /// Per-request LLM timeout in seconds.
+    #[arg(long, global = true, value_name = "SECS")]
+    llm_timeout: Option<u64>,
 
     #[command(subcommand)]
     command: Command,
@@ -97,6 +123,9 @@ enum Format {
     Json,
     Sarif,
     Markdown,
+    /// The exact payload isomer would send to the LLM (minus the prompt), for
+    /// debugging `--llm`.
+    Interpret,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -104,6 +133,14 @@ enum Color {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Gate {
+    /// Fail only on newly-introduced risk.
+    New,
+    /// Fail on any changed risk, including escalations of existing findings.
+    Any,
 }
 
 impl Color {

@@ -15,6 +15,10 @@ cleave = { path = "../cleave", default-features = false }
 # Same major as cleave's, so the theme's painters and our override agree on
 # one global colorize state.
 colored = "3.1"
+# Identity types, for the signer/publisher delta. Same source as cleave/scan
+# so it unifies to one version in the graph.
+filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # atomdrift-scan (lib name `scan`) supplies the azoth ML model for risk
@@ -42,3 +46,9 @@ panic = "deny"
 wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
 tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
 tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
+
+# Local-dev override so isomer's cleave build carries the working-tree filefacts
+# (direct-syscall inventory → `type: syscall` traits). Mirrors cleave's own
+# patch; remove to return to the pinned git filefacts.
+[patch."https://github.com/atomdrift-project/filefacts.git"]
+filefacts = { path = "../filefacts" }

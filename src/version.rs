@@ -79,9 +79,9 @@ fn version_char_runs(s: &str) -> Vec<&str> {
     runs
 }
 
-/// How the new version relates to the old one.
+/// Which version component moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Bump {
+pub(crate) enum BumpKind {
     Major,
     Minor,
     Patch,
@@ -90,42 +90,64 @@ pub(crate) enum Bump {
     Downgrade,
 }
 
+/// How the new version relates to the old one, including *how far* it moved:
+/// `5.4.5 → 5.6.0` is `Minor` with `steps = 2` (two minor releases), which the
+/// report states honestly rather than calling it "a minor release".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Bump {
+    pub kind: BumpKind,
+    pub steps: u64,
+}
+
 impl Bump {
     pub(crate) fn classify(old: &Version, new: &Version) -> Bump {
         use std::cmp::Ordering::{Equal, Greater, Less};
-        match (
+        let (kind, steps) = match (
             new.major.cmp(&old.major),
             new.minor.cmp(&old.minor),
             new.patch.cmp(&old.patch),
         ) {
-            (Greater, _, _) => Bump::Major,
-            (Less, _, _) => Bump::Downgrade,
-            (Equal, Greater, _) => Bump::Minor,
-            (Equal, Less, _) => Bump::Downgrade,
-            (Equal, Equal, Greater) => Bump::Patch,
-            (Equal, Equal, Less) => Bump::Downgrade,
-            (Equal, Equal, Equal) => Bump::Same,
-        }
+            (Greater, _, _) => (BumpKind::Major, new.major - old.major),
+            (Less, _, _) => (BumpKind::Downgrade, 0),
+            (Equal, Greater, _) => (BumpKind::Minor, new.minor - old.minor),
+            (Equal, Less, _) => (BumpKind::Downgrade, 0),
+            (Equal, Equal, Greater) => (BumpKind::Patch, new.patch - old.patch),
+            (Equal, Equal, Less) => (BumpKind::Downgrade, 0),
+            (Equal, Equal, Equal) => (BumpKind::Same, 0),
+        };
+        Bump { kind, steps }
     }
 
     pub(crate) fn label(self) -> &'static str {
-        match self {
-            Bump::Major => "major",
-            Bump::Minor => "minor",
-            Bump::Patch => "patch",
-            Bump::Same => "same",
-            Bump::Downgrade => "downgrade",
+        match self.kind {
+            BumpKind::Major => "major",
+            BumpKind::Minor => "minor",
+            BumpKind::Patch => "patch",
+            BumpKind::Same => "same",
+            BumpKind::Downgrade => "downgrade",
+        }
+    }
+
+    /// Human phrase: `minor release` for one step, `2 minor releases` for more.
+    pub(crate) fn describe(self) -> String {
+        match self.kind {
+            BumpKind::Same => "same version".to_string(),
+            BumpKind::Downgrade => "downgrade".to_string(),
+            _ if self.steps > 1 => format!("{} {} releases", self.steps, self.label()),
+            _ => format!("{} release", self.label()),
         }
     }
 
     /// Highest behavioral-capability severity considered *proportionate* for
     /// this bump. Anything above it is disproportionate drift — a patch that
-    /// adds an execution primitive, a minor that adds network egress.
+    /// adds an execution primitive, a minor that adds network egress. Keyed on
+    /// the component that moved, not the distance: two minor releases still do
+    /// not license an execution-hijack primitive.
     pub(crate) fn tolerance(self) -> Severity {
-        match self {
-            Bump::Major => Severity::High,
-            Bump::Minor => Severity::Medium,
-            Bump::Patch | Bump::Same | Bump::Downgrade => Severity::None,
+        match self.kind {
+            BumpKind::Major => Severity::High,
+            BumpKind::Minor => Severity::Medium,
+            BumpKind::Patch | BumpKind::Same | BumpKind::Downgrade => Severity::None,
         }
     }
 }
@@ -144,28 +166,25 @@ mod tests {
     #[test]
     fn classify_bumps() {
         let v = Version::parse;
-        assert_eq!(
-            Bump::classify(&v("5.4.5").unwrap(), &v("5.6.0").unwrap()),
-            Bump::Minor
-        );
-        assert_eq!(
-            Bump::classify(&v("12.0.0").unwrap(), &v("12.0.1").unwrap()),
-            Bump::Patch
-        );
-        assert_eq!(
-            Bump::classify(&v("1.0.0").unwrap(), &v("2.0.0").unwrap()),
-            Bump::Major
-        );
-        assert_eq!(
-            Bump::classify(&v("2.0.0").unwrap(), &v("1.9.9").unwrap()),
-            Bump::Downgrade
-        );
+        // 5.4.5 → 5.6.0 is TWO minor releases, not one.
+        let b = Bump::classify(&v("5.4.5").unwrap(), &v("5.6.0").unwrap());
+        assert_eq!(b.kind, BumpKind::Minor);
+        assert_eq!(b.steps, 2);
+        assert_eq!(b.describe(), "2 minor releases");
+
+        assert_eq!(Bump::classify(&v("12.0.0").unwrap(), &v("12.0.1").unwrap()).kind, BumpKind::Patch);
+        assert_eq!(Bump::classify(&v("5.4.5").unwrap(), &v("5.5.0").unwrap()).describe(), "minor release");
+        assert_eq!(Bump::classify(&v("1.0.0").unwrap(), &v("2.0.0").unwrap()).kind, BumpKind::Major);
+        assert_eq!(Bump::classify(&v("2.0.0").unwrap(), &v("1.9.9").unwrap()).kind, BumpKind::Downgrade);
     }
 
     #[test]
     fn tolerance_tightens_for_smaller_bumps() {
-        assert_eq!(Bump::Patch.tolerance(), Severity::None);
-        assert_eq!(Bump::Minor.tolerance(), Severity::Medium);
-        assert_eq!(Bump::Major.tolerance(), Severity::High);
+        let b = |kind| Bump { kind, steps: 1 };
+        assert_eq!(b(BumpKind::Patch).tolerance(), Severity::None);
+        assert_eq!(b(BumpKind::Minor).tolerance(), Severity::Medium);
+        assert_eq!(b(BumpKind::Major).tolerance(), Severity::High);
+        // Two minor releases still don't license a High capability.
+        assert_eq!(Bump { kind: BumpKind::Minor, steps: 2 }.tolerance(), Severity::Medium);
     }
 }

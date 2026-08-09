@@ -14,7 +14,7 @@ use cleave::types::{DiffReportV1, FileDiffEntry};
 
 use crate::rubric::{self, Assessment};
 use crate::version::{Bump, Version};
-use crate::{Cli, Format, Severity};
+use crate::{Cli, Format, Gate, Severity};
 
 /// Diff `old` against `new`, emit the report, and return whether the delta is
 /// clean at `--fail-on`.
@@ -32,29 +32,64 @@ pub(crate) fn run(old: &Path, new: &Path, cli: &Cli) -> Result<bool> {
         .as_ref()
         .context("diff_paths returned a report without a diff")?;
 
-    let assessment = rubric::assess(diff);
+    // Capability classes present in the base, so we can tell a wholly new
+    // class from one that merely gained a trait (a cached analyze of old).
+    let base_classes = crate::evidence::base_classes(old, &options);
+    let assessment = rubric::assess(diff, &base_classes);
     let naming = Naming::resolve(old, new, cli);
     let prop = Proportionality::eval(&assessment, &naming);
-    let clean = !assessment.severity.fails(cli.fail_on);
+
+    // Azoth ML risk is the *primary* detector: a jump into a worse band drives
+    // the verdict on its own, even when no trait or signature fired. Computed
+    // once up front (a diff needs it to decide whether to speak). `None` when no
+    // model is available — then the hand-coded rubric stands alone.
+    let risk = crate::risk::score_pair(old, new);
+    let risk_now = risk.map_or(Severity::None, |r| risk_band(r.new));
+    let risk_jump = risk.map_or(Severity::None, |r| {
+        if risk_band(r.new) > risk_band(r.old) { risk_band(r.new) } else { Severity::None }
+    });
+
+    // The verdict folds the rubric axes with the ML risk. The gate then decides
+    // exit: `new` counts only newly-introduced risk (rubric-new ∪ a risk jump);
+    // `any` includes escalations of pre-existing findings.
+    let verdict = assessment.severity.max(risk_now);
+    let verdict_new = assessment.new_severity().max(risk_jump);
+    let gated = match cli.gate {
+        Gate::New => verdict_new,
+        Gate::Any => verdict,
+    };
+    let clean = !gated.fails(cli.fail_on);
 
     match cli.format {
         Format::Terminal => {
             let mut out = String::new();
-            if should_speak(&assessment, &prop, cli) {
-                // Azoth ML risk for each side (optional; skipped if no model).
-                let risk = crate::risk::score_pair(old, new);
-                header::render(&mut out, &assessment, diff, &naming, &prop, risk);
-                // The proof: context windows for the gained traits, rendered by
-                // cleave so they match what scan shows byte for byte.
+            if should_speak(&assessment, &prop, gated, cli) {
+                // Optional LLM read of the change — computed first so it can sit
+                // in the masthead. Failures log to stderr and don't block.
+                let interp = crate::llm::config(cli).and_then(|cfg| {
+                    let ctx = llm_context(&assessment, &naming, risk, new, &options).ok()?;
+                    match crate::llm::interpret(&cfg, &ctx) {
+                        Ok(i) => Some(i),
+                        Err(e) => {
+                            eprintln!("isomer: llm interpretation failed: {e:#}");
+                            None
+                        }
+                    }
+                });
+                header::render(&mut out, verdict, &assessment, diff, &naming, &prop, risk, interp.as_ref());
+                // The proof: context windows for the gained traits as an aligned
+                // table (locator · code · description).
                 let ids = assessment.gained_ids();
-                let ev = crate::evidence::render(new, &options, &ids, !cli.explain)?;
-                if !ev.trim().is_empty() {
-                    out.push_str(&format!(
-                        "   {}\n\n",
-                        cleave::theme::paint_component("evidence — where the change lives")
-                    ));
-                    out.push_str(&ev);
-                }
+                let limit = if cli.explain { 24 } else { 6 };
+                let rows = crate::evidence::windows(new, &options, &ids, limit)?;
+                out.push_str(&header::evidence_table(&rows));
+            } else if let Some(existing) =
+                crate::evidence::existing_risk(new, &options, &naming.name)?
+            {
+                // No noticeable change, but the artifact still carries elevated
+                // traits. Say so concisely rather than staying fully silent —
+                // "nothing changed, but heads up". Does not affect exit code.
+                out.push_str(&existing);
             }
             if cli.explain {
                 if !out.is_empty() {
@@ -65,11 +100,47 @@ pub(crate) fn run(old: &Path, new: &Path, cli: &Cli) -> Result<bool> {
             write_stdout(&out)?;
         }
         Format::Json => {
-            let risk = crate::risk::score_pair(old, new);
+            // Include the LLM read when asked, exactly as the terminal path does.
+            let interp = crate::llm::config(cli).and_then(|cfg| {
+                let ctx = llm_context(&assessment, &naming, risk, new, &options).ok()?;
+                match crate::llm::interpret(&cfg, &ctx) {
+                    Ok(i) => Some(i),
+                    Err(e) => {
+                        eprintln!("isomer: llm interpretation failed: {e:#}");
+                        None
+                    }
+                }
+            });
+            let gate = GateDecision {
+                on: match cli.gate {
+                    Gate::New => "new",
+                    Gate::Any => "any",
+                },
+                fail_on: cli.fail_on.as_str(),
+                severity: gated.as_str(),
+                fail: !clean,
+            };
+            // The proof windows and the full identity claims — everything the UI
+            // and the CLI cache need to redraw without re-reading the artifact.
+            let evidence =
+                crate::evidence::windows(new, &options, &assessment.gained_ids(), EVIDENCE_JSON_CAP)?;
+            let provenance = diff
+                .files
+                .iter()
+                .find_map(|f| f.identity.as_ref())
+                .map_or((None, None), |idd| (idd.old.as_ref(), idd.new.as_ref()));
             write_stdout(&format!(
                 "{}\n",
-                json(&assessment, &naming, &prop, risk, &report)?
+                json(
+                    &assessment, &naming, &prop, risk, &gate, interp.as_ref(), &evidence, provenance,
+                    &report,
+                )?
             ))?;
+        }
+        Format::Interpret => {
+            // Exactly what `--llm` would send (minus the system prompt).
+            let ctx = llm_context(&assessment, &naming, risk, new, &options)?;
+            write_stdout(&format!("{ctx}\n"))?;
         }
         Format::Sarif | Format::Markdown => bail!("--format {:?} is not implemented yet", cli.format),
     }
@@ -77,14 +148,97 @@ pub(crate) fn run(old: &Path, new: &Path, cli: &Cli) -> Result<bool> {
     Ok(clean)
 }
 
+/// Build the plain-text payload describing the diff, sent to the LLM (and shown
+/// verbatim by `--format interpret`). No color, no rail — just the structured
+/// behavioral delta plus the matched code/bytes.
+fn llm_context(
+    a: &Assessment,
+    naming: &Naming,
+    risk: Option<crate::risk::Risk>,
+    new: &Path,
+    options: &cleave::AnalysisOptions,
+) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(s, "artifact: {}", naming.name);
+    if let (Some(o), Some(n)) = (&naming.old, &naming.new) {
+        let bump = naming.bump.map(|b| format!(" ({})", b.describe())).unwrap_or_default();
+        let _ = writeln!(s, "version: {} -> {}{bump}", o.raw, n.raw);
+    }
+    if let Some(r) = risk {
+        let _ = writeln!(s, "ml_malware_probability: {:.2} -> {:.2}", r.old, r.new);
+    }
+
+    let (fresh, expanded): (Vec<_>, Vec<_>) = a
+        .behavioral
+        .categories
+        .iter()
+        .partition(|c| a.behavioral.is_new_category(c));
+    if !fresh.is_empty() {
+        let _ = writeln!(s, "\nNEW capability classes (absent in old version):");
+        for c in &fresh {
+            let _ = writeln!(s, "- {} [{}]: {} ({} new traits)", c.label, c.severity.as_str(), c.namespaces.join(", "), c.new_ids.len());
+        }
+    }
+    if !expanded.is_empty() {
+        let _ = writeln!(s, "\nEXPANDED capability classes (already present in old version):");
+        for c in &expanded {
+            let _ = writeln!(s, "- {} [{}]: {} (+{} traits)", c.label, c.severity.as_str(), c.namespaces.join(", "), c.new_ids.len());
+        }
+    }
+    if a.signature.severity != Severity::None {
+        let _ = writeln!(s, "\nknown-bad signatures matched:");
+        for (sev, id, _) in &a.signature.ids {
+            let _ = writeln!(s, "- [{}] {}", sev.as_str(), header::sig_name(id));
+        }
+        if let Some(cve) = &a.signature.cve {
+            let _ = writeln!(s, "  referenced CVE: {cve}");
+        }
+    }
+    if !a.identity.changes.is_empty() {
+        let _ = writeln!(s, "\nidentity changes (publisher/signer):");
+        for ch in &a.identity.changes {
+            let old = if ch.old.is_empty() { "none" } else { &ch.old };
+            let new = if ch.new.is_empty() { "none" } else { &ch.new };
+            let _ = writeln!(s, "- {}: {} -> {}", ch.label, old, new);
+        }
+    }
+
+    // Compact evidence — the matched rows and their descriptions, not the full
+    // surrounding dump; keeps the payload focused and the token cost bounded.
+    let ev = crate::evidence::render(new, options, &a.gained_ids(), true)?;
+    if !ev.trim().is_empty() {
+        let _ = writeln!(s, "\nchanged code / bytes (matched by rules):");
+        s.push_str(ev.trim_end());
+        s.push('\n');
+    }
+    Ok(s)
+}
+
 /// The diff-like speech gate: stay silent unless there is a real signal. We
-/// speak when the verdict fails the threshold, when anything reaches High, or
-/// when behavioral drift is disproportionate for the version bump. `--explain`
-/// always speaks.
-fn should_speak(a: &Assessment, prop: &Proportionality, cli: &Cli) -> bool {
+/// speak when the gated verdict fails the threshold, when the change reaches
+/// High, or when behavioral drift is disproportionate for the version bump.
+/// `--explain` always speaks. `gated` is the severity under the active
+/// `--gate` policy, so a `new`-gated run stays quiet about pre-existing risk
+/// here (it's surfaced concisely instead).
+/// Map an ML malware probability to a severity band (mirrors the risk words:
+/// benign / elevated / suspicious / malware).
+fn risk_band(p: f32) -> Severity {
+    if p >= 0.90 {
+        Severity::Critical
+    } else if p >= 0.50 {
+        Severity::High
+    } else if p >= 0.15 {
+        Severity::Medium
+    } else {
+        Severity::None
+    }
+}
+
+fn should_speak(a: &Assessment, prop: &Proportionality, gated: Severity, cli: &Cli) -> bool {
     cli.explain
-        || a.severity.fails(cli.fail_on)
-        || a.severity >= Severity::High
+        || gated.fails(cli.fail_on)
+        || gated >= Severity::High
         || (prop.disproportionate && a.behavioral.severity >= Severity::Medium)
 }
 
@@ -218,113 +372,187 @@ impl Proportionality {
 
 // ── JSON ────────────────────────────────────────────────────────────────────
 
-fn json(
+/// Evidence windows to embed in `--format json`. Higher than the terminal's
+/// display cap: the JSON is a complete, cacheable record, not a screenful.
+const EVIDENCE_JSON_CAP: usize = 64;
+
+/// The CI exit decision, ready to place in the envelope's `gate` field.
+struct GateDecision {
+    on: &'static str,
+    fail_on: &'static str,
+    severity: &'static str,
+    fail: bool,
+}
+
+/// Build the `--format json` envelope. Compact and typed, mirroring `../scan`:
+/// a curated `verdict` and its evidence beside the full `raw` cleave diff. See
+/// [`crate::json`].
+#[allow(clippy::too_many_arguments)]
+fn json<R: serde::Serialize>(
     a: &Assessment,
     naming: &Naming,
     prop: &Proportionality,
     risk: Option<crate::risk::Risk>,
-    report: &cleave::types::AnalysisReport,
+    gate: &GateDecision,
+    interp: Option<&crate::llm::Interpretation>,
+    evidence: &[crate::evidence::Window],
+    provenance: (Option<&filefacts::Identity>, Option<&filefacts::Identity>),
+    report: &R,
 ) -> Result<String> {
-    let categories: Vec<_> = a
+    use crate::json as j;
+    let categories = a
         .behavioral
         .categories
         .iter()
-        .map(|c| {
-            serde_json::json!({
-                "class": c.class,
-                "severity": c.severity.as_str(),
-                "trait_ids": c.ids,
-            })
+        .map(|c| j::Category {
+            class: &c.class,
+            label: &c.label,
+            severity: c.severity.as_str(),
+            new_category: a.behavioral.is_new_category(c),
+            namespaces: &c.namespaces,
+            new_ids: &c.new_ids,
+            escalated_ids: &c.escalated_ids,
         })
         .collect();
-    let envelope = serde_json::json!({
-        "schema_version": 1,
-        "artifact": naming.name,
-        "version": {
-            "old": naming.old.as_ref().map(|v| &v.raw),
-            "new": naming.new.as_ref().map(|v| &v.raw),
-            "bump": naming.bump.map(Bump::label),
+    let sig_ids = a
+        .signature
+        .ids
+        .iter()
+        .map(|(sev, id, new)| j::SigId { id, crit: sev.as_str(), new: *new })
+        .collect();
+    let facts = a
+        .structure
+        .facts
+        .iter()
+        .map(|f| j::Fact { severity: f.severity.as_str(), label: f.label, detail: &f.detail })
+        .collect();
+    let changes = a
+        .identity
+        .changes
+        .iter()
+        .map(|c| j::IdChange { field: c.label, old: &c.old, new: &c.new })
+        .collect();
+    let evidence = evidence
+        .iter()
+        .map(|w| j::Ev {
+            member: w.member.as_deref(),
+            locator: &w.locator,
+            code: &w.code,
+            desc: &w.desc,
+            hostile: w.hostile,
+        })
+        .collect();
+
+    let envelope = j::Envelope {
+        v: "1",
+        eng: concat!("isomer/", env!("CARGO_PKG_VERSION")),
+        verb: "fs",
+        artifact: (!naming.name.is_empty()).then_some(naming.name.as_str()),
+        version: j::Version {
+            old: naming.old.as_ref().map(|v| v.raw.as_str()),
+            new: naming.new.as_ref().map(|v| v.raw.as_str()),
+            bump: naming.bump.map(Bump::label),
         },
-        "verdict": {
-            "severity": a.severity.as_str(),
-            "behavioral": { "severity": a.behavioral.severity.as_str(), "categories": categories },
-            "signature": {
-                "severity": a.signature.severity.as_str(),
-                "count": a.signature.ids.len(),
-                "cve": a.signature.cve,
-                "trait_ids": a.signature.ids.iter().map(|(_, id)| id).collect::<Vec<_>>(),
+        provenance: j::Provenance { old: provenance.0, new: provenance.1 },
+        verdict: j::Verdict {
+            severity: a.severity.as_str(),
+            new_severity: a.new_severity().as_str(),
+            gate: j::Gate {
+                on: gate.on,
+                fail_on: gate.fail_on,
+                severity: gate.severity,
+                fail: gate.fail,
             },
-            "identity": { "severity": a.identity.severity.as_str(), "files": a.identity.files },
-            "proportionality": { "disproportionate": prop.disproportionate, "note": prop.note },
-            "risk": risk.map(|r| serde_json::json!({
-                "old": r.old, "new": r.new, "delta": r.delta(), "model": "azoth",
-            })),
+            risk: risk.map(|r| j::Risk { old: r.old, new: r.new, delta: r.delta(), model: "azoth" }),
+            proportionality: j::Prop {
+                disproportionate: prop.disproportionate,
+                note: prop.note.as_deref(),
+            },
+            behavioral: j::Behavioral { severity: a.behavioral.severity.as_str(), categories },
+            signature: j::Signature {
+                severity: a.signature.severity.as_str(),
+                cve: a.signature.cve.as_deref(),
+                count: a.signature.ids.len(),
+                ids: sig_ids,
+            },
+            identity: j::Identity { severity: a.identity.severity.as_str(), changes },
+            structure: j::Structure { severity: a.structure.severity.as_str(), facts },
         },
-        "report": report,
-    });
+        evidence,
+        llm: interp.map(|i| j::Llm { nature: &i.nature, verdict: &i.verdict, model: &i.model }),
+        raw: report,
+    };
     Ok(serde_json::to_string(&envelope)?)
 }
 
-// ── terminal header — "Incident Brief" ───────────────────────────────────────
+// ── terminal header — "Command Rail" ─────────────────────────────────────────
+// ── terminal header — masthead + grid ────────────────────────────────────────
 
 mod header {
+    use colored::Colorize;
+
     use super::{DiffReportV1, FileDiffEntry, Naming, Proportionality, Severity};
+    use crate::evidence::Window;
+    use crate::llm::Interpretation;
     use crate::risk::Risk;
     use crate::rubric::Assessment;
 
-    /// Width of the left label column in the brief body.
-    const LABEL: usize = 13;
+    const BAR: usize = 20;
+    /// Visible width of the section-pill cell (longest pill + a trailing space).
+    const PILL_COL: usize = 12;
+    /// Width the capability-class name column pads to.
+    const NAME_W: usize = 20;
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render(
         out: &mut String,
+        verdict: Severity,
         a: &Assessment,
         diff: &DiffReportV1,
         naming: &Naming,
         prop: &Proportionality,
         risk: Option<Risk>,
+        interp: Option<&Interpretation>,
     ) {
-        // Eyebrow.
-        out.push_str(&format!(
-            " {}\n\n",
-            cleave::theme::paint_component("isomer · supply-chain differential")
-        ));
-
-        // Subject: what, which versions, the verdict stamp.
-        out.push_str(&subject_line(a, diff, naming));
-        // Risk: the model's opinion of each side, and the change between them.
+        // ── masthead: verdict, the one-line read, the risk move ──
+        out.push_str(&badge_line(verdict, diff, naming, prop));
+        if let Some(i) = interp.filter(|i| !i.nature.trim().is_empty()) {
+            out.push_str(&format!(" {} {}\n", "✨", i.nature.trim().truecolor(62, 207, 214)));
+        }
         if let Some(r) = risk {
-            out.push_str(&risk_line(r));
+            out.push_str(&risk_twin(r));
         }
         out.push('\n');
 
-        // Narrative: one sentence a human reads first.
-        for line in wrap(&narrative(a, naming, prop), 66) {
-            out.push_str(&format!("   {} {}\n", paint(a.severity, "┃"), line));
+        // ── detail: one grid, pill · dots · name · locator ──
+        behavioral_grid(out, a);
+        structure_grid(out, &a.structure);
+        signature_grid(out, a);
+        identity_grid(out, a);
+        if let Some(m) = single_changed_file(diff).and_then(metrics_body) {
+            out.push_str(&grid_line(&pill_cell("metrics", PILL_TEAL), "   ", &m));
         }
-        out.push('\n');
-
-        // Labeled evidence rows.
-        for (label, body) in body_rows(a) {
-            out.push_str(&format!("   {}{}\n", pad(&label), body));
-        }
-        if let Some(m) = single_changed_file(diff).and_then(metrics_line) {
-            out.push_str(&format!("   {}{}\n", pad("metrics"), m));
-        }
-        out.push('\n');
     }
 
-    /// `   liblzma.so   5.4.5 ──▶ 5.6.0   · minor release        [ HOSTILE ]`.
-    fn subject_line(a: &Assessment, diff: &DiffReportV1, naming: &Naming) -> String {
-        let mut s = format!("   {}", bold(&naming.name));
+    /// The structural-anomaly section (computed by the rubric): a new linked
+    /// dependency, functions turned into ifunc resolvers, new imports — the
+    /// signature-less tell for an xz-class attack.
+    fn structure_grid(out: &mut String, structure: &crate::rubric::Structure) {
+        for (i, f) in structure.facts.iter().enumerate() {
+            let cell = if i == 0 { pill_cell("structure", PILL_SLATE) } else { blank_cell() };
+            let name = pad_visible(&f.label.bold().to_string(), f.label, NAME_W);
+            let body = format!("{name} {}", f.detail.truecolor(150, 160, 168));
+            out.push_str(&grid_line(&cell, &dots(f.severity), &body));
+        }
+    }
+
+    /// ` [ HOSTILE ]  liblzma.so   5.4.5 → 5.6.0 · 2 minor releases`.
+    fn badge_line(verdict: Severity, diff: &DiffReportV1, naming: &Naming, prop: &Proportionality) -> String {
+        let mut meta = String::new();
         if let (Some(o), Some(n)) = (&naming.old, &naming.new) {
-            s.push_str(&format!(
-                "   {} {} {}",
-                o.raw,
-                cleave::theme::paint_component("──▶"),
-                bold(&n.raw)
-            ));
+            meta.push_str(&format!("   {} → {}", o.raw, n.raw));
             if let Some(b) = naming.bump {
-                s.push_str(&cleave::theme::paint_component(format!("   · {} release", b.label())).to_string());
+                meta.push_str(&format!(" · {}", b.describe()));
             }
         }
         let total = diff.summary.files_changed
@@ -332,183 +560,228 @@ mod header {
             + diff.summary.files_removed
             + diff.summary.files_unchanged;
         if total > 1 {
-            s.push_str(
-                &cleave::theme::paint_component(format!(" · {} of {} files", diff.summary.files_changed, total))
-                    .to_string(),
-            );
+            meta.push_str(&format!(" · {} of {} files", diff.summary.files_changed, total));
         }
-        s.push_str(&format!("   {}\n", stamp(a.severity)));
+        let mut s = format!(
+            " {}  {}{}",
+            badge(verdict),
+            naming.name.clone().bold(),
+            meta.truecolor(102, 117, 127),
+        );
+        if prop.disproportionate {
+            s.push_str(&format!(" {}", "· disproportionate".truecolor(255, 176, 46)));
+        }
+        s.push('\n');
         s
     }
 
-    /// `   risk    0.02 ──▶ 0.98    ▲ +0.96    azoth malware probability`.
-    fn risk_line(r: Risk) -> String {
-        let new_sev = risk_severity(r.new);
+    /// Twin-bar risk: `was`/`now` each on a benign→malware bar, jump called out.
+    fn risk_twin(r: Risk) -> String {
         let d = r.delta();
-        let arrow = if d > 0.005 {
-            "▲"
+        let (arrow, dsev) = if d > 0.005 {
+            ("▲", risk_severity(r.new))
         } else if d < -0.005 {
-            "▼"
+            ("▼", Severity::None)
         } else {
-            "·"
+            ("·", Severity::None)
         };
-        let delta_sev = if d > 0.005 { new_sev } else { Severity::None };
         format!(
-            "   {}{:.2} {} {}    {}   {}\n",
-            pad("risk"),
-            r.old,
-            cleave::theme::paint_component("──▶"),
-            paint(new_sev, &format!("{:.2}", r.new)),
-            paint(delta_sev, &format!("{arrow} {d:+.2}")),
-            cleave::theme::paint_component("azoth malware probability"),
+            " {} {}\n    {}  {}  {}  {}\n    {}  {}  {}  {}   {}\n",
+            "📊",
+            "malware risk".truecolor(102, 117, 127),
+            "was".truecolor(102, 117, 127),
+            format!("{:.2}", r.old).truecolor(140, 150, 158),
+            bar(r.old),
+            risk_word(r.old),
+            "now".truecolor(102, 117, 127),
+            paint(risk_severity(r.new), &format!("{:.2}", r.new)).bold(),
+            bar(r.new),
+            risk_word(r.new),
+            paint(dsev, &format!("{arrow} {d:+.2}")),
         )
     }
 
-    /// The labeled body rows, in reading order. Behavioral leads with the
-    /// single worst finding named in full (the "smoking gun"); the rest are
-    /// summarized.
-    fn body_rows(a: &Assessment) -> Vec<(String, String)> {
-        let mut rows: Vec<(String, String)> = Vec::new();
-
-        if let Some(worst) = a.behavioral.categories.first() {
-            let phrase = strip_gained(worst.phrase);
-            rows.push((
-                "smoking gun".into(),
-                format!("{} — {}", paint(worst.severity, worst.class), phrase),
-            ));
-            if let Some(id) = worst.ids.first() {
-                rows.push((
-                    String::new(),
-                    format!(
-                        "{}   {} {}",
-                        cleave::theme::paint_component(id),
-                        dots(worst.severity),
-                        paint(worst.severity, sev_word(worst.severity)),
-                    ),
-                ));
-            }
-            let rest: Vec<&str> = a.behavioral.categories[1..].iter().map(|c| c.class).collect();
-            if !rest.is_empty() {
-                let body = format!("{} ({} capabilities total)", rest.join(" · "), a.behavioral.total());
-                rows.push(("also new".into(), cleave::theme::paint_component(body).to_string()));
-            }
-        }
-
-        if a.signature.severity != Severity::None {
-            let n = a.signature.ids.len();
-            let rules = if n == 1 { "rule" } else { "rules" };
-            let mut body = format!("{n} known-bad {rules}");
-            if let Some(cve) = &a.signature.cve {
-                body.push_str(&format!(" · {}", bold(cve)));
-            }
-            body.push_str(&format!(
-                "   {} {}",
-                dots(a.signature.severity),
-                paint(a.signature.severity, sev_word(a.signature.severity))
-            ));
-            rows.push(("confirmed".into(), body));
-        }
-
-        if a.identity.severity != Severity::None {
-            let mut body = "signer / publisher changed".to_string();
-            if a.identity.files > 1 {
-                body.push_str(&format!(" ({} files)", a.identity.files));
-            }
-            body.push_str(&format!(
-                "   {} {}",
-                dots(a.identity.severity),
-                paint(a.identity.severity, sev_word(a.identity.severity))
-            ));
-            rows.push(("identity".into(), body));
-        }
-
-        rows
+    fn bar(value: f32) -> String {
+        let filled = (value * BAR as f32).round().clamp(0.0, BAR as f32) as usize;
+        let sev = risk_severity(value);
+        format!(
+            "{}{}",
+            paint(sev, &"█".repeat(filled)),
+            "░".repeat(BAR - filled).truecolor(70, 80, 89),
+        )
     }
 
-    /// One sentence stating the finding, written for a human.
-    fn narrative(a: &Assessment, naming: &Naming, prop: &Proportionality) -> String {
-        let name = &naming.name;
-        if let Some(worst) = a.behavioral.categories.first() {
-            let what = strip_gained(worst.phrase);
-            if prop.disproportionate {
-                let bump = naming.bump.map(|b| b.label()).unwrap_or("minor");
-                return format!(
-                    "{name} gained {what} — disproportionate for a {bump} release."
-                );
-            }
-            return format!("{name} gained {what}.");
-        }
-        if a.signature.severity != Severity::None {
-            let n = a.signature.ids.len();
-            return format!("{name} matches {n} known-bad signature(s).");
-        }
-        if a.identity.severity != Severity::None {
-            return format!("{name} changed its signer or publisher.");
-        }
-        format!("{name} changed.")
-    }
-
-    /// `"gained an ifunc resolver"` → `"an ifunc resolver"`.
-    fn strip_gained(phrase: &str) -> &str {
-        phrase.strip_prefix("gained ").unwrap_or(phrase)
-    }
-
-    /// Map a model probability to a severity band for coloring.
-    fn risk_severity(p: f32) -> Severity {
-        if p >= 0.90 {
-            Severity::Critical
+    fn risk_word(p: f32) -> String {
+        let (word, sev) = if p >= 0.90 {
+            ("malware", Severity::Critical)
         } else if p >= 0.50 {
-            Severity::High
+            ("suspicious", Severity::High)
         } else if p >= 0.15 {
-            Severity::Medium
+            ("elevated", Severity::Medium)
         } else {
-            Severity::None
-        }
-    }
-
-    /// Left-pad a label to the body column, dimmed. Empty labels align
-    /// continuation rows under their parent.
-    fn pad(label: &str) -> String {
-        if label.is_empty() {
-            " ".repeat(LABEL)
-        } else {
-            format!("{}{}", cleave::theme::paint_component(label), " ".repeat(LABEL.saturating_sub(label.len())))
-        }
-    }
-
-    /// Word-wrap to `width` columns (plain text; spans are added by the caller).
-    fn wrap(text: &str, width: usize) -> Vec<String> {
-        let mut lines = Vec::new();
-        let mut cur = String::new();
-        for word in text.split(' ') {
-            if !cur.is_empty() && cur.len() + 1 + word.len() > width {
-                lines.push(std::mem::take(&mut cur));
-            }
-            if !cur.is_empty() {
-                cur.push(' ');
-            }
-            cur.push_str(word);
-        }
-        if !cur.is_empty() {
-            lines.push(cur);
-        }
-        lines
-    }
-
-    fn bold(text: &str) -> String {
-        use colored::Colorize;
-        text.bold().to_string()
-    }
-
-    fn stamp(sev: Severity) -> String {
-        let word = match sev {
-            Severity::Critical => "HOSTILE",
-            Severity::High => "SUSPICIOUS",
-            Severity::Medium | Severity::Low => "NOTABLE",
-            Severity::None => "CLEAN",
+            ("benign", Severity::None)
         };
-        paint(sev, &format!("[ {word} ]"))
+        if sev == Severity::None {
+            word.truecolor(102, 117, 127).to_string()
+        } else {
+            paint(sev, word)
+        }
     }
+
+    // ── the detail grid ──────────────────────────────────────────────────────
+
+    fn behavioral_grid(out: &mut String, a: &Assessment) {
+        let (fresh, expanded): (Vec<_>, Vec<_>) = a
+            .behavioral
+            .categories
+            .iter()
+            .partition(|c| a.behavioral.is_new_category(c));
+        class_group(out, &fresh, "new", PILL_PLUM, true);
+        class_group(out, &expanded, "expanded", PILL_PLUM_DIM, false);
+    }
+
+    fn class_group(out: &mut String, cats: &[&crate::rubric::Category], label: &str, color: (u8, u8, u8), fresh: bool) {
+        for (i, c) in cats.iter().enumerate() {
+            let cell = if i == 0 { pill_cell(label, color) } else { blank_cell() };
+            let name = pad_visible(&c.label.clone().bold().to_string(), &c.label, NAME_W);
+            let body = format!("{name} {}{}", locator(c), count_str(c, fresh));
+            out.push_str(&grid_line(&cell, &dots(c.severity), &body));
+        }
+    }
+
+    /// The namespace locator: common prefix shown once, divergent tails listed.
+    fn locator(c: &crate::rubric::Category) -> String {
+        const MAX_TAILS: usize = 3;
+        let refs: Vec<&str> = c.namespaces.iter().map(String::as_str).collect();
+        let head = common_prefix(&refs);
+        let mut tails: Vec<String> = c
+            .namespaces
+            .iter()
+            .map(|p| strip_prefix_path(p, &head))
+            .filter(|t| !t.is_empty())
+            .collect();
+        let overflow = tails.len().saturating_sub(MAX_TAILS);
+        tails.truncate(MAX_TAILS);
+        let mut s = head.clone().bold().to_string();
+        if !tails.is_empty() {
+            let joined = tails.join(&" · ".truecolor(70, 80, 89).to_string());
+            s.push_str(&format!("/{joined}").truecolor(120, 134, 144).to_string());
+        }
+        if overflow > 0 {
+            s.push_str(&format!(" +{overflow}").truecolor(102, 117, 127).to_string());
+        }
+        s
+    }
+
+    /// A count only when it carries information — a lone new trait is the default.
+    fn count_str(c: &crate::rubric::Category, fresh: bool) -> String {
+        let n = c.new_ids.len();
+        let base = match (fresh, n) {
+            (_, 0) | (true, 1) => String::new(),
+            (true, k) => format!("  {}", paint(c.severity, &format!("{k} new"))),
+            (false, k) => format!("  {}", paint(c.severity, &format!("+{k}"))),
+        };
+        if c.escalated_ids.is_empty() {
+            base
+        } else {
+            format!("{base}  {}", format!("{}↑", c.escalated_ids.len()).truecolor(102, 117, 127))
+        }
+    }
+
+    fn signature_grid(out: &mut String, a: &Assessment) {
+        if a.signature.severity == Severity::None {
+            return;
+        }
+        const MAX: usize = 4;
+        let n = a.signature.ids.len();
+        for (i, (sev, id, _)) in a.signature.ids.iter().take(MAX).enumerate() {
+            let cell = if i == 0 { pill_cell("signature", PILL_HOT) } else { blank_cell() };
+            let mut body = sig_name(id);
+            if i == 0 && let Some(cve) = &a.signature.cve {
+                body.push_str(&format!("   {}", paint(Severity::Critical, cve)));
+            }
+            out.push_str(&grid_line(&cell, &dots(*sev), &body));
+        }
+        if n > MAX {
+            out.push_str(&grid_line(
+                &blank_cell(),
+                &"·  ".truecolor(102, 117, 127).to_string(),
+                &format!("+{} more", n - MAX).truecolor(102, 117, 127).to_string(),
+            ));
+        }
+    }
+
+    fn identity_grid(out: &mut String, a: &Assessment) {
+        if a.identity.severity == Severity::None {
+            return;
+        }
+        for (i, ch) in a.identity.changes.iter().enumerate() {
+            let cell = if i == 0 { pill_cell("identity", PILL_SLATE) } else { blank_cell() };
+            let old = if ch.old.is_empty() { "none".to_string() } else { ch.old.clone() };
+            let new = if ch.new.is_empty() { "none".to_string() } else { ch.new.clone() };
+            let body = format!("{}: {} {} {}", ch.label, old, "→".truecolor(70, 80, 89), new.bold());
+            out.push_str(&grid_line(&cell, &dots(a.identity.severity), &body));
+        }
+    }
+
+    /// The evidence table — its own `member / locator / code / description`
+    /// columns, kept separate from the capability grid above.
+    pub(super) fn evidence_table(rows: &[Window]) -> String {
+        if rows.is_empty() {
+            return String::new();
+        }
+        let locw = rows.iter().map(|r| r.locator.chars().count()).max().unwrap_or(4);
+        let codew = rows.iter().map(|r| r.code.chars().count()).max().unwrap_or(0).min(54);
+        let mut out = format!("\n {}\n", pill_cell("evidence", PILL_OCEAN).trim_end());
+        let mut last: Option<&str> = None;
+        for r in rows {
+            let member = r.member.as_deref();
+            if member != last {
+                if let Some(m) = member {
+                    out.push_str(&format!("   {}\n", format!("📄 {m}").truecolor(120, 134, 144)));
+                }
+                last = member;
+            }
+            let loc = format!("{:>locw$}", r.locator, locw = locw);
+            let code = format!("{:codew$}", r.code, codew = codew);
+            let desc = if r.hostile {
+                paint(Severity::Critical, &r.desc)
+            } else {
+                r.desc.truecolor(120, 134, 144).to_string()
+            };
+            out.push_str(&format!(
+                "   {}  {}  {}\n",
+                loc.truecolor(70, 80, 89),
+                code.ink(),
+                desc,
+            ));
+        }
+        out
+    }
+
+    // ── grid + pill primitives ───────────────────────────────────────────────
+
+    fn grid_line(cell: &str, dots: &str, body: &str) -> String {
+        format!(" {cell}{dots} {body}\n")
+    }
+
+    fn pill_cell(label: &str, (r, g, b): (u8, u8, u8)) -> String {
+        let p = format!(" {label} ").bold().white().on_truecolor(r, g, b).to_string();
+        let vis = label.chars().count() + 2;
+        format!("{p}{}", " ".repeat(PILL_COL.saturating_sub(vis)))
+    }
+
+    fn blank_cell() -> String {
+        " ".repeat(PILL_COL)
+    }
+
+    /// Right-pad `painted` (carrying ANSI) to `width` visible columns.
+    fn pad_visible(painted: &str, plain: &str, width: usize) -> String {
+        let vis = plain.chars().count();
+        format!("{painted}{}", " ".repeat(width.saturating_sub(vis)))
+    }
+
+    // ── metrics ──────────────────────────────────────────────────────────────
 
     fn single_changed_file(diff: &DiffReportV1) -> Option<&FileDiffEntry> {
         let changed: Vec<&FileDiffEntry> = diff
@@ -519,32 +792,41 @@ mod header {
         (changed.len() == 1).then(|| changed[0])
     }
 
-    /// The most substantial metric movements, as `code +37% · init_array 2→1`.
-    /// Ranks changed numeric metrics by relative magnitude and keeps the top
-    /// few above a noise floor, so only genuinely large shifts surface.
-    fn metrics_line(file: &FileDiffEntry) -> Option<String> {
-        const FLOOR: f64 = 0.15; // 15% — below this is version-churn noise.
-        const KEEP: usize = 3;
+    fn metrics_body(file: &FileDiffEntry) -> Option<String> {
+        const FLOOR: f64 = 0.12;
+        const KEEP: usize = 5;
         let m = file.scopes.metrics.as_ref()?;
         let mut movers: Vec<(f64, String)> = Vec::new();
         for c in &m.changed {
+            // `load_segment_*` restate code size; `dependencies` and the loader
+            // flag are named in the structure section — don't repeat them here.
+            let p = &c.new.path;
+            // `load_segment_*`/`size_bytes` restate other movers; `dependencies`
+            // and the loader flag are named in the structure section.
+            if p.contains("load_segment")
+                || p.ends_with("size_bytes")
+                || p.contains("dependencies")
+                || p.contains("has_direct_loader_dep")
+            {
+                continue;
+            }
             let (Some(o), Some(n)) = (num(&c.old.value), num(&c.new.value)) else {
                 continue;
             };
             if o == n {
                 continue;
             }
-            let rel = if o != 0.0 {
-                (n - o).abs() / o.abs()
-            } else {
-                f64::INFINITY
-            };
+            let rel = if o != 0.0 { (n - o).abs() / o.abs() } else { f64::INFINITY };
             if rel < FLOOR {
                 continue;
             }
             movers.push((rel, describe(&c.new.path, o, n)));
         }
         movers.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // One row per label (the plain leading word), keeping the largest mover
+        // — so `relacount` and `dynrela_count` collapse to a single `relocs`.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        movers.retain(|(_, s)| seen.insert(s.split(' ').next().unwrap_or("").to_string()));
         movers.truncate(KEEP);
         if movers.is_empty() {
             return None;
@@ -554,31 +836,43 @@ mod header {
                 .into_iter()
                 .map(|(_, d)| d)
                 .collect::<Vec<_>>()
-                .join(" · "),
+                .join(&" · ".truecolor(102, 117, 127).to_string()),
         )
     }
 
-    /// Human phrasing for one metric delta. Percent for sizes/counts that grew
-    /// a lot; explicit `a→b` for small integer counts where the ratio reads
-    /// oddly (e.g. `init_array 2→1`).
     fn describe(path: &str, old: f64, new: f64) -> String {
         let leaf = path.rsplit(['.', '/']).next().unwrap_or(path);
         let label = if path.contains("dependencies") {
             "deps"
         } else {
             match leaf {
-                "code_size" | "size" | "size_bytes" => "code",
+                "code_size" => "code",
+                "size" | "size_bytes" => "size",
                 "init_array_count" => "init_array",
                 "dynrela_count" | "relacount" => "relocs",
                 other => other,
             }
         };
-        if old > 0.0 && old.max(new) >= 8.0 {
-            let pct = (new - old) / old * 100.0;
-            let sign = if pct >= 0.0 { "+" } else { "" };
-            format!("{label} {sign}{pct:.0}%")
+        let rel = if old != 0.0 { (new - old).abs() / old.abs() } else { 1.0 };
+        let sev = intensity_severity(rel);
+        let value = if old > 0.0 && old.max(new) >= 8.0 {
+            let arrow = if new >= old { "↑" } else { "↓" };
+            format!("{arrow}{:.0}%", (new - old).abs() / old * 100.0)
         } else {
-            format!("{label} {old:.0}→{new:.0}")
+            format!("{old:.0}→{new:.0}")
+        };
+        format!("{label} {}", paint(sev, &value))
+    }
+
+    fn intensity_severity(rel: f64) -> Severity {
+        if rel >= 0.50 {
+            Severity::Critical
+        } else if rel >= 0.20 {
+            Severity::High
+        } else if rel >= 0.05 {
+            Severity::Medium
+        } else {
+            Severity::None
         }
     }
 
@@ -586,16 +880,60 @@ mod header {
         v.as_f64()
     }
 
-    // ── shared painters ─────────────────────────────────────────────────────
-
-    fn sev_word(sev: Severity) -> &'static str {
-        match sev {
-            Severity::Critical => "critical",
-            Severity::High => "high",
-            Severity::Medium => "medium",
-            Severity::Low => "low",
-            Severity::None => "clean",
+    fn common_prefix(paths: &[&str]) -> String {
+        let Some(first) = paths.first() else {
+            return String::new();
+        };
+        let mut prefix: Vec<&str> = first.split('/').collect();
+        for p in &paths[1..] {
+            let segs: Vec<&str> = p.split('/').collect();
+            let keep = prefix.iter().zip(segs.iter()).take_while(|(a, b)| a == b).count();
+            prefix.truncate(keep);
         }
+        prefix.join("/")
+    }
+
+    fn strip_prefix_path(path: &str, prefix: &str) -> String {
+        if prefix.is_empty() {
+            return path.to_string();
+        }
+        path.strip_prefix(prefix)
+            .map(|r| r.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| path.to_string())
+    }
+
+    pub(super) fn sig_name(id: &str) -> String {
+        if let Some((_, leaf)) = id.rsplit_once("::") {
+            return leaf.to_string();
+        }
+        if let Some(rest) = id.strip_prefix("third_party/") {
+            let segs: Vec<&str> = rest.split('/').collect();
+            return match (segs.first(), segs.last()) {
+                (Some(v), Some(l)) if segs.len() > 1 => format!("{v}/{l}"),
+                (Some(v), _) => v.to_string(),
+                _ => rest.to_string(),
+            };
+        }
+        id.rsplit('/').next().unwrap_or(id).to_string()
+    }
+
+    // ── painters ─────────────────────────────────────────────────────────────
+
+    const PILL_PLUM: (u8, u8, u8) = (60, 30, 75);
+    const PILL_PLUM_DIM: (u8, u8, u8) = (44, 30, 52);
+    const PILL_HOT: (u8, u8, u8) = (127, 43, 43);
+    const PILL_TEAL: (u8, u8, u8) = (0, 60, 55);
+    const PILL_OCEAN: (u8, u8, u8) = (12, 58, 75);
+    const PILL_SLATE: (u8, u8, u8) = (55, 55, 58);
+
+    fn badge(sev: Severity) -> String {
+        let (word, (r, g, b)) = match sev {
+            Severity::Critical => ("HOSTILE", (176, 46, 46)),
+            Severity::High => ("SUSPICIOUS", (150, 105, 0)),
+            Severity::Medium | Severity::Low => ("NOTABLE", (0, 90, 140)),
+            Severity::None => ("CLEAN", (40, 110, 40)),
+        };
+        format!(" {word} ").bold().white().on_truecolor(r, g, b).to_string()
     }
 
     fn dots(sev: Severity) -> String {
@@ -608,12 +946,34 @@ mod header {
         paint(sev, d)
     }
 
+    fn risk_severity(p: f32) -> Severity {
+        if p >= 0.90 {
+            Severity::Critical
+        } else if p >= 0.50 {
+            Severity::High
+        } else if p >= 0.15 {
+            Severity::Medium
+        } else {
+            Severity::None
+        }
+    }
+
     fn paint(sev: Severity, text: &str) -> String {
         match sev {
             Severity::Critical => cleave::theme::paint_hostile(text).to_string(),
             Severity::High => cleave::theme::paint_suspicious(text).to_string(),
             Severity::Medium | Severity::Low => cleave::theme::paint_notable(text).to_string(),
             Severity::None => cleave::theme::paint_baseline(text).to_string(),
+        }
+    }
+
+    /// Regular terminal-foreground text (evidence code, left plain).
+    trait Ink {
+        fn ink(&self) -> String;
+    }
+    impl Ink for String {
+        fn ink(&self) -> String {
+            self.truecolor(205, 214, 221).to_string()
         }
     }
 }

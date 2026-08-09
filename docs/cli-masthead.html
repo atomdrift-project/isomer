@@ -1,0 +1,160 @@
+<title>isomer · masthead, refined</title>
+
+<style>
+  :root {
+    --bg:#eef2f2; --surface:#fff; --ink:#0f1a1e; --muted:#54606a; --faint:#7c8890;
+    --line:#d7e0e0; --brand:#0a8f9c; --brand-soft:#dff2f3;
+    --shadow: 0 1px 2px rgba(16,26,30,.06), 0 12px 30px rgba(16,26,30,.09);
+  }
+  :root:not([data-theme="light"]) { @media (prefers-color-scheme: dark) {
+    --bg:#090c10; --surface:#10161d; --ink:#e9eff1; --muted:#8d9aa2; --faint:#67757d;
+    --line:#202b33; --brand:#3ad0d8; --brand-soft:#0c2427;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 18px 44px rgba(0,0,0,.5);
+  } }
+  :root[data-theme="dark"] {
+    --bg:#090c10; --surface:#10161d; --ink:#e9eff1; --muted:#8d9aa2; --faint:#67757d;
+    --line:#202b33; --brand:#3ad0d8; --brand-soft:#0c2427;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 18px 44px rgba(0,0,0,.5);
+  }
+  :root {
+    --term-bg:#0b0f14; --ink0:#ccd6dd; --dim:#66757f; --faint2:#465059;
+    --hostile:#e0625f; --suspicious:#ffb02e; --notable:#38b6ff; --baseline:#63c07a;
+    --cyan:#3ecfd6; --slate:#5f7488;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; line-height:1.55; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:1000px; margin:0 auto; padding:clamp(28px,5vw,68px) clamp(18px,4vw,40px) 80px; }
+  .eyebrow { font-family:ui-monospace,Menlo,monospace; font-size:12px; letter-spacing:.22em; text-transform:uppercase; color:var(--brand); margin:0 0 14px; }
+  h1 { font-size:clamp(28px,4.6vw,44px); line-height:1.04; margin:0 0 15px; letter-spacing:-.02em; font-weight:660; text-wrap:balance; }
+  .lede { max-width:66ch; color:var(--muted); font-size:clamp(15px,1.6vw,17.5px); margin:0; }
+  .lede b { color:var(--ink); font-weight:620; }
+  .rule { height:1px; background:var(--line); border:0; margin:32px 0 0; }
+  .stack { display:flex; flex-direction:column; gap:44px; margin-top:40px; }
+  figure { margin:0; display:flex; flex-direction:column; gap:15px; }
+  .cap .n { font-family:ui-monospace,Menlo,monospace; font-size:12px; letter-spacing:.16em; text-transform:uppercase; color:var(--faint); display:flex; gap:10px; align-items:baseline; }
+  .cap .n b { color:var(--brand); font-weight:700; }
+  .cap h2 { font-size:21px; margin:5px 0 0; letter-spacing:-.01em; font-weight:640; }
+  .cap p { margin:3px 0 0; color:var(--muted); font-size:14.5px; max-width:62ch; }
+  .cap .who { color:var(--brand); font-weight:600; }
+  .term { background:var(--term-bg); border:1px solid #232c35; border-radius:12px; overflow:hidden; box-shadow:var(--shadow); }
+  .bar { display:flex; align-items:center; gap:8px; background:#161d25; padding:10px 14px; border-bottom:1px solid #232c35; }
+  .bar i { width:11px; height:11px; border-radius:50%; }
+  .r{background:#ec6a5e;} .y{background:#f4bf4f;} .grn{background:#61c554;}
+  .bar span { margin-left:8px; font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--dim); }
+  pre.cli { margin:0; padding:20px 22px; font-family:ui-monospace,"SF Mono","Cascadia Code",Menlo,monospace;
+    font-size:12.5px; line-height:1.72; color:var(--ink0); white-space:pre; overflow-x:auto; tab-size:2; }
+  .ico { display:inline-block; width:2ch; text-align:center; }
+  .cli b{font-weight:700;color:#e8eef1;} .ink0{color:var(--ink0);} .hot{color:var(--hostile);} .sus{color:var(--suspicious);}
+  .not{color:var(--notable);} .base{color:var(--baseline);} .cy{color:var(--cyan);}
+  .dim{color:var(--dim);} .fnt{color:var(--faint2);} .slate{color:var(--slate);}
+  .pill{font-weight:700;color:#fff;border-radius:3px;}
+  .p-plum{background:#3c1e4b;} .p-teal{background:#0c3f3a;} .p-ocean{background:#0c3a4b;} .p-slateb{background:#37373a;} .p-hot{background:#7f2b2b;}
+  .badge{font-weight:700;color:#fff;background:#b02e2e;padding:0 .6ch;border-radius:3px;}
+  footer{margin-top:52px;color:var(--faint);font-size:13.5px;}
+  footer code{font-family:ui-monospace,Menlo,monospace;color:var(--brand);background:var(--brand-soft);padding:1px 6px;border-radius:5px;font-size:12.5px;}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">isomer · terminal layout · masthead v2</p>
+  <h1>The masthead, cleaned up and on-grid.</h1>
+  <p class="lede">Same direction you liked — a human summary over the detail — with three fixes: the ✨ read
+  is just the phrase (no <b>llm · malicious</b> tag), the <b>evidence</b> is back so you can judge it, and
+  behavioral, signatures, metrics, and evidence now sit on <b>one grid</b> where the dots, names, and locators
+  all share an edge. Three ways to treat the left label column.</p>
+
+  <hr class="rule">
+
+  <div class="stack">
+
+    <!-- ═══ A · KEYS ═══ -->
+    <figure>
+      <div class="cap">
+        <div class="n"><b>A</b> Right-aligned keys</div>
+        <h2>Labels as a quiet gutter</h2>
+        <p>Section names right-align into a dim column, so the dots start at one edge and the names at another.
+        Nothing shouts; the grid carries it. <span class="who">The most restrained.</span></p>
+      </div>
+      <div class="term">
+        <div class="bar"><i class="r"></i><i class="y"></i><i class="grn"></i><span>isomer fs — keys</span></div>
+<pre class="cli">   <span class="badge"> HOSTILE </span>  <b>liblzma.so</b>   <span class="dim">5.4.5 → 5.6.0 · minor release</span>
+   <span class="ico">✨</span><span class="cy">XZ Utils supply chain backdoor</span>
+   <span class="ico">📊</span><span class="dim">malware risk</span>  <span class="base">0.00</span> <span class="fnt">▏</span><span class="base">░</span><span class="sus">░░</span><span class="hot">░░░░░░░░░░░░▉█</span><span class="fnt">▏</span> <span class="hot"><b>0.98</b></span>   <span class="hot">▲ +0.98</span>
+   <span class="slate">──────────────────────────────────────────────────────</span>
+        <span class="dim">new</span>  <span class="sus">●● </span> execution hijack     <b>binary/linking/runtime</b>
+             <span class="not">●  </span> hidden byte strings  <b>data/string/assembly</b>
+             <span class="not">●  </span> xor encoding         <b>data/encode/xor</b>
+   <span class="dim">expanded</span>  <span class="not">●  </span> runtime linkage      <b>binary/linking/runtime</b>  <span class="dim">+3</span>
+  <span class="dim">signature</span>  <span class="hot">●●●</span> elastic/xzbackdoor   <span class="hot">CVE-2024-3094</span>
+             <span class="hot">●●●</span> CRAIU/Backdoor
+             <span class="hot">●●●</span> CRAIU/Encstrings
+    <span class="dim">metrics</span>  <span class="fnt"> · </span> code <span class="sus">+37%</span>          <span class="dim">deps <span class="hot">1→2</span> · init_array <span class="hot">2→1</span></span>
+   <span class="dim">evidence</span>  <span class="fnt"> · </span> <span class="dim">47e9</span>   41 5c c3 0f 1f 40 00 f3   <span class="dim">liblzma backdoored</span>
+             <span class="fnt"> · </span> <span class="dim">2ddf9</span>  00 00 00 00 04 00 10 08   <span class="dim">encoded strings</span></pre>
+      </div>
+    </figure>
+
+    <!-- ═══ B · PILLS ═══ -->
+    <figure>
+      <div class="cap">
+        <div class="n"><b>B</b> Pill labels</div>
+        <h2>Color-blocked sections</h2>
+        <p>The same grid, but each section label is a fixed-width background pill — so groups read at a glance
+        and the dots/names/locators still line up beneath them. <span class="who">Most scannable.</span></p>
+      </div>
+      <div class="term">
+        <div class="bar"><i class="r"></i><i class="y"></i><i class="grn"></i><span>isomer fs — pills</span></div>
+<pre class="cli">   <span class="badge"> HOSTILE </span>  <b>liblzma.so</b>   <span class="dim">5.4.5 → 5.6.0 · minor release</span>
+   <span class="ico">✨</span><span class="cy">XZ Utils supply chain backdoor</span>
+   <span class="ico">📊</span><span class="dim">malware risk</span>  <span class="base">0.00</span> <span class="fnt">▏</span><span class="base">░</span><span class="sus">░░</span><span class="hot">░░░░░░░░░░░░▉█</span><span class="fnt">▏</span> <span class="hot"><b>0.98</b></span>   <span class="hot">▲ +0.98</span>
+
+   <span class="pill p-plum"> new       </span>  <span class="sus">●● </span> execution hijack     <b>binary/linking/runtime</b>
+                 <span class="not">●  </span> hidden byte strings  <b>data/string/assembly</b>
+                 <span class="not">●  </span> xor encoding         <b>data/encode/xor</b>
+   <span class="pill p-plum"> expanded  </span>  <span class="not">●  </span> runtime linkage      <b>binary/linking/runtime</b>  <span class="dim">+3</span>
+   <span class="pill p-hot"> signature </span>  <span class="hot">●●●</span> elastic/xzbackdoor   <span class="hot">CVE-2024-3094</span>
+                 <span class="hot">●●●</span> CRAIU/Backdoor <span class="fnt">·</span> CRAIU/Encstrings
+   <span class="pill p-teal"> metrics   </span>  <span class="fnt"> · </span> code <span class="sus">+37%</span> <span class="fnt">·</span> deps <span class="hot">1→2</span> <span class="fnt">·</span> init_array <span class="hot">2→1</span>
+   <span class="pill p-ocean"> evidence  </span>  <span class="fnt"> · </span> <span class="dim">47e9</span>   41 5c c3 0f 1f 40 00 f3   <span class="dim">liblzma backdoored</span>
+                 <span class="fnt"> · </span> <span class="dim">2ddf9</span>  00 00 00 00 04 00 10 08   <span class="dim">encoded strings</span></pre>
+      </div>
+    </figure>
+
+    <!-- ═══ C · EYEBROWS ═══ -->
+    <figure>
+      <div class="cap">
+        <div class="n"><b>C</b> Eyebrow groups</div>
+        <h2>No label column at all</h2>
+        <p>Drop the gutter entirely: a dim uppercase eyebrow heads each group, and the rows below it are a
+        pure dots · name · locator grid with the cleanest possible left edge.
+        <span class="who">The most editorial.</span></p>
+      </div>
+      <div class="term">
+        <div class="bar"><i class="r"></i><i class="y"></i><i class="grn"></i><span>isomer fs — eyebrows</span></div>
+<pre class="cli">   <span class="badge"> HOSTILE </span>  <b>liblzma.so</b>   <span class="dim">5.4.5 → 5.6.0 · minor release</span>
+   <span class="ico">✨</span><span class="cy">XZ Utils supply chain backdoor</span>
+   <span class="ico">📊</span><span class="dim">malware risk</span>  <span class="base">0.00</span> <span class="fnt">▏</span><span class="base">░</span><span class="sus">░░</span><span class="hot">░░░░░░░░░░░░▉█</span><span class="fnt">▏</span> <span class="hot"><b>0.98</b></span>   <span class="hot">▲ +0.98</span>
+
+   <span class="dim" style="letter-spacing:.15em">NEW BEHAVIOR</span> <span class="fnt">· absent in 5.4.5</span>
+     <span class="sus">●● </span> execution hijack     <b>binary/linking/runtime</b>
+     <span class="not">●  </span> hidden byte strings  <b>data/string/assembly</b>
+     <span class="not">●  </span> xor encoding         <b>data/encode/xor</b>
+   <span class="dim" style="letter-spacing:.15em">EXPANDED</span>
+     <span class="not">●  </span> runtime linkage      <b>binary/linking/runtime</b>  <span class="dim">+3</span>
+   <span class="dim" style="letter-spacing:.15em">SIGNATURES</span> <span class="fnt">· CVE-2024-3094</span>
+     <span class="hot">●●●</span> elastic/xzbackdoor   <span class="hot">CRAIU/Backdoor</span> <span class="fnt">·</span> <span class="hot">CRAIU/Encstrings</span>
+   <span class="dim" style="letter-spacing:.15em">METRICS</span>
+     <span class="fnt"> · </span> code <span class="sus">+37%</span> <span class="fnt">·</span> deps <span class="hot">1→2</span> <span class="fnt">·</span> init_array <span class="hot">2→1</span>
+   <span class="dim" style="letter-spacing:.15em">EVIDENCE</span>
+     <span class="dim">47e9</span>   41 5c c3 0f 1f 40 00 f3   <span class="dim">liblzma backdoored</span>
+     <span class="dim">2ddf9</span>  00 00 00 00 04 00 10 08   <span class="dim">encoded strings</span></pre>
+      </div>
+    </figure>
+
+  </div>
+
+  <footer>
+    All three share the masthead and the on-grid detail; they differ only in the left column — quiet keys,
+    color pills, or no column at all. Pick one and it becomes <code>--format terminal</code>.
+  </footer>
+</div>

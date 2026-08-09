@@ -1,0 +1,176 @@
+<title>isomer · lining it up — refined</title>
+
+<style>
+  :root {
+    --bg:#eef2f2; --surface:#fff; --ink:#0f1a1e; --muted:#54606a; --faint:#7c8890;
+    --line:#d7e0e0; --brand:#0a8f9c; --brand-soft:#dff2f3;
+    --shadow: 0 1px 2px rgba(16,26,30,.06), 0 12px 30px rgba(16,26,30,.09);
+  }
+  :root:not([data-theme="light"]) { @media (prefers-color-scheme: dark) {
+    --bg:#090c10; --surface:#10161d; --ink:#e9eff1; --muted:#8d9aa2; --faint:#67757d;
+    --line:#202b33; --brand:#3ad0d8; --brand-soft:#0c2427;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 18px 44px rgba(0,0,0,.5);
+  } }
+  :root[data-theme="dark"] {
+    --bg:#090c10; --surface:#10161d; --ink:#e9eff1; --muted:#8d9aa2; --faint:#67757d;
+    --line:#202b33; --brand:#3ad0d8; --brand-soft:#0c2427;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 18px 44px rgba(0,0,0,.5);
+  }
+  :root {
+    --term-bg:#0b0f14; --ink0:#ccd6dd; --dim:#66757f; --faint2:#465059;
+    --hostile:#e0625f; --suspicious:#ffb02e; --notable:#38b6ff; --baseline:#63c07a;
+    --cyan:#3ecfd6; --slate:#5f7488;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; line-height:1.55; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:1000px; margin:0 auto; padding:clamp(28px,5vw,68px) clamp(18px,4vw,40px) 80px; }
+  .eyebrow { font-family:ui-monospace,Menlo,monospace; font-size:12px; letter-spacing:.22em;
+    text-transform:uppercase; color:var(--brand); margin:0 0 14px; }
+  h1 { font-size:clamp(28px,4.6vw,44px); line-height:1.04; margin:0 0 15px; letter-spacing:-.02em; font-weight:660; text-wrap:balance; }
+  .lede { max-width:66ch; color:var(--muted); font-size:clamp(15px,1.6vw,17.5px); margin:0; }
+  .lede b { color:var(--ink); font-weight:620; }
+  .fixes { max-width:66ch; margin:18px 0 0; padding:0; list-style:none; display:flex; flex-direction:column; gap:6px;
+    font-size:14.5px; color:var(--muted); }
+  .fixes li { padding-left:20px; position:relative; }
+  .fixes li::before { content:"✓"; position:absolute; left:0; color:var(--brand); font-weight:700; }
+  .rule { height:1px; background:var(--line); border:0; margin:32px 0 0; }
+  .stack { display:flex; flex-direction:column; gap:44px; margin-top:40px; }
+  figure { margin:0; display:flex; flex-direction:column; gap:15px; }
+  .cap .n { font-family:ui-monospace,Menlo,monospace; font-size:12px; letter-spacing:.16em; text-transform:uppercase;
+    color:var(--faint); display:flex; gap:10px; align-items:baseline; }
+  .cap .n b { color:var(--brand); font-weight:700; }
+  .cap h2 { font-size:21px; margin:5px 0 0; letter-spacing:-.01em; font-weight:640; }
+  .cap p { margin:3px 0 0; color:var(--muted); font-size:14.5px; max-width:58ch; }
+  .cap .who { color:var(--brand); font-weight:600; }
+  .term { background:var(--term-bg); border:1px solid #232c35; border-radius:12px; overflow:hidden; box-shadow:var(--shadow); }
+  .bar { display:flex; align-items:center; gap:8px; background:#161d25; padding:10px 14px; border-bottom:1px solid #232c35; }
+  .bar i { width:11px; height:11px; border-radius:50%; }
+  .r{background:#ec6a5e;} .y{background:#f4bf4f;} .g{background:#61c554;}
+  .bar span { margin-left:8px; font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--dim); }
+  pre.cli { margin:0; padding:20px; font-family:ui-monospace,"SF Mono","Cascadia Code",Menlo,monospace;
+    font-size:12.5px; line-height:1.66; color:var(--ink0); white-space:pre; overflow-x:auto; tab-size:2; }
+  .cli b{font-weight:700;color:#e8eef1;} .ink0{color:var(--ink0);} .hot{color:var(--hostile);} .sus{color:var(--suspicious);}
+  .not{color:var(--notable);} .base{color:var(--baseline);} .cy{color:var(--cyan);}
+  .dim{color:var(--dim);} .fnt{color:var(--faint2);} .slate{color:var(--slate);}
+  .pill{font-weight:700;color:#fff;border-radius:3px;}
+  .p-hot{background:#d64541;} .p-plum{background:#3c1e4b;} .p-teal{background:#0c3f3a;}
+  .p-ochre{background:#4b3700;} .p-ocean{background:#0c3a4b;} .p-slate{background:#37373a;}
+  .tag{font-weight:700;font-size:.86em;color:#0b0f14;background:var(--suspicious);border-radius:2px;padding:0 .3ch;}
+  footer{margin-top:52px;color:var(--faint);font-size:13.5px;}
+  footer code{font-family:ui-monospace,Menlo,monospace;color:var(--brand);background:var(--brand-soft);padding:1px 6px;border-radius:5px;font-size:12.5px;}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">isomer · terminal layout · v2</p>
+  <h1>Layout C, dressed properly.</h1>
+  <p class="lede">Three refinements of the <b>Banner Rail</b> you liked, each folding in the pieces you
+  called out — and one new idea: every capability is marked <b>new</b> vs escalated, and the added trait
+  <b>namespaces</b> (the path before <span class="cy">::</span>) are listed so you see exactly which
+  behaviors appeared.</p>
+  <ul class="fixes">
+    <li>Section <b>pills</b> (behavioral · signature · metrics · evidence) — all the same width now</li>
+    <li>The <b>risk gauge</b> from B, made legible: both versions on a labeled benign→malware scale</li>
+    <li><b>New vs existing</b>: capabilities absent in the old version are flagged, with their added namespaces</li>
+    <li>Full palette — cyan brand, magnitude-tinted numbers, scan's bold-white-on-color verdict badge</li>
+  </ul>
+
+  <hr class="rule">
+
+  <div class="stack">
+
+    <!-- ═══ 1 · COMMAND RAIL ═══ -->
+    <figure>
+      <div class="cap">
+        <div class="n"><b>1</b> Command Rail</div>
+        <h2>The consolidation</h2>
+        <p>Everything you liked in one: banner, severity rail, equal pills, the two-bar risk gauge,
+        namespaces under each capability. <span class="who">The everyone answer.</span></p>
+      </div>
+      <div class="term">
+        <div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>isomer fs — liblzma · Command Rail</span></div>
+<pre class="cli"><span class="cy">isomer</span> <span class="slate">──────────────────────────────────────</span> <span class="dim">supply-chain differential</span>
+
+ <span class="pill p-hot"> HOSTILE </span>  <b>liblzma.so</b>   <span class="dim">5.4.5 → 5.6.0 · minor release</span>
+
+ <span class="dim">risk</span>   <span class="dim">5.4.5</span>  <span class="base">0.00</span>  <span class="fnt">▏</span><span class="fnt">░░░░░░░░░░░░░░░░░░░░</span><span class="fnt">▏</span>  <span class="dim">benign</span>
+        <span class="dim">5.6.0</span>  <span class="hot"><b>0.98</b></span>  <span class="fnt">▏</span><span class="hot">███████████████████▉</span><span class="fnt">▏</span>  <span class="hot">malware</span>   <span class="hot">▲ +0.98</span>
+
+ <span class="hot">┃</span> <span class="dim">An</span> <span class="sus">ifunc resolver</span> <span class="dim">appeared — behavior liblzma never had, and the</span>
+ <span class="hot">┃</span> <span class="dim">xz backdoor's own hook. Disproportionate for a minor release.</span>
+
+ <span class="hot">┃</span> <span class="pill p-plum"> behavioral </span>  <span class="tag">NEW</span> <span class="dim">capabilities absent in 5.4.5</span>
+ <span class="hot">┃</span>   <span class="sus">●●</span> <b>binary/linking/runtime</b>   <span class="dim">execution hijack + loaders</span>  <span class="sus">4 new</span>
+ <span class="hot">┃</span>   <span class="not">●</span>  <b>data/encode/xor</b>          <span class="dim">xor-encoded data</span>            <span class="not">1 new</span>
+ <span class="hot">┃</span>   <span class="not">●</span>  <b>data/string/assembly</b>     <span class="dim">hidden byte strings</span>         <span class="not">1 new</span>
+ <span class="hot">┃</span> <span class="pill p-hot"> signature  </span>  <span class="hot">●●●</span> 4 known-bad rules <span class="dim">·</span> <span class="hot">CVE-2024-3094</span>
+ <span class="hot">┃</span> <span class="pill p-teal"> metrics    </span>  code <span class="sus">↑37%</span> <span class="dim">·</span> deps <span class="hot">↑100%</span> <span class="dim">·</span> init_array <span class="hot">↓50%</span>
+
+ <span class="slate">└</span> <span class="pill p-ocean"> evidence   </span>
+   <span class="dim">47f0</span>  <span class="ink0">f3 0f 1e fa 55 48 89 f5 4c 89 ce 53</span>  <span class="hot">// liblzma backdoored</span>
+   <span class="dim">bdae</span>  <span class="ink0">4d 8b 6c 24 08 45 8b 3c 24 4c 8b 63</span>  <span class="hot">// injected backdoor code</span></pre>
+      </div>
+    </figure>
+
+    <!-- ═══ 2 · ANALYST GRID ═══ -->
+    <figure>
+      <div class="cap">
+        <div class="n"><b>2</b> Analyst Grid</div>
+        <h2>Namespaces as a table</h2>
+        <p>A <span class="tag">NEW</span>/<span class="sus">↑</span> column, then namespace, trait count, and the exact leaf.
+        Densest and most technical. <span class="who">The security engineer's view.</span></p>
+      </div>
+      <div class="term">
+        <div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>isomer fs — liblzma · Analyst Grid</span></div>
+<pre class="cli"><span class="cy">isomer</span> <span class="slate">──────────────────────────────────────</span> <span class="dim">supply-chain differential</span>
+
+ <span class="pill p-hot"> HOSTILE </span>  <b>liblzma.so</b>  <span class="dim">5.4.5 → 5.6.0 · minor</span>   <span class="dim">risk</span> <span class="base">0.00</span><span class="dim">→</span><span class="hot"><b>0.98</b></span> <span class="hot">▲.98</span>
+
+ <span class="pill p-plum"> behavioral </span>
+  <span class="tag">NEW</span> <span class="sus">●●</span>  <b>binary/linking/runtime</b>    <span class="dim">·4 traits</span>   <span class="dim">ifunc, loader-dep, tls-get-addr</span>
+  <span class="tag">NEW</span> <span class="not">●</span>   <b>data/encode/xor</b>           <span class="dim">·1 trait</span>   <span class="dim">unusual-character-combinations</span>
+  <span class="tag">NEW</span> <span class="not">●</span>   <b>data/string/assembly</b>      <span class="dim">·1 trait</span>   <span class="dim">stack-immediate-byte-string</span>
+ <span class="pill p-hot"> signature  </span>
+  <span class="hot">●●●</span> <b>third_party</b> <span class="dim">×4</span>            <span class="dim">·</span> <span class="hot">CVE-2024-3094</span> <span class="dim">(elastic, CRAIU, SigBase)</span>
+ <span class="pill p-teal"> metrics    </span>
+  code <span class="sus">↑37%</span>   deps <span class="hot">↑100%</span>   init_array <span class="hot">↓50%</span>   size <span class="sus">↑27%</span>
+ <span class="pill p-ocean"> evidence   </span>
+  <span class="dim">47f0</span>  <span class="ink0">f3 0f 1e fa 55 48 89 f5 4c 89 ce 53</span>  <span class="hot">// liblzma backdoored</span>
+  <span class="dim">2de00</span> <span class="ink0">04 00 10 08 03 00 00 00 03 00 00 00</span>  <span class="hot">// encoded strings</span></pre>
+      </div>
+    </figure>
+
+    <!-- ═══ 3 · EXECUTIVE BRIEF ═══ -->
+    <figure>
+      <div class="cap">
+        <div class="n"><b>3</b> Executive Brief</div>
+        <h2>Plain language, gauge first</h2>
+        <p>Risk stated as a sentence and one big scale; capabilities named in English with the namespace as
+        the technical footnote. Still shows proof. <span class="who">The CTO's view.</span></p>
+      </div>
+      <div class="term">
+        <div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>isomer fs — liblzma · Executive Brief</span></div>
+<pre class="cli"> <b>liblzma.so</b>   <span class="dim">5.4.5 → 5.6.0</span>                       <span class="pill p-hot"> HOSTILE </span>
+
+ <span class="dim">Malware risk jumped from</span> <span class="base">0%</span> <span class="dim">to</span> <span class="hot"><b>98%</b></span><span class="dim">.</span>
+ <span class="base">benign</span> <span class="fnt">▏</span><span class="base">░</span><span class="sus">░░</span><span class="hot">░░░░░░░░░░░░░░░░▉█</span><span class="fnt">▏</span> <span class="hot">malware</span>          <span class="hot">▲ +98 pts</span>
+
+ <span class="hot">┃</span> <span class="dim">A compression library gained the ability to</span> <span class="sus">hijack code</span>
+ <span class="hot">┃</span> <span class="sus">execution</span> <span class="dim">— a capability it never had. This is the xz backdoor.</span>
+
+  <span class="tag">NEW</span> <span class="dim">capability</span>   <b>code-execution hijack</b>   <span class="dim">binary/linking/runtime</span>
+  <span class="tag">NEW</span> <span class="dim">capability</span>   <b>data obfuscation</b>        <span class="dim">data/encode/xor · string/assembly</span>
+  <span class="hot">✓</span>   <span class="dim">confirmed</span>    <b>4 known-malware rules</b>   <span class="hot">CVE-2024-3094</span>
+
+  <span class="pill p-ocean"> proof      </span>
+   <span class="dim">47f0</span>  <span class="ink0">f3 0f 1e fa 55 48 89 f5 4c 89 ce 53</span>  <span class="hot">// liblzma backdoored</span></pre>
+      </div>
+    </figure>
+
+  </div>
+
+  <footer>
+    Pick one, or mix — e.g. Command Rail's frame with the Executive gauge. Whatever wins becomes
+    <code>--format terminal</code>; the namespace/new-vs-existing data is the same underneath.
+  </footer>
+</div>
