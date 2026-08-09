@@ -69,6 +69,11 @@ pub(crate) struct Ev<'a> {
     pub member: Option<&'a str>,
     pub locator: &'a str,
     pub code: &'a str,
+    /// Source line above/below the match (hostile text matches only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<&'a str>,
     pub desc: &'a str,
     pub hostile: bool,
 }
@@ -127,6 +132,9 @@ pub(crate) struct Prop<'a> {
     pub disproportionate: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<&'a str>,
+    /// Behavior-vs-content skew note (the surgical-implant tell), when it fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skew: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -164,6 +172,9 @@ pub(crate) struct Signature<'a> {
 #[derive(Serialize)]
 pub(crate) struct SigId<'a> {
     pub id: &'a str,
+    /// The rule's human description, when it carries one.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub desc: &'a str,
     /// Per-signature severity word.
     pub crit: &'static str,
     /// Absent on the old side (vs an escalation of an existing match).
@@ -224,7 +235,7 @@ mod tests {
                 new_severity: "critical",
                 gate: Gate { on: "new", fail_on: "high", severity: "critical", fail: true },
                 risk: Some(Risk { old: 0.1, new: 0.98, delta: 0.88, model: "azoth" }),
-                proportionality: Prop { disproportionate: true, note: None },
+                proportionality: Prop { disproportionate: true, note: None, skew: None },
                 behavioral: Behavioral { severity: "high", categories: Vec::new() },
                 signature: Signature { severity: "none", cve: None, count: 0, ids: Vec::new() },
                 identity: Identity { severity: "none", changes: Vec::new() },

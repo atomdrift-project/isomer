@@ -81,7 +81,7 @@ impl Assessment {
             ids.extend(c.new_ids.iter().cloned());
             ids.extend(c.escalated_ids.iter().cloned());
         }
-        ids.extend(self.signature.ids.iter().map(|(_, id, _)| id.clone()));
+        ids.extend(self.signature.ids.iter().map(|m| m.id.clone()));
         ids
     }
 
@@ -102,8 +102,8 @@ impl Assessment {
             .signature
             .ids
             .iter()
-            .filter(|(_, _, is_new)| *is_new)
-            .map(|(s, _, _)| *s)
+            .filter(|m| m.is_new)
+            .map(|m| m.severity)
             .max()
             .unwrap_or(Severity::None);
         // Structural facts are all added kv entries — inherently new.
@@ -120,9 +120,21 @@ pub(crate) struct Signature {
     pub severity: Severity,
     /// A CVE referenced by any matched rule, if present.
     pub cve: Option<String>,
-    /// `(severity, full-id, is_new)` triples, worst first. `is_new` is true
-    /// when the signature was absent on the old side (vs escalated).
-    pub ids: Vec<(Severity, String, bool)>,
+    /// Matched rules, worst first.
+    pub ids: Vec<SigMatch>,
+}
+
+/// One matched known-bad rule.
+#[derive(Debug)]
+pub(crate) struct SigMatch {
+    pub severity: Severity,
+    /// Full trait id of the matched rule.
+    pub id: String,
+    /// The rule's human description — the campaign or intent an analyst
+    /// triages on. May be empty when the rule carries none.
+    pub desc: String,
+    /// True when the rule was absent on the old side (vs escalated).
+    pub is_new: bool,
 }
 
 /// Signer / publisher drift — the *meaningful* fields only (version is
@@ -165,7 +177,7 @@ pub(crate) struct StructFact {
 /// from one that merely gained a trait.
 pub(crate) fn assess(diff: &DiffReportV1, base_classes: &std::collections::HashSet<String>) -> Assessment {
     let mut groups: HashMap<&'static str, Category> = HashMap::new();
-    let mut sig_ids: Vec<(Severity, String, bool)> = Vec::new();
+    let mut sig_ids: Vec<SigMatch> = Vec::new();
     let mut cve: Option<String> = None;
     let mut identity_changes: Vec<IdentityChange> = Vec::new();
 
@@ -177,7 +189,12 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &std::collections::HashS
             if is_signature(&tc.id) {
                 let sev = severity_from_crit(tc.crit);
                 if sev != Severity::None {
-                    sig_ids.push((sev, tc.id.clone(), is_new));
+                    sig_ids.push(SigMatch {
+                        severity: sev,
+                        id: tc.id.clone(),
+                        desc: tc.desc.clone(),
+                        is_new,
+                    });
                     if cve.is_none() {
                         cve = extract_cve(&tc.id);
                     }
@@ -219,8 +236,10 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &std::collections::HashS
             .then(a.class.cmp(&b.class))
     });
 
-    sig_ids.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    sig_ids.dedup();
+    // One entry per rule with its worst criticality kept, then worst first.
+    sig_ids.sort_by(|a, b| a.id.cmp(&b.id).then(b.severity.cmp(&a.severity)));
+    sig_ids.dedup_by(|a, b| a.id == b.id);
+    sig_ids.sort_by(|a, b| b.severity.cmp(&a.severity).then(a.id.cmp(&b.id)));
 
     // A class is new when the base version carried no trait of it.
     let new_categories: std::collections::HashSet<String> = categories
@@ -234,7 +253,7 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &std::collections::HashS
         .map(|c| c.severity)
         .max()
         .unwrap_or(Severity::None);
-    let signature_sev = sig_ids.iter().map(|s| s.0).max().unwrap_or(Severity::None);
+    let signature_sev = sig_ids.iter().map(|s| s.severity).max().unwrap_or(Severity::None);
     let identity_sev = if identity_changes.is_empty() {
         Severity::None
     } else {

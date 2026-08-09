@@ -13,16 +13,28 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// One evidence row for the table renderer: where it is, what the code/bytes
-/// are, and the rule's description.
+/// Width budget (chars) for the code column of an evidence row.
+pub(crate) const CODE_W: usize = 54;
+
+/// One evidence row for the table renderer: where the match is, the code or
+/// bytes at the match, and the rule's description. Hostile text matches also
+/// carry their neighboring source lines so the reader sees the match in situ.
 #[derive(Debug)]
 pub(crate) struct Window {
     /// Archive member path, when the hit is inside one; `None` for the root.
     pub member: Option<String>,
-    /// Source line number, or hex byte offset for binaries.
+    /// Absolute byte offset of the match — the file-order sort key.
+    pub loc: u64,
+    /// 1-based source line of the match; `None` for binary windows.
+    pub line: Option<u64>,
+    /// Display locator: the line number, or a hex byte offset for binaries.
     pub locator: String,
-    /// The matched source line (truncated) or a hex byte run.
+    /// The matched source line (windowed around the match) or a hex byte run.
     pub code: String,
+    /// The source line above the match (hostile text matches only).
+    pub before: Option<String>,
+    /// The source line below the match (hostile text matches only).
+    pub after: Option<String>,
     /// The matching rule's human description.
     pub desc: String,
     /// Whether the matching finding is hostile (for coloring).
@@ -61,13 +73,12 @@ pub(crate) fn windows(
         }
     }
 
-    // Collect every hit line (bounded), then rank so the strongest evidence
-    // leads: the note's criticality picks which finding a shared line is
-    // attributed to, and hostile rows sort ahead of the rest.
+    // Collect every hit (bounded). The note's criticality picks which finding
+    // a shared chunk is attributed to.
     let mut rows: Vec<Window> = Vec::new();
-    for (member, fa) in &candidates {
-        for line in &fa.context {
-            let Some(note) = line
+    'outer: for (member, fa) in &candidates {
+        for chunk in &fa.context {
+            let Some(note) = chunk
                 .notes
                 .iter()
                 .filter(|n| keep.contains(n.id.as_str()))
@@ -75,33 +86,114 @@ pub(crate) fn windows(
             else {
                 continue;
             };
-            let (locator, code) = match line.line {
-                Some(l) => {
-                    let text = String::from_utf8_lossy(&line.data);
-                    let first = text.lines().next().unwrap_or("").trim_end();
-                    (l.to_string(), truncate(first, 54))
-                }
-                None => (format!("{:x}", line.loc), hex_run(&line.data, 11)),
+            let hostile = matches!(note.crit, Criticality::Hostile);
+            // The chunk carries bytes *around* the match; the note's offset
+            // locates the match itself within it.
+            let delta = usize::try_from(note.off.saturating_sub(chunk.loc))
+                .unwrap_or(usize::MAX)
+                .min(chunk.data.len());
+            let mut row = match chunk.line {
+                Some(first_line) => text_row(chunk, first_line, delta, hostile),
+                None => Window {
+                    member: None,
+                    loc: note.off,
+                    line: None,
+                    locator: format!("{:x}", note.off),
+                    code: hex_run(&chunk.data[delta..], 11),
+                    before: None,
+                    after: None,
+                    desc: String::new(),
+                    hostile,
+                },
             };
-            rows.push(Window {
-                member: member.clone(),
-                locator,
-                code,
-                desc: if note.desc.is_empty() { "matched".into() } else { note.desc.as_str().to_string() },
-                hostile: matches!(note.crit, Criticality::Hostile),
-            });
+            row.member = member.clone();
+            row.desc = if note.desc.is_empty() { "matched".into() } else { note.desc.as_str().to_string() };
+            rows.push(row);
             if rows.len() >= 120 {
-                break;
+                break 'outer;
             }
         }
     }
-    // Hostile first (stable within a tier), then one row per distinct
-    // description so the compact view shows variety, not the same rule repeated.
+    // Rank hostile first (stable within a tier) to pick the survivors, keep one
+    // row per distinct rule so the compact view shows variety — then restore
+    // file order, so the evidence reads top-to-bottom like the source.
     rows.sort_by_key(|r| !r.hostile);
     let mut seen: HashSet<String> = HashSet::new();
     rows.retain(|r| seen.insert(r.desc.clone()));
     rows.truncate(limit);
+    rows.sort_by(|a, b| a.member.cmp(&b.member).then(a.loc.cmp(&b.loc)));
     Ok(rows)
+}
+
+/// Build the text-file row: the source line containing the match, windowed
+/// around the match column, with its neighbor lines as context when hostile.
+/// `member` and `desc` are filled by the caller.
+fn text_row(chunk: &cleave::types::ContextLine, first_line: u64, delta: usize, hostile: bool) -> Window {
+    let spans = line_spans(&chunk.data);
+    let idx = spans
+        .iter()
+        .position(|&(s, e)| delta >= s && delta <= e)
+        .unwrap_or(0);
+    let (s, e) = spans[idx];
+    // A chunk can open mid-line (`col` > 1); the first segment is then a
+    // continuation and its display marks the clipped start.
+    let clipped = idx == 0 && chunk.col.unwrap_or(1) > 1;
+    let context = |i: usize| {
+        let (cs, ce) = spans[i];
+        let text = String::from_utf8_lossy(&chunk.data[cs..ce]);
+        let text = text.trim_end();
+        if i == 0 && chunk.col.unwrap_or(1) > 1 {
+            truncate(&format!("…{text}"), CODE_W)
+        } else {
+            truncate(text, CODE_W)
+        }
+    };
+    Window {
+        member: None,
+        loc: chunk.loc + delta as u64,
+        line: Some(first_line + idx as u64),
+        locator: (first_line + idx as u64).to_string(),
+        code: excerpt(&chunk.data[s..e], delta - s, clipped),
+        // Blank neighbors carry no information — a bare line number in the
+        // table reads as a glitch, so drop them.
+        before: (hostile && idx > 0).then(|| context(idx - 1)).filter(|t| !t.is_empty()),
+        after: (hostile && idx + 1 < spans.len()).then(|| context(idx + 1)).filter(|t| !t.is_empty()),
+        desc: String::new(),
+        hostile,
+    }
+}
+
+/// Byte ranges of the lines within `data`, split on `\n` (terminator excluded).
+fn line_spans(data: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = 0;
+    for (i, b) in data.iter().enumerate() {
+        if *b == b'\n' {
+            spans.push((start, i));
+            start = i + 1;
+        }
+    }
+    spans.push((start, data.len()));
+    spans
+}
+
+/// Render one source line for the code column. Short lines show whole; a line
+/// wider than [`CODE_W`] (obfuscated payloads run to thousands of chars) shows
+/// a window opening just before the match column, `…` marking clipped ends.
+fn excerpt(line: &[u8], col: usize, clipped: bool) -> String {
+    let text = String::from_utf8_lossy(line);
+    let trimmed = text.trim_end();
+    let total = trimmed.chars().count();
+    if total <= CODE_W {
+        return if clipped { format!("…{trimmed}") } else { trimmed.to_string() };
+    }
+    let at = String::from_utf8_lossy(&line[..col.min(line.len())]).chars().count();
+    let keep = CODE_W - 2;
+    let start = at.saturating_sub(12).min(total - keep);
+    let kept: String = trimmed.chars().skip(start).take(keep).collect();
+    let head = if start > 0 || clipped { "…" } else { "" };
+    let tail = if start + keep < total { "…" } else { "" };
+    format!("{head}{kept}{tail}")
 }
 
 fn crit_rank(c: cleave::Criticality) -> u8 {
@@ -151,7 +243,6 @@ fn truncate(s: &str, max: usize) -> String {
 ///
 /// `compact` caps the number of windows for the default view; `--explain`
 /// passes `false` for the fuller set.
-#[allow(dead_code)]
 pub(crate) fn render(
     new_path: &Path,
     options: &cleave::AnalysisOptions,

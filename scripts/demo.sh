@@ -54,7 +54,7 @@ run "$DATA/rand-user-agent/clean/index.js" "$DATA/rand-user-agent/compromised/in
 
 case_header "node-ipc / protestware" \
     "Geo-targeted destructive payload across two published tarballs; also
-exercises archive-member diffing and identity drift."
+exercises archive-member diffing."
 run "$DATA/node-ipc/node-ipc-12.0.0.tgz" "$DATA/node-ipc/node-ipc-12.0.1.tgz"
 
 printf '\n%bDone. Full evidence for any case: isomer fs <old> <new> (no sed).%b\n' "$DIM" "$R"
