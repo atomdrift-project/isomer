@@ -48,6 +48,15 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
                 out.push_str(&evidence_hunks(&rows));
             }
         }
+        // Behavior-bearing atoms a source change introduced below the finding
+        // floor — the "$HOME read, base64 heredoc" that no single trait scored
+        // high enough to name. Shown on every speaking verdict (not gated on
+        // `detailed`): when they are the *only* reason the diff spoke, they are
+        // the whole story.
+        let obs = a.observations();
+        if !obs.is_empty() {
+            out.push_str(&observations_section(&obs));
+        }
     } else if let Some(existing) =
         crate::evidence::existing_risk(&a.pairs, a.options, &a.naming.name)
     {
@@ -693,6 +702,49 @@ fn evidence_note() -> String {
 /// its coordinate, and what it does, drilled from the fetched dependency's own
 /// analysis. A dependency that couldn't be fetched shows its reason, never a
 /// blank clean line.
+/// Sub-Notable behavioral atoms a source change introduced — the changes the
+/// finding floor drops. Purely informational: severity is never raised, the
+/// gate never fails, but a reviewer sees that a file gained a `$HOME` read or a
+/// base64 heredoc. Deduplicated by description and capped, so a file that
+/// gained many atoms lists a representative few rather than a screenful.
+fn observations_section(atoms: &[&crate::analysis::Atom]) -> String {
+    const CAP: usize = 6;
+    let mut seen = std::collections::HashSet::new();
+    let mut labels: Vec<String> = Vec::new();
+    for at in atoms {
+        let label = if at.desc.is_empty() {
+            crate::rubric::short_name(&at.id)
+        } else {
+            at.desc.clone()
+        };
+        if seen.insert(label.clone()) {
+            labels.push(label);
+        }
+    }
+    let extra = labels.len().saturating_sub(CAP);
+    let mut out = String::new();
+    for (i, label) in labels.iter().take(CAP).enumerate() {
+        let cell = if i == 0 {
+            pill_cell("observed", PILL_SLATE)
+        } else {
+            blank_cell()
+        };
+        out.push_str(&grid_line(
+            &cell,
+            &dots(Severity::None),
+            &crate::printable(label).truecolor(150, 160, 168).to_string(),
+        ));
+    }
+    if extra > 0 {
+        out.push_str(&grid_line(
+            &blank_cell(),
+            &dots(Severity::None),
+            &format!("+{extra} more").truecolor(102, 117, 127).to_string(),
+        ));
+    }
+    out
+}
+
 fn dependencies_section(deps: &[crate::deps::DepProfile]) -> String {
     let mut out = String::new();
     let indent = " ".repeat(PILL_COL + NAME_W + 4);

