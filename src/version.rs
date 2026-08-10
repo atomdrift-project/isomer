@@ -43,7 +43,8 @@ impl Version {
     pub(crate) fn detect(name: &str) -> Option<Self> {
         let mut best: Option<Version> = None;
         let mut best_parts = 0usize;
-        for run in version_char_runs(name) {
+        // Every maximal run of ASCII digits and dots is a candidate token.
+        for run in name.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
             let tok = run.trim_matches('.');
             let parts = tok.split('.').count();
             if parts < 2 {
@@ -58,13 +59,6 @@ impl Version {
         }
         best
     }
-}
-
-/// Maximal substrings composed only of ASCII digits and `.`.
-fn version_char_runs(s: &str) -> Vec<&str> {
-    s.split(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .filter(|run| !run.is_empty())
-        .collect()
 }
 
 /// Which version component moved.

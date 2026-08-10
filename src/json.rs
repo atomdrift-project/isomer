@@ -40,6 +40,10 @@ pub(crate) struct Envelope<'a, R: Serialize> {
     /// file order (locator · code · description). Present so the UI and a cache
     /// can render the evidence table without re-reading the artifact.
     pub evidence: Vec<Ev<'a>>,
+    /// What each dependency the change *added* can do, from fetching and
+    /// analyzing it (`--deps`). Absent when the flag wasn't set.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<Dep<'a>>,
     /// Optional `--llm` interpretation (mirrors scan's `llm`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm: Option<Llm<'a>>,
@@ -48,6 +52,22 @@ pub(crate) struct Envelope<'a, R: Serialize> {
     /// reading top-down meets the verdict before the bulk, and so a consumer
     /// (prism, the CLI cache) can regenerate anything the curated view omits.
     pub raw: &'a R,
+}
+
+/// One added dependency, profiled by fetching and analyzing it.
+#[derive(Serialize)]
+pub(crate) struct Dep<'a> {
+    /// The declared coordinate, `peacenotwar@^9.1.3`.
+    pub coord: &'a str,
+    pub ecosystem: &'a str,
+    /// Worst severity found in the fetched dependency.
+    pub severity: &'static str,
+    /// Strongest finding descriptions, worst-first.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub highlights: &'a [String],
+    /// Present when the dependency could not be fetched or analyzed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'a str>,
 }
 
 /// Full identity claims for each side (the `changed` subset lives in
@@ -124,6 +144,26 @@ pub(crate) struct Verdict<'a> {
     pub signature: Signature<'a>,
     pub identity: Identity<'a>,
     pub structure: Structure<'a>,
+    /// MITRE ATT&CK and MBC ids the change moved. Ids only — isomer ships no
+    /// catalog mapping them to prose, and a consumer that has one can join on
+    /// these.
+    pub frameworks: Frameworks<'a>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct Frameworks<'a> {
+    pub attack: Ids<'a>,
+    pub mbc: Ids<'a>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct Ids<'a> {
+    /// Present on the new side and absent on the old.
+    pub new: Vec<&'a str>,
+    /// Present on the old side and absent on the new.
+    pub removed: Vec<&'a str>,
+    /// Present on both.
+    pub unchanged: usize,
 }
 
 /// The CI exit decision, stated so a pipeline never re-derives it.
@@ -294,12 +334,25 @@ mod tests {
                     severity: "none",
                     changes: Vec::new(),
                 },
+                frameworks: Frameworks {
+                    attack: Ids {
+                        new: vec!["T1055"],
+                        removed: Vec::new(),
+                        unchanged: 2,
+                    },
+                    mbc: Ids {
+                        new: Vec::new(),
+                        removed: Vec::new(),
+                        unchanged: 0,
+                    },
+                },
                 structure: Structure {
                     severity: "high",
                     facts: Vec::new(),
                 },
             },
             evidence: Vec::new(),
+            deps: Vec::new(),
             llm: None,
             raw: &raw,
         };

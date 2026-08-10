@@ -8,10 +8,13 @@
 //! evidence is the *delta*: only windows touching a gained trait render, so the
 //! engineer sees what changed, not the whole file.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::fmt::Write as _;
 use std::path::Path;
 
+use crate::Severity;
 use crate::analysis::Pair;
+use crate::rubric::{crit_rank, namespace_of};
 
 /// Width (chars) of one displayed code row. Context lines truncate here; the
 /// matched line may carry up to [`MATCH_W`] chars, which the renderer wraps
@@ -48,7 +51,7 @@ pub(crate) struct Hunk {
     /// The top rule's human description.
     pub desc: String,
     /// The top rule's tier, painted on the header.
-    pub severity: crate::Severity,
+    pub severity: Severity,
     /// True for byte windows in binaries (no line structure).
     pub binary: bool,
     /// Ranking score of the top note (crit × confidence).
@@ -78,14 +81,14 @@ pub(crate) struct HunkLine {
 /// Total hunks collected before ranking — a work cap, not a display cap.
 const HUNK_BUDGET: usize = 120;
 
-/// Analyze one file for evidence. A file that cannot be analyzed costs its own
-/// evidence and nothing else: the verdict already stands on the diff, so this
-/// logs and moves on rather than failing the run.
+/// Analyze one file. A file that cannot be analyzed costs its own evidence and
+/// nothing else: the verdict already stands on the diff, so this logs and moves
+/// on rather than failing the run.
 fn analyze(path: &Path, options: &cleave::AnalysisOptions) -> Option<cleave::AnalysisReport> {
     match cleave::analyze_file(path, options) {
         Ok(r) => Some(r),
         Err(e) => {
-            eprintln!("isomer: no evidence from {}: {e:#}", path.display());
+            eprintln!("isomer: could not analyze {}: {e:#}", path.display());
             None
         }
     }
@@ -93,12 +96,16 @@ fn analyze(path: &Path, options: &cleave::AnalysisOptions) -> Option<cleave::Ana
 
 /// Diff-style evidence hunks for the gained traits: one hunk per matched
 /// region, each attributed to its strongest rule, contiguous regions merged,
-/// strongest `limit` kept, presented in file order.
+/// one hunk per distinct rule, **strongest first**.
+///
+/// Ranked rather than display-ordered because the cap differs per sink (five in
+/// a terminal, twenty-four in the JSON record); [`strongest`] applies a cap and
+/// returns to file order. Re-analyzing per sink is the expensive part, so this
+/// runs once per report — see [`crate::analysis::Analysis::hunks`].
 pub(crate) fn hunks(
     pairs: &[Pair],
     options: &cleave::AnalysisOptions,
-    gained_ids: &HashSet<String>,
-    limit: usize,
+    gained_ids: &HashSet<&str>,
 ) -> Vec<Hunk> {
     if gained_ids.is_empty() {
         return Vec::new();
@@ -119,17 +126,15 @@ pub(crate) fn hunks(
 
     // Contiguous hunks in the same member merge into one, owned by the
     // stronger rule; each is then trimmed to a short excerpt around its top
-    // match. The strongest `limit` hunks survive — one per rule, so five
-    // hunks show five behaviors, not one behavior five times — and display
-    // returns to file order.
+    // match.
     merge_contiguous(&mut all);
     for h in &mut all {
         trim(h);
     }
     // Notable+ hunks own the slots; baseline-tier matches qualify only when
     // nothing stronger exists (they're context, not standalone proof).
-    if all.iter().any(|h| h.severity >= crate::Severity::Medium) {
-        all.retain(|h| h.severity >= crate::Severity::Medium);
+    if all.iter().any(|h| h.severity >= Severity::Medium) {
+        all.retain(|h| h.severity >= Severity::Medium);
     }
     all.sort_by(|a, b| {
         b.severity
@@ -137,16 +142,24 @@ pub(crate) fn hunks(
             .then(b.score.total_cmp(&a.score))
             .then(a.loc.cmp(&b.loc))
     });
+    // One hunk per rule, so five hunks show five behaviors rather than one
+    // behavior five times.
     let mut seen: HashSet<String> = HashSet::new();
     all.retain(|h| seen.insert(h.desc.clone()));
-    all.truncate(limit);
-    all.sort_by(|a, b| {
+    all
+}
+
+/// The strongest `limit` hunks of a ranked set, presented in file order — the
+/// order a reader scans a diff in.
+pub(crate) fn strongest(all: &[Hunk], limit: usize) -> Vec<&Hunk> {
+    let mut shown: Vec<&Hunk> = all.iter().take(limit).collect();
+    shown.sort_by(|a, b| {
         a.file
             .cmp(&b.file)
             .then(a.member.cmp(&b.member))
             .then(a.loc.cmp(&b.loc))
     });
-    all
+    shown
 }
 
 /// Collect one file's hunks (the file itself plus any archive members) into
@@ -154,24 +167,33 @@ pub(crate) fn hunks(
 fn file_hunks(
     pair: &Pair,
     report: &cleave::AnalysisReport,
-    gained_ids: &HashSet<String>,
+    gained_ids: &HashSet<&str>,
     all: &mut Vec<Hunk>,
 ) {
-    let mut candidates: Vec<(Option<String>, cleave::types::FileAnalysis)> = Vec::new();
-    candidates.push((None, report.to_file_analysis(0)));
-    for fa in &report.files {
-        candidates.push((Some(clean_member(&fa.path)), fa.clone()));
-    }
-    // cleave finding ids are interned (`Istr`); compare/collect at the `&str`
-    // boundary so this holds whether the field is `String` or `Istr`.
-    let mut keep = gained_ids.clone();
-    for (_, fa) in &candidates {
-        for f in &fa.findings {
-            if gained_ids.contains(f.id.as_str()) {
-                keep.extend(f.trait_refs.iter().map(|s| s.as_str().to_string()));
-            }
-        }
-    }
+    // The root analysis plus one entry per archive member, all borrowed: these
+    // carry every matched byte window in the file, so copying them to iterate
+    // twice would dwarf the work being done.
+    let root = report.to_file_analysis(0);
+    let candidates: Vec<(Option<String>, &cleave::types::FileAnalysis)> =
+        std::iter::once((None, &root))
+            .chain(
+                report
+                    .files
+                    .iter()
+                    .map(|fa| (Some(clean_member(&fa.path)), fa)),
+            )
+            .collect();
+    // The composite legs a gained trait references, so a gained composite still
+    // renders the component windows that justify it. cleave finding ids are
+    // interned (`Istr`); compare at the `&str` boundary so this holds whether
+    // the field is `String` or `Istr`.
+    let legs: HashSet<&str> = candidates
+        .iter()
+        .flat_map(|(_, fa)| &fa.findings)
+        .filter(|f| gained_ids.contains(f.id.as_str()))
+        .flat_map(|f| f.trait_refs.iter().map(cleave::types::Istr::as_str))
+        .collect();
+    let keep = |id: &str| gained_ids.contains(id) || legs.contains(id);
 
     let container = !report.files.is_empty();
     let old_lines = pair.old.as_deref().and_then(|p| old_line_set(p, container));
@@ -179,11 +201,8 @@ fn file_hunks(
     for (member, fa) in &candidates {
         let shown = member.clone().unwrap_or_else(|| pair.label.clone());
         for chunk in &fa.context {
-            let kept: Vec<&cleave::types::Note> = chunk
-                .notes
-                .iter()
-                .filter(|n| keep.contains(n.id.as_str()))
-                .collect();
+            let kept: Vec<&cleave::types::Note> =
+                chunk.notes.iter().filter(|n| keep(n.id.as_str())).collect();
             let Some(top) = kept
                 .iter()
                 .copied()
@@ -222,26 +241,21 @@ fn desc_of(n: &cleave::types::Note) -> String {
     if n.desc.is_empty() {
         "matched".into()
     } else {
-        n.desc.as_str().to_string()
+        crate::printable(n.desc.as_str())
     }
 }
 
-/// Tier of a note's criticality, for header painting.
-fn tier(c: cleave::Criticality) -> crate::Severity {
+/// A hunk's tier — the rule's own criticality, which is where trait severity is
+/// maintained. Unlike the rubric's mapping, sub-notable tiers land on `Low`
+/// rather than `None`: a baseline window is still evidence, just weaker.
+fn tier(c: cleave::Criticality) -> Severity {
     use cleave::Criticality::{Hostile, Notable, Suspicious};
     match c {
-        Hostile => crate::Severity::Critical,
-        Suspicious => crate::Severity::High,
-        Notable => crate::Severity::Medium,
-        _ => crate::Severity::Low,
+        Hostile => Severity::Critical,
+        Suspicious => Severity::High,
+        Notable => Severity::Medium,
+        _ => Severity::Low,
     }
-}
-
-/// A hunk's tier: the rule's own criticality or the severity of the
-/// capability it proves, whichever is higher — so the SSH-protocol string
-/// that evidences a High network capability ranks (and paints) as High.
-fn hunk_severity(n: &cleave::types::Note) -> crate::Severity {
-    tier(n.crit).max(crate::rubric::capability_severity(n.id.as_str()))
 }
 
 /// Trimmed lines of the old version, for the `+` gutter. Plain text files
@@ -294,13 +308,15 @@ fn text_hunk(
         let text = if i == top_idx {
             excerpt(raw, delta_of(top.off) - s, clipped)
         } else if clipped {
-            truncate(&format!("…{}", full.trim_end()), CODE_W)
+            crate::clip(&format!("…{}", full.trim_end()), CODE_W)
         } else {
-            truncate(full.trim_end(), CODE_W)
+            crate::clip(full.trim_end(), CODE_W)
         };
         lines.push(HunkLine {
             locator: (first_line + i as u64).to_string(),
-            text,
+            // Neutralize control chars before display; the `added` diff below
+            // still compares the raw line, so the `+` gutter stays exact.
+            text: crate::printable(&text),
             added: old.map(|set| !set.contains(full.trim())),
             is_match: matched.contains(&i),
         });
@@ -313,7 +329,7 @@ fn text_hunk(
         location: format!("{file}:{}", first_line + top_idx as u64),
         id: top.id.as_str().to_string(),
         desc: desc_of(top),
-        severity: hunk_severity(top),
+        severity: tier(top.crit),
         binary: false,
         score: score(top),
         lines,
@@ -350,7 +366,7 @@ fn binary_hunk(chunk: &cleave::types::ContextLine, top: &cleave::types::Note, fi
         location: file.to_string(),
         id: top.id.as_str().to_string(),
         desc: desc_of(top),
-        severity: hunk_severity(top),
+        severity: tier(top.crit),
         binary: true,
         score: score(top),
         lines,
@@ -364,7 +380,7 @@ fn binary_hunk(chunk: &cleave::types::ContextLine, top: &cleave::types::Note, fi
 fn hex_ascii(row: &[u8], stride: usize) -> String {
     let mut s = String::with_capacity(stride * 4 + 1);
     for b in row {
-        s.push_str(&format!("{b:02x} "));
+        let _ = write!(s, "{b:02x} ");
     }
     for _ in row.len()..stride {
         s.push_str("   ");
@@ -476,30 +492,13 @@ fn excerpt(line: &[u8], col: usize, clipped: bool) -> String {
     format!("{head}{kept}{tail}")
 }
 
-fn crit_rank(c: cleave::Criticality) -> u8 {
-    use cleave::Criticality::*;
-    match c {
-        Hostile => 5,
-        Suspicious => 4,
-        Notable => 3,
-        Baseline => 2,
-        Component => 1,
-        _ => 0,
-    }
-}
-
 /// `<root>!!package/foo.js` → `package/foo.js`; a bare member name is kept.
+///
+/// A member name is chosen by whoever built the archive, so it is neutralized
+/// here: it reaches the terminal, the SARIF logical location, and the PR
+/// comment, and an archive is free to name a file `evil\x1b[2J`.
 fn clean_member(path: &str) -> String {
-    path.rsplit("!!").next().unwrap_or(path).to_string()
-}
-
-/// Char-aware truncation with a trailing ellipsis.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{kept}…")
+    crate::printable(path.rsplit("!!").next().unwrap_or(path))
 }
 
 /// Render context windows (source lines or hex+ascii, per file type) for the
@@ -512,7 +511,7 @@ fn truncate(s: &str, max: usize) -> String {
 pub(crate) fn render(
     pairs: &[Pair],
     options: &cleave::AnalysisOptions,
-    gained_ids: &HashSet<String>,
+    gained_ids: &HashSet<&str>,
     compact: bool,
 ) -> String {
     if gained_ids.is_empty() {
@@ -521,44 +520,45 @@ pub(crate) fn render(
 
     // Candidate files across every changed file: each root plus any archive
     // members, converted to the FileAnalysis shape `format_context` consumes.
+    // Owned, because the filtering below rewrites them in place.
     let mut candidates: Vec<cleave::types::FileAnalysis> = Vec::new();
     let mut target = None;
     for pair in pairs {
         let Some(new_path) = pair.new.as_deref() else {
             continue;
         };
-        let Some(report) = analyze(new_path, options) else {
+        let Some(mut report) = analyze(new_path, options) else {
             continue;
         };
         candidates.push(report.to_file_analysis(0));
-        candidates.extend(report.files.iter().cloned());
         if target.is_none() {
             target = Some(report.target.clone());
         }
+        candidates.append(&mut report.files);
     }
     let Some(target) = target else {
         return String::new();
     };
 
-    // Keep the gained traits plus the composite legs they reference, so a
-    // gained composite still renders the component windows that justify it.
-    let mut keep = gained_ids.clone();
-    for fa in &candidates {
-        for f in &fa.findings {
-            if gained_ids.contains(f.id.as_str()) {
-                keep.extend(f.trait_refs.iter().map(|s| s.as_str().to_string()));
-            }
-        }
-    }
+    // The composite legs the gained traits reference, so a gained composite
+    // still renders the component windows that justify it. Owned, so the
+    // borrow of `candidates` ends before they are rewritten below.
+    let legs: HashSet<String> = candidates
+        .iter()
+        .flat_map(|fa| &fa.findings)
+        .filter(|f| gained_ids.contains(f.id.as_str()))
+        .flat_map(|f| f.trait_refs.iter().map(|s| s.as_str().to_string()))
+        .collect();
+    let keep = |id: &str| gained_ids.contains(id) || legs.contains(id);
 
     // Filter each candidate to the kept traits and drop those left with nothing
     // to show. Renumber ids so `format_context`'s id→file map stays unique.
     let mut files: Vec<cleave::types::FileAnalysis> = Vec::new();
     for (idx, mut fa) in (0u32..).zip(candidates) {
         fa.id = idx;
-        fa.findings.retain(|f| keep.contains(f.id.as_str()));
+        fa.findings.retain(|f| keep(f.id.as_str()));
         fa.context
-            .retain(|line| line.notes.iter().any(|n| keep.contains(n.id.as_str())));
+            .retain(|line| line.notes.iter().any(|n| keep(n.id.as_str())));
         if !fa.context.is_empty() {
             files.push(fa);
         }
@@ -618,9 +618,8 @@ pub(crate) fn existing_risk(
             .chain(report.files.iter().flat_map(|f| f.findings.iter()));
         for f in findings {
             if matches!(f.crit, Criticality::Suspicious | Criticality::Hostile) {
-                let ns = namespace_of(&f.id);
-                let slot = worst.entry(ns).or_insert(f.crit);
-                if rank(f.crit) > rank(*slot) {
+                let slot = worst.entry(namespace_of(&f.id)).or_insert(f.crit);
+                if crit_rank(f.crit) > crit_rank(*slot) {
                     *slot = f.crit;
                 }
             }
@@ -632,7 +631,7 @@ pub(crate) fn existing_risk(
 
     let hostile = worst.values().any(|c| *c == Criticality::Hostile);
     let mut items: Vec<(String, Criticality)> = worst.into_iter().collect();
-    items.sort_by(|a, b| rank(b.1).cmp(&rank(a.1)).then(a.0.cmp(&b.0)));
+    items.sort_by(|a, b| crit_rank(b.1).cmp(&crit_rank(a.1)).then(a.0.cmp(&b.0)));
     items.truncate(6);
 
     let label = if hostile {
@@ -656,68 +655,162 @@ pub(crate) fn existing_risk(
     ))
 }
 
-/// Capability classes present in the base version, so the rubric can tell a
-/// wholly new class from one that merely gained a trait. Empty on analysis
-/// failure (then everything reads as new, the safe default).
-pub(crate) fn base_classes(
-    pairs: &[Pair],
-    options: &cleave::AnalysisOptions,
-) -> std::collections::HashSet<String> {
+/// What each side of the change exhibits, gathered in one walk over both.
+///
+/// Both sides are analyzed anyway — the base for its capability classes, the
+/// head for evidence — and cleave caches per content hash, so collecting the
+/// framework annotations here costs nothing beyond the bookkeeping.
+#[derive(Debug, Default)]
+pub(crate) struct Survey {
+    /// Capability classes present in the base version, so the rubric can tell
+    /// a wholly new class from one that merely gained a trait.
+    pub base_classes: HashSet<String>,
+    /// MITRE ATT&CK technique ids seen on each side.
+    pub attack: Sides,
+    /// MBC behavior ids seen on each side.
+    pub mbc: Sides,
+}
+
+/// One framework's ids on either side of the change.
+#[derive(Debug, Default)]
+pub(crate) struct Sides {
+    pub old: BTreeSet<String>,
+    pub new: BTreeSet<String>,
+}
+
+impl Sides {
+    /// Ids the change introduced.
+    pub(crate) fn gained(&self) -> Vec<&str> {
+        self.new.difference(&self.old).map(String::as_str).collect()
+    }
+
+    /// Ids the change removed. Reported because a technique disappearing is
+    /// how a reviewer sees a fix land, not only how a regression looks.
+    pub(crate) fn lost(&self) -> Vec<&str> {
+        self.old.difference(&self.new).map(String::as_str).collect()
+    }
+
+    /// Ids present before and after — context for how much is genuinely new.
+    pub(crate) fn kept(&self) -> usize {
+        self.old.intersection(&self.new).count()
+    }
+
+    pub(crate) fn changed(&self) -> bool {
+        self.old != self.new
+    }
+}
+
+/// Walk both sides, collecting capability classes and framework annotations.
+/// A file that fails to analyze contributes nothing rather than failing the
+/// run; on the base side that makes its capabilities read as new, which is the
+/// safe direction to be wrong in.
+pub(crate) fn survey(pairs: &[Pair], options: &cleave::AnalysisOptions) -> Survey {
     use cleave::Criticality;
-    let mut classes = std::collections::HashSet::new();
+    let mut survey = Survey::default();
     for pair in pairs {
         // A file the change *added* has no base side — every class it carries
         // is new by definition, which is what an empty contribution means.
-        let Some(old_path) = pair.old.as_deref() else {
-            continue;
-        };
-        let Ok(report) = cleave::analyze_file(old_path, options) else {
-            continue;
-        };
-        classes.extend(
-            report
+        for (path, is_base) in [(pair.old.as_deref(), true), (pair.new.as_deref(), false)] {
+            let Some(path) = path else {
+                continue;
+            };
+            let Some(report) = analyze(path, options) else {
+                continue;
+            };
+            let findings = report
                 .findings
                 .iter()
                 .chain(report.files.iter().flat_map(|f| f.findings.iter()))
-                // Only count a class the base exhibited *meaningfully*
-                // (notable+). A baseline-criticality substring match doesn't
-                // mean the base "did C2"; counting it would dismiss a
-                // genuinely new capability as "expanded". Erring toward
-                // notable+ keeps new capabilities flagged as new.
+                // Only count what the artifact exhibits *meaningfully*
+                // (notable+), matching the rubric's reporting floor. A
+                // baseline match doesn't mean the base "did C2"; counting it
+                // would dismiss a genuinely new capability as "expanded".
                 .filter(|f| {
                     matches!(
                         f.crit,
                         Criticality::Notable | Criticality::Suspicious | Criticality::Hostile
                     )
-                })
-                .filter_map(|f| crate::rubric::capability_class(&f.id))
-                .map(str::to_string),
-        );
+                });
+            for f in findings {
+                if is_base && let Some(class) = crate::rubric::capability_class(&f.id) {
+                    survey.base_classes.insert(class);
+                }
+                let attack = ids(f.attack.as_ref().map(cleave::types::Istr::as_str));
+                let mbc = ids(f.mbc.as_ref().map(cleave::types::Istr::as_str));
+                if is_base {
+                    survey.attack.old.extend(attack);
+                    survey.mbc.old.extend(mbc);
+                } else {
+                    survey.attack.new.extend(attack);
+                    survey.mbc.new.extend(mbc);
+                }
+            }
+        }
     }
-    classes
+    survey
 }
 
-/// Trait namespace: taxonomy path before `::`, taxonomy root stripped. Kept in
-/// step with `rubric`'s namespace grouping.
-fn namespace_of(id: &str) -> String {
-    const ROOTS: &[&str] = &[
-        "metadata",
-        "micro-behaviors",
-        "objectives",
-        "well-known",
-        "third_party",
-    ];
-    let path = id.split("::").next().unwrap_or(id);
-    match path.split_once('/') {
-        Some((root, rest)) if ROOTS.contains(&root) => rest.to_string(),
-        _ => path.to_string(),
-    }
+/// Split a framework annotation into ids. Traits write these as a free-text
+/// field — `T1003`, `"T1003, T1041"`, `T1027,T1140`, or empty — so the split
+/// is on commas with the pieces trimmed, and anything that doesn't look like
+/// an identifier is dropped rather than shown to a reader as one.
+fn ids(field: Option<&str>) -> Vec<String> {
+    field
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 16
+                && s.starts_with(|c: char| c.is_ascii_alphabetic())
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+        })
+        .map(str::to_string)
+        .collect()
 }
 
-fn rank(c: cleave::Criticality) -> u8 {
-    match c {
-        cleave::Criticality::Hostile => 2,
-        cleave::Criticality::Suspicious => 1,
-        _ => 0,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Traits write ATT&CK and MBC annotations as free text, so the parser
+    /// meets every shape the corpus actually contains — a bare id, a quoted
+    /// comma list with spaces, a comma list without, an empty field — and
+    /// refuses anything that would put non-identifier text in front of a
+    /// reader as though it were a technique.
+    #[test]
+    fn framework_ids_parse_the_shapes_traits_use() {
+        assert_eq!(ids(Some("T1003")), ["T1003"]);
+        assert_eq!(ids(Some("T1003, T1041")), ["T1003", "T1041"]);
+        assert_eq!(ids(Some("T1027,T1140")), ["T1027", "T1140"]);
+        assert_eq!(ids(Some("T1003.008")), ["T1003.008"]);
+        assert_eq!(ids(Some("B0001.009")), ["B0001.009"]);
+        assert!(ids(Some("")).is_empty());
+        assert!(ids(None).is_empty());
+        // Junk is dropped rather than displayed as a technique.
+        assert!(ids(Some("see the notes above")).is_empty());
+        assert!(ids(Some("  ,  ")).is_empty());
+        assert_eq!(ids(Some("T1003, oops!, T1041")), ["T1003", "T1041"]);
+    }
+
+    /// The delta is a set difference in both directions: a technique that
+    /// disappears is how a fix reads, and must not be silently dropped.
+    #[test]
+    fn sides_report_both_directions() {
+        let sides = Sides {
+            old: ["T1", "T2"].iter().map(ToString::to_string).collect(),
+            new: ["T2", "T3"].iter().map(ToString::to_string).collect(),
+        };
+        assert_eq!(sides.gained(), ["T3"]);
+        assert_eq!(sides.lost(), ["T1"]);
+        assert_eq!(sides.kept(), 1);
+        assert!(sides.changed());
+
+        let same = Sides {
+            old: ["T1"].iter().map(ToString::to_string).collect(),
+            new: ["T1"].iter().map(ToString::to_string).collect(),
+        };
+        assert!(!same.changed());
+        assert!(same.gained().is_empty());
     }
 }

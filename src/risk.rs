@@ -51,7 +51,12 @@ pub(crate) fn score(pairs: &[crate::analysis::Pair]) -> Option<Risk> {
     let analyzer = analyzer()?;
     let probability = |p: Option<&Path>| -> Option<f32> {
         let p = p?;
-        Some(analyzer.scan_file(p, &basename(p)).ok()?.probability)
+        Some(
+            analyzer
+                .scan_file(p, &crate::analysis::basename(p))
+                .ok()?
+                .probability,
+        )
     };
     pairs
         .iter()
@@ -65,10 +70,4 @@ pub(crate) fn score(pairs: &[crate::analysis::Pair]) -> Option<Risk> {
             })
         })
         .max_by(|a, b| a.new.total_cmp(&b.new))
-}
-
-fn basename(p: &Path) -> String {
-    p.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.display().to_string())
 }

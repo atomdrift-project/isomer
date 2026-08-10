@@ -40,7 +40,22 @@ struct Finding {
 
 /// Render the analysis as a SARIF 2.1.0 log.
 pub(crate) fn report(a: &Analysis<'_>) -> Result<String> {
-    let findings = findings(a);
+    let mut findings = findings(a);
+    // Newly-introduced technique ids ride along as tags on every rule this
+    // change produced. Code scanning surfaces tags as filters, so an analyst
+    // can pivot from an alert to the technique without isomer needing a
+    // catalog of its own.
+    let techniques: Vec<String> = a
+        .survey
+        .attack
+        .gained()
+        .iter()
+        .map(|id| format!("attack/{id}"))
+        .chain(a.survey.mbc.gained().iter().map(|id| format!("mbc/{id}")))
+        .collect();
+    for f in &mut findings {
+        f.tags.extend(techniques.iter().cloned());
+    }
     let hunks = a.hunks(EVIDENCE_CAP);
 
     let mut rules: Vec<Value> = Vec::new();
@@ -231,7 +246,7 @@ fn findings(a: &Analysis<'_>) -> Vec<Finding> {
 /// with no trait ids at all (publisher drift, a structural fact) is a property
 /// of the change rather than of a line, so it lands on the first changed file
 /// with no region — better an imprecise location than a precise fiction.
-fn locate(a: &Analysis<'_>, hunks: &[crate::evidence::Hunk], f: &Finding) -> Value {
+fn locate(a: &Analysis<'_>, hunks: &[&crate::evidence::Hunk], f: &Finding) -> Value {
     let anchor = (!f.ids.is_empty() || !f.hints.is_empty())
         .then(|| {
             hunks

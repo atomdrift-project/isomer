@@ -16,7 +16,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod analysis;
 mod ci;
+mod deps;
 mod evidence;
+mod fetch;
 mod fs;
 mod json;
 mod llm;
@@ -95,6 +97,13 @@ struct Cli {
     /// Per-request LLM timeout in seconds.
     #[arg(long, global = true, value_name = "SECS")]
     llm_timeout: Option<u64>,
+
+    /// Follow each dependency the change *adds*: fetch it and report what it can
+    /// do, attributed to the dependency. Catches the transitive supply-chain
+    /// case (a benign version range pulling in a now-malicious release) a
+    /// manifest diff can't see. A network step; off by default.
+    #[arg(long, global = true)]
+    deps: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -190,6 +199,16 @@ enum Command {
         /// than analyzing a subset and reporting it as the whole.
         #[arg(long, value_name = "N", default_value_t = 1000)]
         max_files: usize,
+        /// Build outputs of the base commit, laid over the base tree.
+        ///
+        /// Source tells you what a change says; the artifact tells you what it
+        /// does. A backdoor injected by the build — the xz case — is in neither
+        /// commit, so only comparing the two builds can see it.
+        #[arg(long, value_name = "DIR")]
+        base_artifacts: Option<std::path::PathBuf>,
+        /// Build outputs of this change. See `--base-artifacts`.
+        #[arg(long, value_name = "DIR")]
+        head_artifacts: Option<std::path::PathBuf>,
     },
     /// Compare two local trees, following the dependency graph.
     Fs {
@@ -250,11 +269,63 @@ fn main() -> ExitCode {
 /// not sample analysis, and recompiling costs seconds per run. An explicit
 /// `CLEAVE_SKIP_CACHE` still resolves normally when this switch is off.
 fn disable_analysis_cache_if_requested() {
-    let on =
-        std::env::var("ISOMER_NO_CACHE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    if on {
+    if std::env::var("ISOMER_NO_CACHE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
         cleave::cache::set_skip_cache_override(Some(true));
     }
+}
+
+/// Neutralize control characters in untrusted, sample-derived display text — a
+/// matched evidence line, a dependency or action name lifted from the artifact.
+/// Left raw, an ANSI escape (`\x1b…`) in a malicious sample could spoof the
+/// terminal: clear the screen, fake a `CLEAN` verdict, or hide the real one from
+/// the analyst who trusts this output. Applied where the string is built, so the
+/// terminal render and the JSON envelope share one clean copy. Byte-for-byte
+/// fidelity of the *matched bytes* stays available in `--format json`'s hex for
+/// binaries; here the goal is a display that cannot lie about what it shows.
+pub(crate) fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || reorders(c) {
+                '·'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Characters that change how the *rest* of a line renders while being
+/// invisible themselves — the Trojan Source family (CVE-2021-42574).
+///
+/// A bidi override makes a file display one thing and execute another, which is
+/// exactly the deception isomer exists to expose: evidence that reproduced one
+/// would show an analyst the attacker's preferred reading of the very line
+/// being flagged. `char::is_control` does not cover these — they are format
+/// (Cf) characters, not control (Cc) — so they are named here.
+///
+/// Only the explicit overrides, isolates, and zero-width padding are
+/// neutralized. Ordinary right-to-left script renders normally, and ZWJ/ZWNJ
+/// are left alone because Indic, Arabic, and emoji sequences need them and
+/// neither reorders text.
+const fn reorders(c: char) -> bool {
+    matches!(c,
+        '\u{200b}'                  // zero-width space
+        | '\u{200e}' | '\u{200f}'   // LRM, RLM
+        | '\u{202a}'..='\u{202e}'   // LRE, RLE, PDF, LRO, RLO
+        | '\u{2066}'..='\u{2069}'   // LRI, RLI, FSI, PDI
+        | '\u{feff}'                // BOM appearing mid-text
+    )
+}
+
+/// Clip display text to `max` *characters*, marking the cut with an ellipsis.
+/// Char-aware, so a multi-byte character is never split in half — and named
+/// apart from `String::truncate`, which counts bytes and would panic here.
+pub(crate) fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 /// Broken-pipe-safe write: a closed downstream pipe (e.g. `| head`) is a normal
@@ -281,6 +352,8 @@ fn run(cli: &Cli) -> anyhow::Result<bool> {
             repo,
             out_dir,
             max_files,
+            base_artifacts,
+            head_artifacts,
         } => ci::run(
             cli,
             &policy,
@@ -290,11 +363,54 @@ fn run(cli: &Cli) -> anyhow::Result<bool> {
                 repo: repo.clone(),
                 out_dir: out_dir.clone(),
                 max_files: *max_files,
+                base_artifacts: base_artifacts.clone(),
+                head_artifacts: head_artifacts.clone(),
             },
         ),
         Command::Fs { old, new } => fs::run(Path::new(old), Path::new(new), cli, &policy),
         Command::Git { .. } => anyhow::bail!("`isomer git` is not implemented yet"),
-        Command::Purl { .. } => anyhow::bail!("`isomer purl` is not implemented yet"),
-        Command::Oci { .. } => anyhow::bail!("`isomer oci` is not implemented yet"),
+        Command::Purl { old, new } => fetch::compare("purl", old, new, cli, &policy),
+        Command::Oci { old, new } => fetch::compare(
+            "oci",
+            &fetch::oci_purl(old),
+            &fetch::oci_purl(new),
+            cli,
+            &policy,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sample is free to embed terminal escapes; the report must not replay
+    /// them into the terminal of the analyst reading the verdict.
+    #[test]
+    fn escapes_cannot_reach_the_terminal() {
+        let spoof = "\u{1b}[2J\u{1b}[H  CLEAN  no findings";
+        assert!(!printable(spoof).contains('\u{1b}'));
+        assert!(!printable("a\rb\nc").contains(['\r', '\n']));
+        assert_eq!(printable("ordinary text"), "ordinary text");
+    }
+
+    /// Trojan Source (CVE-2021-42574): a bidi override reorders the rest of the
+    /// line, so the evidence an analyst reads is not the code that runs.
+    #[test]
+    fn bidi_overrides_cannot_reorder_evidence() {
+        // U+202E is what makes the reversed tail read as an innocuous comment;
+        // rustc denies the literal character in source for the same reason, so
+        // it is written here as an escape.
+        let trojan = "execSync(\"id\"); /* \u{202e} evil ; )\"di\"(cnyScexe \u{202c} */";
+        let safe = printable(trojan);
+        for c in [
+            '\u{202e}', '\u{202c}', '\u{202a}', '\u{2066}', '\u{200f}', '\u{feff}',
+        ] {
+            assert!(!safe.contains(c), "{c:?} survived");
+        }
+        // Right-to-left *script* is legitimate content and must survive intact,
+        // as must ZWJ/ZWNJ, which real scripts and emoji depend on.
+        assert_eq!(printable("مرحبا שלום"), "مرحبا שלום");
+        assert_eq!(printable("a\u{200d}b\u{200c}c"), "a\u{200d}b\u{200c}c");
     }
 }

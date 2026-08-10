@@ -56,6 +56,13 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
         // "nothing changed, but heads up". Does not affect exit code.
         out.push_str(&existing);
     }
+    // What the added dependencies can do (`--deps`) — the risk the manifest
+    // diff only named. Rendered whenever the fetch ran, even on an otherwise
+    // silent change: a benign-looking version bump pulling a malicious release
+    // is exactly the case worth surfacing.
+    if !a.deps.is_empty() {
+        out.push_str(&dependencies_section(&a.deps));
+    }
     // Accepted risk is still risk: a run that withheld findings must not read
     // as one that found none.
     if !a.assessment.suppressed.is_empty() {
@@ -70,7 +77,7 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
             let _ = writeln!(
                 out,
                 "   {}  {}",
-                s.id.clone().truecolor(150, 160, 168),
+                s.id.as_str().truecolor(150, 160, 168),
                 s.describe().truecolor(102, 117, 127),
             );
         }
@@ -96,37 +103,38 @@ fn render(out: &mut String, a: &Analysis<'_>, detailed: bool) {
     let mut sections: Vec<String> = Vec::new();
     let mut head = badge_line(a.verdict, a.diff, naming);
     // The judgement leads: what isomer makes of the change, before any of the
-    // detail behind it.
-    let indent = badge_indent(a.verdict);
-    head.push_str(&format!(
-        "{indent}{}\n",
-        a.judgement().truecolor(150, 160, 168)
-    ));
+    // detail behind it. Annotation lines are indented past the badge so they
+    // align under the artifact name rather than the verdict word.
+    let indent = " ".repeat(badge_parts(a.verdict).0.len() + 5);
+    let judgement = a.judgement();
+    let _ = writeln!(head, "{indent}{}", judgement.truecolor(150, 160, 168));
     // Then say *why* the change shape is wrong, not just that it is:
     // behavioral delta vs the version bump's promise, and behavior vs content
-    // skew. Annotations align under the artifact name, not the badge.
+    // skew. Annotations align under the artifact name, not the badge — and are
+    // skipped when the judgement above already *is* the note, so the report
+    // never says the same sentence twice.
+    let mut warn = |text: &str| {
+        let _ = writeln!(
+            head,
+            "{indent}{} {}",
+            "⚠".truecolor(255, 176, 46),
+            text.truecolor(255, 176, 46)
+        );
+    };
     if prop.disproportionate
-        && let Some(note) = &prop.note
+        && let Some(note) = prop.note.as_deref().filter(|n| *n != judgement)
     {
-        head.push_str(&format!(
-            "{indent}{} {}\n",
-            "⚠".truecolor(255, 176, 46),
-            note.clone().truecolor(255, 176, 46)
-        ));
+        warn(note);
     }
-    if let Some(skew) = &prop.skew {
-        head.push_str(&format!(
-            "{indent}{} {}\n",
-            "⚠".truecolor(255, 176, 46),
-            skew.clone().truecolor(255, 176, 46)
-        ));
+    if let Some(skew) = prop.skew.as_deref().filter(|s| *s != judgement) {
+        warn(skew);
     }
     if let Some(i) = a.interp.as_ref().filter(|i| !i.nature.trim().is_empty()) {
-        head.push_str(&format!(
-            "{indent}{} {}\n",
-            "✨",
+        let _ = writeln!(
+            head,
+            "{indent}✨ {}",
             i.nature.trim().truecolor(62, 207, 214)
-        ));
+        );
     }
     sections.push(head);
     // The model's read is shown when it moved bands (the reviewer needs to
@@ -150,6 +158,8 @@ fn render(out: &mut String, a: &Analysis<'_>, detailed: bool) {
     push_section(&mut sections, &mut section);
     structure_grid(&mut section, &assessment.structure);
     push_section(&mut sections, &mut section);
+    frameworks_grid(&mut section, a);
+    push_section(&mut sections, &mut section);
     // Metrics and the touched-file list are triage aids for a change that
     // failed; they are noise on one that passed.
     if detailed {
@@ -166,6 +176,39 @@ fn render(out: &mut String, a: &Analysis<'_>, detailed: bool) {
         push_section(&mut sections, &mut section);
     }
     out.push_str(&sections.join("\n"));
+}
+
+/// The MITRE ATT&CK and MBC ids this change moved.
+///
+/// isomer carries no catalog mapping these to prose, so it does not pretend
+/// to: the ids are shown as ids, which is what an analyst pastes into their
+/// own reference anyway. `+` is a technique the change introduced, `−` one it
+/// no longer exhibits — a fix landing looks different from a regression.
+fn frameworks_grid(out: &mut String, a: &Analysis<'_>) {
+    for (label, sides) in [("attack", &a.survey.attack), ("mbc", &a.survey.mbc)] {
+        if !sides.changed() {
+            continue;
+        }
+        let mut items: Vec<String> = Vec::new();
+        items.extend(sides.gained().iter().map(|id| format!("+{id}")));
+        items.extend(sides.lost().iter().map(|id| format!("−{id}")));
+        let kept = sides.kept();
+        for (i, line) in wrap_items(&items, 60).into_iter().enumerate() {
+            let cell = if i == 0 {
+                pill_cell(label, PILL_OCEAN)
+            } else {
+                blank_cell()
+            };
+            let mut body = line.truecolor(205, 214, 221).to_string();
+            if i == 0 && kept > 0 {
+                body.push_str(&format!(
+                    "   {}",
+                    format!("{kept} unchanged").truecolor(102, 117, 127)
+                ));
+            }
+            out.push_str(&grid_line(&cell, "   ", &body));
+        }
+    }
 }
 
 /// Move a finished section into the list, skipping empty ones so blank
@@ -255,7 +298,7 @@ fn badge_line(verdict: Severity, diff: &DiffReportV1, naming: &Naming) -> String
     format!(
         " {}  {}{}\n",
         badge(verdict),
-        naming.name.clone().bold(),
+        naming.name.as_str().bold(),
         meta.truecolor(102, 117, 127),
     )
 }
@@ -374,7 +417,7 @@ fn class_group(
         } else {
             blank_cell()
         };
-        let name = pad_visible(&c.label.clone().bold().to_string(), &c.label, NAME_W);
+        let name = pad_visible(&c.label.as_str().bold().to_string(), &c.label, NAME_W);
         let refs: Vec<&str> = c.namespaces.iter().map(String::as_str).collect();
         let head = common_prefix(&refs);
         let tails: Vec<String> = c
@@ -386,7 +429,7 @@ fn class_group(
         let vis = head.chars().count() + tails.iter().map(|t| t.chars().count() + 3).sum::<usize>();
         if vis <= INLINE {
             // Fits: `head/tail1 · tail2` inline, as one line.
-            let mut loc = head.clone().bold().to_string();
+            let mut loc = head.as_str().bold().to_string();
             if !tails.is_empty() {
                 let sep = if head.is_empty() { "" } else { "/" };
                 loc.push_str(
@@ -400,7 +443,7 @@ fn class_group(
         } else {
             // Too many namespaces for one line: the shared prefix and count
             // up top, every tail wrapped beneath — nothing hidden.
-            let body = format!("{name} {}{}", head.clone().bold(), count_str(c, fresh));
+            let body = format!("{name} {}{}", head.as_str().bold(), count_str(c, fresh));
             out.push_str(&grid_line(&cell, &dots(c.severity), &body));
             let items = if tails.is_empty() {
                 c.namespaces.clone()
@@ -465,7 +508,7 @@ fn signature_grid(out: &mut String, a: &Assessment) {
     // Description leads — the campaign or intent an analyst triages on —
     // with the rule id as dim provenance after it. The marker says whether
     // the rule newly matched (`+`) or an existing match escalated (`↑`).
-    let descs: Vec<String> = shown.iter().map(|m| clip(&m.desc, DESC_W)).collect();
+    let descs: Vec<String> = shown.iter().map(|m| crate::clip(&m.desc, DESC_W)).collect();
     let descw = descs.iter().map(|d| d.chars().count()).max().unwrap_or(0);
     for (i, m) in shown.iter().enumerate() {
         let cell = if i == 0 {
@@ -506,15 +549,6 @@ fn signature_grid(out: &mut String, a: &Assessment) {
     }
 }
 
-/// Char-aware clip with a trailing ellipsis.
-fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{kept}…")
-}
-
 fn identity_grid(out: &mut String, a: &Assessment) {
     if a.identity.severity == Severity::None {
         return;
@@ -550,7 +584,7 @@ fn identity_grid(out: &mut String, a: &Assessment) {
 /// top rule (criticality × confidence) and location, then a short excerpt
 /// with matched lines bright, context dim, and `+` marking lines absent
 /// from the old version.
-fn evidence_hunks(hunks: &[Hunk]) -> String {
+fn evidence_hunks(hunks: &[&Hunk]) -> String {
     if hunks.is_empty() {
         return String::new();
     }
@@ -560,7 +594,7 @@ fn evidence_hunks(hunks: &[Hunk]) -> String {
         .map(|l| l.locator.chars().count())
         .max()
         .unwrap_or(4);
-    let descs: Vec<String> = hunks.iter().map(|h| clip(&h.desc, 56)).collect();
+    let descs: Vec<String> = hunks.iter().map(|h| crate::clip(&h.desc, 56)).collect();
     let descw = descs.iter().map(|d| d.chars().count()).max().unwrap_or(0);
     let mut out = format!(
         "\n {}  {}\n",
@@ -580,11 +614,12 @@ fn evidence_hunks(hunks: &[Hunk]) -> String {
                 Some(true) => "+".truecolor(95, 175, 95).to_string(),
                 _ => " ".to_string(),
             };
+            // Matched code in terminal foreground, context dimmed behind it.
             let paint_code = |s: &str| {
                 if l.is_match {
-                    s.to_string().ink()
+                    s.truecolor(205, 214, 221).to_string()
                 } else {
-                    s.to_string().truecolor(102, 117, 127).to_string()
+                    s.truecolor(102, 117, 127).to_string()
                 }
             };
             // A long matched line wraps across continuation rows: bare
@@ -620,7 +655,7 @@ fn evidence_hunks(hunks: &[Hunk]) -> String {
 
 /// Say what the evidence marks mean, once, up top, instead of implying it.
 /// Shared with the markdown report.
-pub(crate) fn evidence_note_text(hunks: &[Hunk]) -> &'static str {
+pub(crate) fn evidence_note_text(hunks: &[&Hunk]) -> &'static str {
     if hunks.iter().all(|h| h.binary) {
         "binary · all matches are gained traits · old bytes not shown"
     } else if hunks
@@ -654,6 +689,40 @@ fn evidence_note() -> String {
 
 // ── grid + pill primitives ───────────────────────────────────────────────
 
+/// The `dependencies` section: one row per added dependency — severity dots,
+/// its coordinate, and what it does, drilled from the fetched dependency's own
+/// analysis. A dependency that couldn't be fetched shows its reason, never a
+/// blank clean line.
+fn dependencies_section(deps: &[crate::deps::DepProfile]) -> String {
+    let mut out = String::new();
+    let indent = " ".repeat(PILL_COL + NAME_W + 4);
+    for (i, d) in deps.iter().enumerate() {
+        let cell = if i == 0 {
+            pill_cell("dependencies", PILL_PLUM)
+        } else {
+            blank_cell()
+        };
+        let name = pad_visible(&d.coord.clone().bold().to_string(), &d.coord, NAME_W);
+        let eco = d.ecosystem.truecolor(102, 117, 127);
+        let tail = match (&d.note, d.severity) {
+            (Some(note), _) => format!("{eco}  {}", note.truecolor(255, 176, 46)),
+            (None, Severity::None) => {
+                format!("{eco}  {}", "no notable behavior".truecolor(102, 117, 127))
+            }
+            (None, _) => eco.to_string(),
+        };
+        out.push_str(&grid_line(
+            &cell,
+            &dots(d.severity),
+            &format!("{name} {tail}"),
+        ));
+        for h in &d.highlights {
+            let _ = writeln!(out, "{indent}{}", paint(d.severity, h));
+        }
+    }
+    out
+}
+
 fn grid_line(cell: &str, dots: &str, body: &str) -> String {
     format!(" {cell}{dots} {body}\n")
 }
@@ -681,12 +750,12 @@ fn pad_visible(painted: &str, plain: &str, width: usize) -> String {
 // ── metrics ──────────────────────────────────────────────────────────────
 
 fn single_changed_file(diff: &DiffReportV1) -> Option<&FileDiffEntry> {
-    let changed: Vec<&FileDiffEntry> = diff
+    let mut changed = diff
         .files
         .iter()
-        .filter(|f| matches!(f.status, cleave::types::FileStatus::Changed))
-        .collect();
-    (changed.len() == 1).then(|| changed[0])
+        .filter(|f| matches!(f.status, cleave::types::FileStatus::Changed));
+    let only = changed.next()?;
+    changed.next().is_none().then_some(only)
 }
 
 /// The metric movers as `(label, value, severity)`, largest relative change
@@ -748,7 +817,7 @@ fn metrics_rows(diff: &DiffReportV1) -> Vec<String> {
     metrics(diff)
         .into_iter()
         .map(|(label, value, sev)| {
-            let painted = label.clone().truecolor(150, 160, 168).to_string();
+            let painted = label.as_str().truecolor(150, 160, 168).to_string();
             format!(
                 "{} {}",
                 pad_visible(&painted, &label, NAME_W),
@@ -859,12 +928,6 @@ fn badge(sev: Severity) -> String {
         .to_string()
 }
 
-/// Spaces matching the badge line's prefix, so masthead annotation lines
-/// (⚠ proportionality, ✨ LLM read) align under the artifact name.
-fn badge_indent(sev: Severity) -> String {
-    " ".repeat(badge_parts(sev).0.len() + 5)
-}
-
 fn dots(sev: Severity) -> String {
     let d = match sev {
         Severity::Critical => "●●●",
@@ -881,15 +944,5 @@ fn paint(sev: Severity, text: &str) -> String {
         Severity::High => cleave::theme::paint_suspicious(text).to_string(),
         Severity::Medium | Severity::Low => cleave::theme::paint_notable(text).to_string(),
         Severity::None => cleave::theme::paint_baseline(text).to_string(),
-    }
-}
-
-/// Regular terminal-foreground text (evidence code, left plain).
-trait Ink {
-    fn ink(&self) -> String;
-}
-impl Ink for String {
-    fn ink(&self) -> String {
-        self.truecolor(205, 214, 221).to_string()
     }
 }

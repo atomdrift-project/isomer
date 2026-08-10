@@ -17,7 +17,14 @@ use crate::policy::Policy;
 pub(crate) fn run(old: &Path, new: &Path, cli: &Cli, policy: &Policy) -> Result<bool> {
     let options = cleave::AnalysisOptions::default();
     let report = analysis::diff(old, new, &options)?;
-    let a = Analysis::new("fs", old, new, &options, &report, cli, policy)?;
+    let mut a = Analysis::new("fs", old, new, &options, &report, cli, policy)?;
+    // `--deps` fetches each added dependency — a network step, and the only one
+    // `fs` makes; skip it under --offline, and show the spinner for a human.
+    if cli.deps && !cli.offline {
+        let progress = cli.format == crate::Format::Terminal
+            && std::io::IsTerminal::is_terminal(&std::io::stderr());
+        a.deps = crate::deps::profiles(a.diff, &options, progress);
+    }
     crate::write_stdout(&a.render(cli.format, cli)?)?;
     Ok(a.clean)
 }

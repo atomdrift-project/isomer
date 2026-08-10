@@ -9,11 +9,13 @@
 //! Running it once is the whole point: `isomer ci` emits four sinks from a
 //! single scan, and analysis is the expensive part.
 
+use std::cell::OnceCell;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use cleave::types::{AnalysisReport, DiffReportV1};
 
+use crate::evidence::Hunk;
 use crate::rubric::Assessment;
 use crate::version::{Bump, Version};
 use crate::{Cli, Format, Gate, Severity};
@@ -40,6 +42,7 @@ pub(crate) fn diff(
 /// capabilities) is per file, so it needs the pairing that the two root paths
 /// alone don't carry. Either side may be absent — a file added by the change
 /// has no old side, a deleted one has no new side.
+#[derive(Debug)]
 pub(crate) struct Pair {
     /// How the file is named in output: repo-relative under `ci`, the
     /// basename under `fs`.
@@ -86,6 +89,69 @@ fn existing(p: std::path::PathBuf) -> Option<std::path::PathBuf> {
     p.is_file().then_some(p)
 }
 
+/// Trait atoms that moved on one file, worst criticality first. Added and
+/// removed together — a reviewer wants both directions of a source change.
+fn trait_atoms(entry: &cleave::types::FileDiffEntry) -> Vec<Atom> {
+    let Some(traits) = entry.scopes.traits.as_ref() else {
+        return Vec::new();
+    };
+    let mut atoms: Vec<Atom> = traits
+        .added
+        .iter()
+        .map(|t| (true, t))
+        .chain(traits.removed.iter().map(|t| (false, t)))
+        .map(|(gained, t)| Atom {
+            id: t.id.clone(),
+            desc: t.desc.clone(),
+            crit: t.crit,
+            gained,
+        })
+        .collect();
+    atoms.sort_by(|a, b| {
+        crate::rubric::crit_rank(b.crit)
+            .cmp(&crate::rubric::crit_rank(a.crit))
+            .then(a.id.cmp(&b.id))
+    });
+    atoms
+}
+
+/// A full line diff of two text files: `+` for a line only on the new side,
+/// `-` for one only on the old, a space for context. Set-based (not
+/// positional), so a moved line reads as context and the output is
+/// order-independent — enough for an LLM to see exactly what text entered or
+/// left. Control chars are neutralized; the total is line-capped so one large
+/// file can't blow the context budget.
+fn line_diff(old: &[u8], new: &[u8]) -> String {
+    use std::collections::HashSet;
+    use std::fmt::Write as _;
+    const MAX_LINES: usize = 400;
+
+    let old_text = String::from_utf8_lossy(old);
+    let new_text = String::from_utf8_lossy(new);
+    let old_set: HashSet<&str> = old_text.lines().map(str::trim_end).collect();
+    let new_set: HashSet<&str> = new_text.lines().map(str::trim_end).collect();
+
+    let mut s = String::new();
+    let mut shown = 0usize;
+    for line in new_text.lines() {
+        if shown >= MAX_LINES {
+            let _ = writeln!(s, "  … (diff truncated)");
+            break;
+        }
+        let mark = if old_set.contains(line.trim_end()) { ' ' } else { '+' };
+        let _ = writeln!(s, "{mark} {}", crate::printable(line));
+        shown += 1;
+    }
+    for line in old_text
+        .lines()
+        .filter(|l| !new_set.contains(l.trim_end()))
+        .take(MAX_LINES)
+    {
+        let _ = writeln!(s, "- {}", crate::printable(line));
+    }
+    s
+}
+
 /// The cleave diff plus everything isomer derived from it.
 ///
 /// Borrows the (large) cleave report rather than owning it, so the caller
@@ -98,6 +164,9 @@ pub(crate) struct Analysis<'a> {
     pub diff: &'a DiffReportV1,
     /// The changed files, each with both sides — what deep analysis runs over.
     pub pairs: Vec<Pair>,
+    /// What each side exhibits: base capability classes, and the ATT&CK / MBC
+    /// ids present before and after.
+    pub survey: crate::evidence::Survey,
     pub assessment: Assessment,
     pub naming: Naming,
     pub prop: Proportionality,
@@ -114,9 +183,49 @@ pub(crate) struct Analysis<'a> {
     pub clean: bool,
     /// Optional `--llm` read of the change.
     pub interp: Option<crate::llm::Interpretation>,
+    /// Profiles of the dependencies this change added — what each can do,
+    /// attributed to the dependency. Empty unless `--deps` was requested; a
+    /// verb fills it after construction, since it is a separate network step.
+    pub deps: Vec<crate::deps::DepProfile>,
     /// The policy file that was actually loaded, if any — reports name it so
     /// `--config ours.toml` is never reported as `.isomer.toml`.
     policy_file: Option<String>,
+    /// Evidence hunks, ranked strongest-first, computed on first use.
+    ///
+    /// Collecting them re-analyzes every changed file, and `ci` renders four
+    /// formats from one analysis — so this is computed at most once per run,
+    /// and not at all for a run with nothing to show.
+    hunks: OnceCell<Vec<Hunk>>,
+    /// Source files whose traits moved, with the atoms and a full line diff —
+    /// the signal the Notable finding floor drops. Reads both sides from disk,
+    /// so it is computed at most once per run.
+    source_changes: OnceCell<Vec<SourceChange>>,
+}
+
+/// A source-language file whose behavior-bearing traits changed between the two
+/// sides. Carries what the strict rubric discards: the sub-Notable atoms that
+/// moved (a `$HOME` read, a base64 heredoc) and a full line diff. An attack
+/// composed entirely of individually-innocent atoms — no single trait reaching
+/// the finding floor — leaves its whole fingerprint here.
+#[derive(Debug)]
+pub(crate) struct SourceChange {
+    /// How the file is named in output.
+    pub label: String,
+    /// Trait atoms that appeared or vanished, worst criticality first. Includes
+    /// the baseline/component tiers [`crate::rubric::is_finding`] filters out.
+    pub atoms: Vec<Atom>,
+    /// Full line diff of the file (`+` added, `-` removed), for the LLM.
+    pub diff: String,
+}
+
+/// One trait that appeared or vanished on a source file.
+#[derive(Debug)]
+pub(crate) struct Atom {
+    pub id: String,
+    pub desc: String,
+    pub crit: cleave::Criticality,
+    /// True when the trait is present on the new side but not the old.
+    pub gained: bool,
 }
 
 impl<'a> Analysis<'a> {
@@ -137,10 +246,11 @@ impl<'a> Analysis<'a> {
 
         let pairs = Pair::from_roots(old, new, diff, policy);
 
-        // Capability classes present in the base, so we can tell a wholly new
-        // class from one that merely gained a trait (a cached analyze of old).
-        let base_classes = crate::evidence::base_classes(&pairs, options);
-        let assessment = crate::rubric::assess(diff, &base_classes, policy);
+        // One walk over both sides: the base's capability classes (so a wholly
+        // new class is distinguishable from one that merely gained a trait)
+        // and the ATT&CK / MBC annotations each side carries.
+        let survey = crate::evidence::survey(&pairs, options);
+        let assessment = crate::rubric::assess(diff, &survey.base_classes, policy);
         let naming = Naming::resolve(old, new, cli);
         let prop = Proportionality::eval(&assessment, &naming, diff);
 
@@ -171,6 +281,7 @@ impl<'a> Analysis<'a> {
             report,
             diff,
             pairs,
+            survey,
             assessment,
             naming,
             prop,
@@ -180,7 +291,10 @@ impl<'a> Analysis<'a> {
             gated,
             clean: !gated.fails(cli.fail_on),
             interp: None,
+            deps: Vec::new(),
             policy_file: policy.source.as_ref().map(|p| p.display().to_string()),
+            hunks: OnceCell::new(),
+            source_changes: OnceCell::new(),
         };
         // The LLM read is asked for only when there is a change worth
         // describing — a silent diff has nothing to interpret, and the call
@@ -270,26 +384,87 @@ impl<'a> Analysis<'a> {
         }
     }
 
-    /// Rename the subject of the report. `fs` compares two artifacts and names
-    /// the artifact; `ci` compares two states of a repository, where the
-    /// scratch directory the files were staged in is no name at all.
-    pub(crate) fn rename(&mut self, name: String) {
-        self.naming.name = name;
-    }
-
     /// The policy file suppressions came from, for the report.
     pub(crate) fn policy_source(&self) -> &str {
         self.policy_file.as_deref().unwrap_or(crate::policy::FILE)
     }
 
-    /// The evidence hunks behind the verdict, capped at `limit`.
-    pub(crate) fn hunks(&self, limit: usize) -> Vec<crate::evidence::Hunk> {
-        crate::evidence::hunks(
-            &self.pairs,
-            self.options,
-            &self.assessment.gained_ids(),
-            limit,
-        )
+    /// The strongest `limit` evidence hunks behind the verdict, in file order.
+    pub(crate) fn hunks(&self, limit: usize) -> Vec<&Hunk> {
+        let all = self.hunks.get_or_init(|| {
+            crate::evidence::hunks(&self.pairs, self.options, &self.assessment.gained_ids())
+        });
+        crate::evidence::strongest(all, limit)
+    }
+
+    /// Source files whose traits moved, each with the atoms and a full line
+    /// diff. Computed once and memoized (both sides are read from disk).
+    ///
+    /// This is the seam that keeps a diff from going silent when an attack is
+    /// composed of individually-innocent atoms: no single trait reaches the
+    /// Notable finding floor, so the rubric surfaces nothing, but the file still
+    /// *changed behavior* — and here that change is captured whole, both for the
+    /// [`observations`](Self::observations) a reviewer sees and for the full
+    /// diff the LLM reads.
+    pub(crate) fn source_changes(&self) -> &[SourceChange] {
+        self.source_changes.get_or_init(|| self.collect_source_changes())
+    }
+
+    /// Walk the pairs, keeping the source-language files whose trait scope
+    /// changed, and pair each with the atoms that moved and a line diff.
+    fn collect_source_changes(&self) -> Vec<SourceChange> {
+        use cleave::types::FileStatus;
+        // A single-file `fs` comparison names its one diff entry `<root>`, not
+        // the basename, so it can't be matched to the pair by path — but there
+        // is only one pair, so the lone changed entry is unambiguously its.
+        let single = self.pairs.len() == 1;
+        let mut out = Vec::new();
+        for pair in &self.pairs {
+            let (Some(old), Some(new)) = (pair.old.as_deref(), pair.new.as_deref()) else {
+                continue;
+            };
+            let Some(entry) = self.diff.files.iter().find(|f| {
+                !matches!(f.status, FileStatus::Unchanged)
+                    && (single || f.path == pair.label)
+                    && f.scopes
+                        .traits
+                        .as_ref()
+                        .is_some_and(|t| !t.added.is_empty() || !t.removed.is_empty())
+            }) else {
+                continue;
+            };
+            // Cheap fileid (no full parse) on the new side decides source-ness;
+            // manifests (package.json) are structured data, not a source
+            // language, and are covered by the dependency path instead.
+            let Ok(new_bytes) = std::fs::read(new) else {
+                continue;
+            };
+            if !filefacts::FileId::from_path_and_bytes(new, &new_bytes)
+                .file_type()
+                .is_source_code()
+            {
+                continue;
+            }
+            let old_bytes = std::fs::read(old).unwrap_or_default();
+            out.push(SourceChange {
+                label: pair.label.clone(),
+                atoms: trait_atoms(entry),
+                diff: line_diff(&old_bytes, &new_bytes),
+            });
+        }
+        out
+    }
+
+    /// The gained sub-Notable atoms across every changed source file — the
+    /// behavioral changes the rubric dropped, for the report's observations
+    /// line. Findings (Notable+) are already named as capability classes, so
+    /// they are excluded here to avoid saying the same thing twice.
+    pub(crate) fn observations(&self) -> Vec<&Atom> {
+        self.source_changes()
+            .iter()
+            .flat_map(|c| &c.atoms)
+            .filter(|a| a.gained && !crate::rubric::is_finding(a.crit))
+            .collect()
     }
 
     /// The one-line reason a reader needs first: why the change is judged the
@@ -579,12 +754,35 @@ impl<'a> Analysis<'a> {
                     severity: a.identity.severity.as_str(),
                     changes,
                 },
+                frameworks: j::Frameworks {
+                    attack: j::Ids {
+                        new: self.survey.attack.gained(),
+                        removed: self.survey.attack.lost(),
+                        unchanged: self.survey.attack.kept(),
+                    },
+                    mbc: j::Ids {
+                        new: self.survey.mbc.gained(),
+                        removed: self.survey.mbc.lost(),
+                        unchanged: self.survey.mbc.kept(),
+                    },
+                },
                 structure: j::Structure {
                     severity: a.structure.severity.as_str(),
                     facts,
                 },
             },
             evidence,
+            deps: self
+                .deps
+                .iter()
+                .map(|d| j::Dep {
+                    coord: &d.coord,
+                    ecosystem: d.ecosystem,
+                    severity: d.severity.as_str(),
+                    highlights: &d.highlights,
+                    note: d.note.as_deref(),
+                })
+                .collect(),
             llm: self.interp.as_ref().map(|i| j::Llm {
                 nature: &i.nature,
                 verdict: &i.verdict,
@@ -618,6 +816,7 @@ pub(crate) fn risk_band(p: f32) -> Severity {
 
 /// Detected versions and the artifact name for the header, from the input
 /// paths (or explicit `--base-version` / `--head-version`).
+#[derive(Debug)]
 pub(crate) struct Naming {
     pub name: String,
     pub old: Option<Version>,
@@ -652,7 +851,9 @@ impl Naming {
     }
 }
 
-fn basename(p: &Path) -> String {
+/// A path's final component, for naming a file in output. Falls back to the
+/// whole path when there is no final component (`/`, or a path ending in `..`).
+pub(crate) fn basename(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.display().to_string())
@@ -665,12 +866,17 @@ fn basename(p: &Path) -> String {
 fn artifact_name(new_base: &str, old_base: &str, ver: Option<&Version>) -> String {
     let new_clean = clean_name(new_base, ver);
     let old_clean = clean_name(old_base, ver);
-    if new_clean.is_empty() || (hexish(&new_clean) && !old_clean.is_empty() && !hexish(&old_clean))
-    {
-        old_clean
-    } else {
-        new_clean
-    }
+    // A filename is attacker-chosen — a pull request names its own files, and a
+    // package names its own archive — and this lands in the masthead.
+    crate::printable(
+        if new_clean.is_empty()
+            || (hexish(&new_clean) && !old_clean.is_empty() && !hexish(&old_clean))
+        {
+            &old_clean
+        } else {
+            &new_clean
+        },
+    )
 }
 
 /// A name that is just a hex digest (with or without an extension).
@@ -713,6 +919,7 @@ fn clean_name(base: &str, ver: Option<&Version>) -> String {
 
 /// The two change-shape reads: behavioral drift vs the version bump's promise
 /// (`disproportionate`/`note`), and behavioral drift vs content drift (`skew`).
+#[derive(Debug)]
 pub(crate) struct Proportionality {
     pub disproportionate: bool,
     pub note: Option<String>,
@@ -725,29 +932,31 @@ pub(crate) struct Proportionality {
 impl Proportionality {
     fn eval(a: &Assessment, naming: &Naming, diff: &DiffReportV1) -> Self {
         let skew = skew_note(a, diff);
-        let (disproportionate, note) = match naming.bump {
-            Some(bump) if a.behavioral.severity != Severity::None => {
-                if a.behavioral.severity > bump.tolerance() {
-                    (
-                        true,
-                        Some(format!(
-                            "disproportionate — a {} bump gained a {}-severity capability",
-                            bump.label(),
-                            a.behavioral.severity.as_str()
-                        )),
-                    )
-                } else {
-                    (
-                        false,
-                        Some(format!("within tolerance for a {} bump", bump.label())),
-                    )
-                }
-            }
-            _ => (false, None),
+        // Proportionality needs both halves of the comparison: a version bump
+        // making a promise, and a capability gain to weigh against it.
+        let Some(bump) = naming
+            .bump
+            .filter(|_| a.behavioral.severity != Severity::None)
+        else {
+            return Self {
+                disproportionate: false,
+                note: None,
+                skew,
+            };
+        };
+        let disproportionate = a.behavioral.severity > bump.tolerance();
+        let note = if disproportionate {
+            format!(
+                "disproportionate — a {} bump gained a {}-severity capability",
+                bump.label(),
+                a.behavioral.severity.as_str()
+            )
+        } else {
+            format!("within tolerance for a {} bump", bump.label())
         };
         Self {
             disproportionate,
-            note,
+            note: Some(note),
             skew,
         }
     }

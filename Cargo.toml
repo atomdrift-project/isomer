@@ -93,8 +93,4 @@ wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freeb
 tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
 tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
 
-# Local-dev override so isomer's cleave build carries the working-tree filefacts
-# (direct-syscall inventory → `type: syscall` traits). Mirrors cleave's own
-# patch; remove to return to the pinned git filefacts.
-[patch."https://github.com/atomdrift-project/filefacts.git"]
-filefacts = { path = "../filefacts" }
+

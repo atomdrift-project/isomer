@@ -44,14 +44,17 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
     }
 
     // The judgement first, always: what isomer makes of the change, before any
-    // of the detail behind it.
-    let _ = writeln!(s, "> {}", a.judgement());
+    // of the detail behind it. Escaped like any other untrusted line — it may
+    // carry a rule description, or the LLM's phrasing of a diff that tried to
+    // talk to it.
+    let _ = writeln!(s, "> {}", cell(&a.judgement()));
     let _ = writeln!(s);
     risk(&mut s, a);
     behavioral(&mut s, a);
     signatures(&mut s, a);
     identity(&mut s, a);
     structure(&mut s, a);
+    frameworks(&mut s, a);
     // A change that passes the gate is named, not dissected: metrics, evidence,
     // and a paste-ready suppression are for a reviewer who has to act.
     if a.detailed(cli) {
@@ -81,10 +84,10 @@ fn heading(a: &Analysis<'_>) -> String {
         crate::terminal::verdict_word(a.verdict)
     )];
     if !a.naming.name.is_empty() {
-        parts.push(format!("`{}`", a.naming.name));
+        parts.push(code(&a.naming.name));
     }
     if let (Some(o), Some(n)) = (&a.naming.old, &a.naming.new) {
-        parts.push(format!("{} → {}", o.raw, n.raw));
+        parts.push(format!("{} → {}", cell(&o.raw), cell(&n.raw)));
         if let Some(b) = a.naming.bump {
             parts.push(b.describe());
         }
@@ -221,9 +224,9 @@ fn signatures(s: &mut String, a: &Analysis<'_>) {
     for m in sig.ids.iter().take(10) {
         let _ = writeln!(
             s,
-            "| {} | `{}` | {} |",
+            "| {} | {} | {} |",
             dots(m.severity),
-            cell(&crate::rubric::short_name(&m.id)),
+            code(&crate::rubric::short_name(&m.id)),
             cell(&m.desc),
         );
     }
@@ -269,6 +272,42 @@ fn structure(s: &mut String, a: &Analysis<'_>) {
     let _ = writeln!(s);
 }
 
+/// ATT&CK and MBC ids the change moved. Shown as ids: isomer has no catalog
+/// mapping them to prose and will not invent one.
+fn frameworks(s: &mut String, a: &Analysis<'_>) {
+    let rows: Vec<(&str, &crate::evidence::Sides)> =
+        [("ATT&CK", &a.survey.attack), ("MBC", &a.survey.mbc)]
+            .into_iter()
+            .filter(|(_, sides)| sides.changed())
+            .collect();
+    if rows.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "#### Technique coverage\n");
+    let _ = writeln!(s, "| | introduced | no longer present | unchanged |");
+    let _ = writeln!(s, "|---|---|---|---|");
+    for (label, sides) in rows {
+        let list = |ids: Vec<&str>| {
+            if ids.is_empty() {
+                "—".to_string()
+            } else {
+                ids.iter()
+                    .map(|i| format!("`{}`", cell(i)))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        };
+        let _ = writeln!(
+            s,
+            "| **{label}** | {} | {} | {} |",
+            list(sides.gained()),
+            list(sides.lost()),
+            sides.kept(),
+        );
+    }
+    let _ = writeln!(s);
+}
+
 fn metrics(s: &mut String, a: &Analysis<'_>) {
     let m = crate::terminal::metrics(a.diff);
     if m.is_empty() {
@@ -295,8 +334,8 @@ fn evidence(s: &mut String, a: &Analysis<'_>) {
     );
     for h in &hunks {
         let where_ = match &h.member {
-            Some(m) => format!("`{}` → `{m}`", h.file),
-            None => format!("`{}`", h.location),
+            Some(m) => format!("{} → {}", code(&h.file), code(m)),
+            None => code(&h.location),
         };
         let _ = writeln!(s, "{} {} — {}\n", dots(h.severity), where_, cell(&h.desc));
         let body: String = h
@@ -358,16 +397,48 @@ fn dots(sev: Severity) -> &'static str {
     }
 }
 
-/// Make a value safe inside a table cell: pipes would end the column, and
-/// newlines would end the row.
+/// Make a value safe as markdown *prose* — a table cell, a list item, or text
+/// sitting beside the raw HTML this report emits.
+///
+/// Pipes would end a column and newlines a row. `<` and `&` matter just as
+/// much: GitHub renders a comment body as rich text, so an artifact whose
+/// author field or suppression reason carries `<img>`/`<details>` can forge a
+/// banner, hide the real verdict behind a collapsed block, or beacon the
+/// reviewer's IP. Everything reaching a comment is attacker-controlled — a
+/// fork's pull request supplies both the artifact *and* `.isomer.toml`.
 fn cell(s: &str) -> String {
-    s.replace('|', "\\|").replace(['\n', '\r'], " ")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('|', "\\|")
+        .replace(['\n', '\r'], " ")
+}
+
+/// An inline code span whose delimiter outgrows any backtick run inside it, so
+/// attacker-controlled text — an archive member name, a rule id, a path from a
+/// fork's pull request — cannot close the span and inject markup after it. The
+/// inline twin of [`fence_lang`], and the reason nothing here interpolates into
+/// a bare `` `…` ``.
+///
+/// A span's content is literal, so only the table-breaking characters need
+/// escaping; GFM honors `\|` inside a code span.
+fn code(s: &str) -> String {
+    let text = s.replace('|', "\\|").replace(['\n', '\r'], " ");
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let ticks = "`".repeat(longest + 1);
+    // CommonMark strips one leading and trailing space inside a span, so pad
+    // content that itself starts or ends with a backtick.
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{ticks}{pad}{text}{pad}{ticks}")
 }
 
 fn code_list(items: &[String]) -> String {
     items
         .iter()
-        .map(|i| format!("`{}`", cell(i)))
+        .map(|i| code(i))
         .collect::<Vec<_>>()
         .join(" · ")
 }
@@ -416,6 +487,32 @@ mod tests {
     fn table_cells_escape_pipes_and_newlines() {
         assert_eq!(cell("a|b"), "a\\|b");
         assert_eq!(cell("a\nb"), "a b");
+    }
+
+    /// The inline half of the fence problem: a member name or path out of a
+    /// hostile archive must not close the span and inject markup after it.
+    #[test]
+    fn code_span_outgrows_backticks() {
+        assert_eq!(code("plain"), "`plain`");
+        let span = code("a`b</code><img src=x onerror=alert(1)>");
+        assert!(span.starts_with("``") && span.ends_with("``"), "{span}");
+        // No backtick run inside can reach the delimiter's length.
+        assert!(!span.contains("```"), "{span}");
+        // Content that itself begins and ends with a backtick survives intact.
+        assert!(code("`x`").contains("`x`"));
+    }
+
+    /// A comment body is rich text, and a fork's pull request supplies both the
+    /// artifact and `.isomer.toml` — raw HTML must not survive into it.
+    #[test]
+    fn cells_neutralize_html() {
+        assert_eq!(
+            cell("<img src=x onerror=alert(1)>"),
+            "&lt;img src=x onerror=alert(1)>"
+        );
+        assert_eq!(cell("a & b"), "a &amp; b");
+        // Ampersand first, so an escaped entity is not re-encoded into a live one.
+        assert_eq!(cell("&lt;script>"), "&amp;lt;script>");
     }
 
     #[test]

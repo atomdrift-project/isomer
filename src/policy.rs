@@ -105,18 +105,19 @@ impl Policy {
                     a.id,
                 );
             }
-            let expires = match a.expires {
-                Some(raw) => Some(NaiveDate::parse_from_str(&raw, "%Y-%m-%d").with_context(
-                    || {
+            let expires = a
+                .expires
+                .as_deref()
+                .map(|raw| {
+                    NaiveDate::parse_from_str(raw, "%Y-%m-%d").with_context(|| {
                         format!(
                             "{}: [[allow]] `{}` has invalid expires `{raw}` (want YYYY-MM-DD)",
                             path.display(),
                             a.id
                         )
-                    },
-                )?),
-                None => None,
-            };
+                    })
+                })
+                .transpose()?;
             if let Some(exp) = expires.filter(|e| *e < today) {
                 eprintln!(
                     "isomer: {}: suppression for `{}` expired {exp} — no longer applied",
@@ -128,7 +129,9 @@ impl Policy {
             allow.push(Allow {
                 id: a.id,
                 path: a.path,
-                reason: a.reason,
+                // Echoed back into the terminal and the PR comment, and on a
+                // fork's pull request this file is the attacker's to write.
+                reason: crate::printable(&a.reason),
                 expires,
             });
         }

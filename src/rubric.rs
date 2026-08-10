@@ -17,7 +17,7 @@
 //! is automatically independent of the signature axis. Proportionality
 //! (drift vs. version bump) is applied by the caller with [`crate::version`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cleave::Criticality;
 use cleave::types::{DiffReportV1, FileDiffEntry, TraitChange};
@@ -48,7 +48,7 @@ pub(crate) struct Behavioral {
     pub categories: Vec<Category>,
     /// Capability classes that had *no* trait in the base version — a wholly
     /// new kind of behavior, the strongest differential signal.
-    pub new_categories: std::collections::HashSet<String>,
+    pub new_categories: HashSet<String>,
 }
 
 impl Behavioral {
@@ -77,15 +77,16 @@ pub(crate) struct Category {
 
 impl Assessment {
     /// Every gained trait id the rubric judged (behavioral plus signature),
-    /// for evidence rendering.
-    pub(crate) fn gained_ids(&self) -> std::collections::HashSet<String> {
-        let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for c in &self.behavioral.categories {
-            ids.extend(c.new_ids.iter().cloned());
-            ids.extend(c.escalated_ids.iter().cloned());
-        }
-        ids.extend(self.signature.ids.iter().map(|m| m.id.clone()));
-        ids
+    /// for evidence rendering. Borrowed: the ids live in the assessment, and
+    /// evidence only ever reads them.
+    pub(crate) fn gained_ids(&self) -> HashSet<&str> {
+        self.behavioral
+            .categories
+            .iter()
+            .flat_map(|c| c.new_ids.iter().chain(&c.escalated_ids))
+            .chain(self.signature.ids.iter().map(|m| &m.id))
+            .map(String::as_str)
+            .collect()
     }
 
     /// Severity considering only *newly-introduced* risk — categories with new
@@ -203,10 +204,10 @@ pub(crate) struct StructFact {
 /// has reviewed and accepted.
 pub(crate) fn assess(
     diff: &DiffReportV1,
-    base_classes: &std::collections::HashSet<String>,
+    base_classes: &HashSet<String>,
     policy: &crate::policy::Policy,
 ) -> Assessment {
-    let mut groups: HashMap<&'static str, Category> = HashMap::new();
+    let mut groups: HashMap<String, Category> = HashMap::new();
     let mut sig_ids: Vec<SigMatch> = Vec::new();
     let mut cve: Option<String> = None;
     let mut identity_changes: Vec<IdentityChange> = Vec::new();
@@ -228,7 +229,9 @@ pub(crate) fn assess(
         {
             let changes = meaningful_identity_changes(idd.old.as_ref(), idd.new.as_ref());
             match policy.allows(IDENTITY_ID, &file.path) {
-                Some(s) => suppressed.extend(changes.iter().map(|_| s.clone())),
+                // Nothing to withhold means nothing to report as withheld.
+                Some(s) if !changes.is_empty() => suppressed.push(s),
+                Some(_) => {}
                 None => identity_changes.extend(changes),
             }
         }
@@ -260,11 +263,16 @@ pub(crate) fn assess(
                         cve = extract_cve(&tc.id);
                     }
                 }
-            } else if let Some((sev, class, _phrase)) = capability_risk(&tc.id) {
-                let entry = groups.entry(class).or_insert_with(|| Category {
+            } else if let Some(class) = capability_class(&tc.id) {
+                // Severity is the grading traits-dev already maintains.
+                // Keeping a second opinion here would mean two places to
+                // update and two answers to reconcile every time a trait
+                // is added or regraded.
+                let sev = severity_from_crit(tc.crit);
+                let entry = groups.entry(class.clone()).or_insert_with(|| Category {
                     severity: sev,
-                    class: class.to_string(),
-                    label: humanize(class),
+                    label: humanize(&class),
+                    class,
                     namespaces: Vec::new(),
                     new_ids: Vec::new(),
                     escalated_ids: Vec::new(),
@@ -303,7 +311,7 @@ pub(crate) fn assess(
     sig_ids.sort_by(|a, b| b.severity.cmp(&a.severity).then(a.id.cmp(&b.id)));
 
     // A class is new when the base version carried no trait of it.
-    let new_categories: std::collections::HashSet<String> = categories
+    let new_categories: HashSet<String> = categories
         .iter()
         .map(|c| c.class.clone())
         .filter(|c| !base_classes.contains(c))
@@ -391,7 +399,7 @@ fn structural_facts(
                     continue;
                 }
                 if let Some(name) = dependency_name(p) {
-                    pkg_deps.push(name);
+                    pkg_deps.push(name.to_owned());
                 } else if p.ends_with(".uses") {
                     if let Some(a) = github_action(&k.value) {
                         actions_new.push(a);
@@ -490,7 +498,11 @@ fn structural_facts(
             severity,
             kind,
             label,
-            detail: names.join(" · "),
+            // The names are lifted from the artifact (dependency and action
+            // names, section names, imports); neutralize control chars so a
+            // crafted name can't spoof the terminal. The ` · ` separators are
+            // ours and survive unchanged.
+            detail: crate::printable(&names.join(" · ")),
         });
     };
     if audit {
@@ -552,21 +564,17 @@ fn is_rwx(perms: &Option<String>) -> bool {
 /// `optionalDependencies.foo` → `foo`. Build-time trees (`devDependencies`)
 /// and non-manifest paths return `None` — a dev dependency does not ship in
 /// the installed package, so it is not the runtime supply-chain surface.
-fn dependency_name(path: &str) -> Option<String> {
-    for root in [
+fn dependency_name(path: &str) -> Option<&str> {
+    [
         "dependencies.",
         "optionalDependencies.",
         "peerDependencies.",
-    ] {
-        if let Some(rest) = path.strip_prefix(root) {
-            // Only a direct child (`dependencies.<name>`); a deeper path is a
-            // sub-field of the version spec, not a distinct dependency.
-            if !rest.is_empty() && !rest.contains('.') {
-                return Some(rest.to_string());
-            }
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find_map(|root| path.strip_prefix(root))
+    // Only a direct child (`dependencies.<name>`); a deeper path is a
+    // sub-field of the version spec, not a distinct dependency.
+    .filter(|rest| !rest.is_empty() && !rest.contains('.'))
 }
 
 /// A GitHub Actions `uses:` value that references *remote* third-party code —
@@ -581,8 +589,9 @@ fn github_action(v: &serde_json::Value) -> Option<String> {
         return None;
     }
     let (repo, git_ref) = raw.split_once('@')?;
-    // `owner/repo` at minimum — a slug with no slash is not a remote action.
-    if !repo.contains('/') || repo.is_empty() {
+    // `owner/repo` at minimum — a slug with no slash is not a remote action
+    // (this also rejects an empty owner, e.g. `@v44`).
+    if !repo.contains('/') {
         return None;
     }
     let pinned = git_ref.len() == 40 && git_ref.bytes().all(|b| b.is_ascii_hexdigit());
@@ -628,8 +637,9 @@ fn gained_traits(file: &FileDiffEntry) -> impl Iterator<Item = (bool, &TraitChan
 
 /// Trait namespace: the taxonomy path before `::`, with the leading taxonomy
 /// root stripped so `metadata/binary/linking/runtime::ifunc` reads as
-/// `binary/linking/runtime`.
-fn namespace_of(id: &str) -> String {
+/// `binary/linking/runtime`. Shared with [`crate::evidence`], so the namespaces
+/// a verdict groups by and the ones its evidence names cannot drift apart.
+pub(crate) fn namespace_of(id: &str) -> String {
     const ROOTS: &[&str] = &[
         "metadata",
         "micro-behaviors",
@@ -644,11 +654,6 @@ fn namespace_of(id: &str) -> String {
     }
 }
 
-/// Turn a kebab class label into words: `execution-hijack` → `execution hijack`.
-fn humanize(class: &str) -> String {
-    class.replace('-', " ")
-}
-
 /// Meaningful identity changes between two sides. Deliberately excludes
 /// `version` (a version bump is not a publisher change) and signature
 /// timestamps; a change in author, signer, organization, publisher account,
@@ -658,8 +663,45 @@ fn meaningful_identity_changes(
     new: Option<&filefacts::Identity>,
 ) -> Vec<IdentityChange> {
     use filefacts::Identity;
-    let mut out = Vec::new();
 
+    // Every field below is a *claim the artifact makes about itself* — an npm
+    // `author`, a signature subject — so it is attacker-controlled text on its
+    // way to an analyst's terminal. Neutralized here, at the one place they are
+    // read, rather than at each of the four renderers downstream.
+    fn claim(c: &Option<filefacts::Claim>) -> String {
+        crate::printable(c.as_ref().map_or("", |c| c.value.as_str()))
+    }
+    fn authors(i: &Identity) -> String {
+        crate::printable(
+            &i.authors
+                .iter()
+                .filter_map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+    fn signer(i: &Identity) -> String {
+        crate::printable(
+            i.signer
+                .as_ref()
+                .and_then(|s| {
+                    s.common_name
+                        .as_deref()
+                        .or(s.organization.as_deref())
+                        .or(s.subject.as_deref())
+                })
+                .unwrap_or_default(),
+        )
+    }
+    fn ids(i: &Identity) -> String {
+        crate::printable(
+            &i.unique_ids
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
     // Name the side that exists — `Dominic Tarr → removed` tells the analyst
     // *whose* identity vanished, where `present → removed` says nothing.
     fn describe_side(i: &Identity) -> String {
@@ -668,6 +710,8 @@ fn meaningful_identity_changes(
             .find(|s| !s.is_empty())
             .unwrap_or_else(|| "present".to_string())
     }
+
+    let mut out = Vec::new();
     let (o, n) = match (old, new) {
         (Some(o), Some(n)) => (o, n),
         (Some(o), None) => {
@@ -688,35 +732,6 @@ fn meaningful_identity_changes(
         }
         (None, None) => return out,
     };
-
-    fn claim(c: &Option<filefacts::Claim>) -> String {
-        c.as_ref().map(|c| c.value.clone()).unwrap_or_default()
-    }
-    fn authors(i: &Identity) -> String {
-        i.authors
-            .iter()
-            .filter_map(|p| p.name.clone())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-    fn signer(i: &Identity) -> String {
-        i.signer
-            .as_ref()
-            .and_then(|s| {
-                s.common_name
-                    .clone()
-                    .or_else(|| s.organization.clone())
-                    .or_else(|| s.subject.clone())
-            })
-            .unwrap_or_default()
-    }
-    fn ids(i: &Identity) -> String {
-        i.unique_ids
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
 
     let mut push = |label: &'static str, ov: String, nv: String| {
         if ov != nv {
@@ -764,14 +779,14 @@ fn is_signature(id: &str) -> bool {
 /// and that composite fires as its own trait, carrying its own id and
 /// criticality, so it is judged here on its own merit and its legs are pulled
 /// in as evidence by [`crate::evidence`].
-fn is_finding(crit: Criticality) -> bool {
+pub(crate) fn is_finding(crit: Criticality) -> bool {
     matches!(
         crit,
         Criticality::Hostile | Criticality::Suspicious | Criticality::Notable
     )
 }
 
-fn severity_from_crit(crit: Criticality) -> Severity {
+pub(crate) fn severity_from_crit(crit: Criticality) -> Severity {
     match crit {
         Criticality::Hostile => Severity::Critical,
         Criticality::Suspicious => Severity::High,
@@ -780,7 +795,9 @@ fn severity_from_crit(crit: Criticality) -> Severity {
     }
 }
 
-fn crit_rank(c: Criticality) -> u8 {
+/// Total order over cleave's criticality tiers, worst highest. The enum itself
+/// is not `Ord`, so every comparison in isomer goes through this one ranking.
+pub(crate) fn crit_rank(c: Criticality) -> u8 {
     match c {
         Criticality::Hostile => 5,
         Criticality::Suspicious => 4,
@@ -791,154 +808,64 @@ fn crit_rank(c: Criticality) -> u8 {
     }
 }
 
-/// Capability-drift risk of a gained trait, keyed on segments of its taxonomy
-/// path rather than its assigned criticality. Returns `(severity, class label,
-/// human phrase)`. The table is ordered by descending severity; the first
-/// matching segment wins.
+/// The capability class a trait belongs to, derived from its taxonomy path.
 ///
-/// These fire regardless of how cleave graded the trait, so a *novel* attack —
-/// one no signature covers — still lights up the moment it introduces an
-/// execution-hijack primitive, network egress, or obfuscation into an artifact
-/// that had none.
-fn capability_risk(id: &str) -> Option<(Severity, &'static str, &'static str)> {
-    const TABLE: &[(&str, Severity, &str, &str)] = &[
-        // Critical — the attacker objective is explicit in the taxonomy.
-        (
-            "command-and-control",
-            Severity::Critical,
-            "C2",
-            "gained C2 signaling",
-        ),
-        (
-            "exfiltration",
-            Severity::Critical,
-            "exfiltration",
-            "gained data exfiltration",
-        ),
-        (
-            "impact/",
-            Severity::Critical,
-            "destructive-impact",
-            "gained destructive impact",
-        ),
-        // High — primitives that grant code execution or egress. `ifunc` is the
-        // resolver-hijack mechanism the xz backdoor used.
-        (
-            "linking/runtime::ifunc",
-            Severity::High,
-            "execution-hijack",
-            "gained an ifunc resolver",
-        ),
-        (
-            "process/create",
-            Severity::High,
-            "process-execution",
-            "gained process execution",
-        ),
-        (
-            "child-process",
-            Severity::High,
-            "process-execution",
-            "gained process execution",
-        ),
-        (
-            "process/inject",
-            Severity::High,
-            "process-injection",
-            "gained process injection",
-        ),
-        // Network egress is Medium, not High. A file that gains an HTTP call
-        // is worth naming — especially when it had none before, which the
-        // new-vs-expanded split already reports — but it is also what ordinary
-        // feature work looks like, and failing every such pull request is how
-        // a scanner gets switched off. The attacker-objective classes above
-        // stay Critical, and proportionality still escalates network drift a
-        // patch release had no business introducing.
-        (
-            "communications/",
-            Severity::Medium,
-            "network",
-            "gained network access",
-        ),
-        (
-            "credential-access",
-            Severity::High,
-            "credential-access",
-            "gained credential access",
-        ),
-        (
-            "install-hook",
-            Severity::High,
-            "install-hook",
-            "gained an install hook",
-        ),
-        // Medium — enablers: new runtime linkage, obfuscation, hidden data,
-        // host reconnaissance. Individually noisy, collectively damning.
-        (
-            "linking/runtime",
-            Severity::Medium,
-            "runtime-linkage",
-            "new runtime linkage",
-        ),
-        (
-            "obfuscation",
-            Severity::Medium,
-            "obfuscation",
-            "gained obfuscation",
-        ),
-        (
-            "encode/xor",
-            Severity::Medium,
-            "xor-encoding",
-            "gained xor-encoded data",
-        ),
-        (
-            "decode/base64",
-            Severity::Medium,
-            "base64",
-            "gained base64 decoding",
-        ),
-        (
-            "string/assembly",
-            Severity::Medium,
-            "hidden-byte-strings",
-            "gained hidden byte strings",
-        ),
-        (
-            "discovery/system",
-            Severity::Medium,
-            "host-recon",
-            "gained host reconnaissance",
-        ),
-        (
-            "fingerprint",
-            Severity::Medium,
-            "host-recon",
-            "gained host reconnaissance",
-        ),
-    ];
-    TABLE
-        .iter()
-        .find(|(seg, _, _, _)| id.contains(seg))
-        .map(|&(_, sev, class, phrase)| (sev, class, phrase))
-}
-
-/// Severity of the capability class a trait id maps to; `Severity::None` for
-/// ids carrying no behavioral capability. Lets evidence rank a
-/// baseline-criticality note by the capability it proves — an SSH-protocol
-/// string is weak as a rule but strong as proof of gained network reach.
-pub(crate) fn capability_severity(id: &str) -> Severity {
-    capability_risk(id).map_or(Severity::None, |(s, _, _)| s)
-}
-
-/// The capability class a trait id maps to, if any. `None` for ids that carry
-/// no behavioral capability (structural metadata, signatures). Used to collect
-/// the base version's capability classes.
-pub(crate) fn capability_class(id: &str) -> Option<&'static str> {
+/// The taxonomy already encodes what a trait *is*; a hand-maintained table
+/// mapping id substrings to classes could only ever cover the branches someone
+/// remembered to enumerate, which is the wrong shape for a tool that claims to
+/// catch novel attacks. Depth varies by root because the roots mean different
+/// things:
+///
+/// | root | depth | example class |
+/// |------|-------|---------------|
+/// | `objectives/` | 1 | `command-and-control` — the MBC objective |
+/// | `micro-behaviors/` | 2 | `data/encode` — micro-objective and behavior |
+/// | `metadata/` | 3 | `binary/linking/runtime` |
+///
+/// `well-known/` (library identity) and `third_party/` (signatures) carry no
+/// capability: the first says what the code *is*, the second that we recognize
+/// it. Both are judged on other axes.
+pub(crate) fn capability_class(id: &str) -> Option<String> {
     if is_signature(id) {
         return None;
     }
-    capability_risk(id).map(|(_, class, _)| class)
+    let path = id.split("::").next().unwrap_or(id);
+    let (root, rest) = path.split_once('/')?;
+    // Under `objectives/` and `micro-behaviors/` the path *is* the behavior
+    // taxonomy, so the path names the capability. Under `metadata/` the path
+    // names a structural location and the leaf names the fact — grouping by
+    // path alone would file an ifunc resolver alongside the ordinary loader
+    // entries every shared object has, and bury the one thing that mattered.
+    if root == "metadata" {
+        let leaf = id.rsplit_once("::").map(|(_, l)| l);
+        let path: Vec<&str> = rest.split('/').take(3).collect();
+        return Some(match leaf {
+            Some(leaf) => format!("{}::{leaf}", path.join("/")),
+            None => path.join("/"),
+        });
+    }
+    // Depth per the table above. An unenumerated root falls to the same
+    // granularity as `micro-behaviors` rather than being dropped: a new
+    // taxonomy branch should surface as a class, not vanish.
+    let depth = match root {
+        "well-known" | "third_party" => return None,
+        "objectives" => 1,
+        _ => 2,
+    };
+    let class = rest.split('/').take(depth).collect::<Vec<_>>().join("/");
+    // A root with nothing under it (`objectives/`) names no capability.
+    (!class.is_empty()).then_some(class)
+}
+
+/// A readable name for a class. `command-and-control` reads as `command and
+/// control`; a `metadata` class reads as its leaf (`…runtime::ifunc` → `ifunc`),
+/// which is the part that names the fact. Path separators are otherwise kept
+/// because they carry meaning.
+fn humanize(class: &str) -> String {
+    match class.rsplit_once("::") {
+        Some((_, leaf)) => leaf.replace('-', " "),
+        None => class.replace('-', " "),
+    }
 }
 
 /// The suppression id for publisher drift. Identity changes have no trait id
@@ -954,7 +881,7 @@ pub(crate) fn structure_id(label: &str) -> String {
 
 /// Kebab-case a human label for use inside an id.
 pub(crate) fn slug(label: &str) -> String {
-    label
+    let kebab: String = label
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {
@@ -963,9 +890,8 @@ pub(crate) fn slug(label: &str) -> String {
                 '-'
             }
         })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
+        .collect();
+    kebab.trim_matches('-').to_string()
 }
 
 /// The readable tail of a trait id — the rule name an analyst greps for.
@@ -1005,42 +931,50 @@ fn extract_cve(id: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The class comes from the taxonomy, at a depth that suits each root, so
+    /// a branch nobody enumerated still gets a class instead of vanishing.
     #[test]
-    fn ifunc_is_high_execution_hijack() {
-        let (sev, class, _) = capability_risk("metadata/binary/linking/runtime::ifunc").unwrap();
-        assert_eq!(sev, Severity::High);
-        assert_eq!(class, "execution-hijack");
-    }
-
-    #[test]
-    fn plain_loader_dep_is_medium_runtime_linkage() {
-        let (sev, class, _) =
-            capability_risk("metadata/binary/linking/runtime::library-loader-dep").unwrap();
-        assert_eq!(sev, Severity::Medium);
-        assert_eq!(class, "runtime-linkage");
-    }
-
-    #[test]
-    fn signature_ids_carry_no_capability() {
-        assert!(capability_risk("third_party/elastic/Linux_Trojan_XZBackdoor").is_none());
-        assert!(is_signature("third_party/elastic/Linux_Trojan_XZBackdoor"));
-    }
-
-    #[test]
-    fn ifunc_and_loaders_are_different_classes() {
-        // The load-bearing distinction for new-vs-existing: within one
-        // namespace, the ifunc is `execution-hijack` (the new thing) while the
-        // loader traits are `runtime-linkage` (pre-existing for any .so).
+    fn class_is_derived_from_the_taxonomy() {
+        let c = |id| capability_class(id);
+        // objectives: the MBC objective itself.
         assert_eq!(
-            capability_class("metadata/binary/linking/runtime::ifunc"),
-            Some("execution-hijack")
+            c("objectives/command-and-control/channel/websocket::sio").as_deref(),
+            Some("command-and-control")
         );
         assert_eq!(
-            capability_class("metadata/binary/linking/runtime::dynamic-loader-needed"),
-            Some("runtime-linkage")
+            c("objectives/exfiltration/http/upload::x").as_deref(),
+            Some("exfiltration")
         );
-        // Signatures and structural traits are not capability classes.
-        assert_eq!(capability_class("third_party/elastic/XZBackdoor"), None);
+        // micro-behaviors: micro-objective and behavior.
+        assert_eq!(
+            c("micro-behaviors/data/encode/xor::x").as_deref(),
+            Some("data/encode")
+        );
+        assert_eq!(
+            c("micro-behaviors/communications/dns/lookup/txt::x").as_deref(),
+            Some("communications/dns")
+        );
+        // metadata: three segments, enough to separate structural neighbours.
+        // metadata keeps the leaf: the ifunc must not be filed with the
+        // ordinary loader entries every shared object already has.
+        assert_eq!(
+            c("metadata/binary/linking/runtime::ifunc").as_deref(),
+            Some("binary/linking/runtime::ifunc")
+        );
+        assert_ne!(
+            c("metadata/binary/linking/runtime::ifunc"),
+            c("metadata/binary/linking/runtime::dynamic-loader-needed")
+        );
+        // Library identity and signatures are not capabilities.
+        assert_eq!(c("well-known/lib/core/suncalc::x"), None);
+        assert_eq!(c("third_party/elastic/XZBackdoor"), None);
+        // An unenumerated root still yields a class rather than nothing.
+        assert_eq!(
+            c("brand-new-root/persistence/service::x").as_deref(),
+            Some("persistence/service")
+        );
+        // A root with nothing under it names no capability.
+        assert_eq!(c("objectives/"), None);
     }
 
     /// A component atom is an ingredient of a composite rule, not a finding.
@@ -1068,13 +1002,10 @@ mod tests {
     fn dependency_name_reads_runtime_manifests_only() {
         // A direct runtime dependency — the node-ipc / event-stream shape.
         assert_eq!(
-            dependency_name("dependencies.peacenotwar").as_deref(),
+            dependency_name("dependencies.peacenotwar"),
             Some("peacenotwar")
         );
-        assert_eq!(
-            dependency_name("optionalDependencies.foo").as_deref(),
-            Some("foo")
-        );
+        assert_eq!(dependency_name("optionalDependencies.foo"), Some("foo"));
         // A lockfile sub-field of a version spec is not a distinct dependency.
         assert_eq!(dependency_name("dependencies.foo.version"), None);
         // Build-time deps don't ship in the installed package.

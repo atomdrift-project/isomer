@@ -36,6 +36,10 @@ pub(crate) struct Args {
     pub repo: PathBuf,
     pub out_dir: Option<PathBuf>,
     pub max_files: usize,
+    /// Build outputs of the base commit, laid over the base tree.
+    pub base_artifacts: Option<PathBuf>,
+    /// Build outputs of the head commit, laid over the head tree.
+    pub head_artifacts: Option<PathBuf>,
 }
 
 /// A blob larger than this is not extracted. Nothing legitimate in a source
@@ -54,7 +58,11 @@ pub(crate) fn run(cli: &Cli, policy: &Policy, args: &Args) -> Result<bool> {
     );
 
     let changes = changed_files(repo, &refs, args.max_files, policy)?;
-    if changes.is_empty() {
+    // Build outputs are judged even when no source file changed: a change to a
+    // lockfile or a build script can move the artifact without moving anything
+    // this diff would otherwise read.
+    let artifacts = args.base_artifacts.is_some() || args.head_artifacts.is_some();
+    if changes.is_empty() && !artifacts {
         // Nothing to judge. Say so on the sinks that always exist and pass;
         // a pull request that touches no analyzable file is not a finding.
         eprintln!("isomer: no analyzable files changed");
@@ -65,6 +73,7 @@ pub(crate) fn run(cli: &Cli, policy: &Policy, args: &Args) -> Result<bool> {
             ("new-severity", "none"),
             ("fail", "false"),
             ("findings", "0"),
+            ("base-sha", &refs.base),
         ]);
         return Ok(true);
     }
@@ -75,14 +84,112 @@ pub(crate) fn run(cli: &Cli, policy: &Policy, args: &Args) -> Result<bool> {
         .context("creating work directory")?;
     let (old, new) = (work.path().join("base"), work.path().join("head"));
     materialize(repo, &refs, &changes, &old, &new)?;
+    // One side without the other is a workflow that half-worked — usually a
+    // build that failed on the base. Every artifact would then read as added or
+    // deleted wholesale, which is noise wearing the costume of a finding.
+    if args.base_artifacts.is_some() != args.head_artifacts.is_some() {
+        warn("only one side's build outputs were supplied; the artifact comparison needs both");
+    }
+    overlay(args.base_artifacts.as_deref(), &old, args.max_files)?;
+    overlay(args.head_artifacts.as_deref(), &new, args.max_files)?;
 
     let options = cleave::AnalysisOptions::default();
     let report = analysis::diff(&old, &new, &options)?;
     let mut a = Analysis::new("ci", &old, &new, &options, &report, cli, policy)?;
-    a.rename(subject(repo));
+    // `fs` names the artifact it compared; `ci` compares two states of a
+    // repository, where the scratch dir the files were staged in is no name.
+    a.naming.name = subject(repo);
 
-    emit(&a, cli, args.out_dir.as_deref())?;
+    emit(&a, cli, args.out_dir.as_deref(), &refs.base)?;
     Ok(a.clean)
+}
+
+// ── build outputs ───────────────────────────────────────────────────────────
+
+/// Lay a built artifact tree over one side of the comparison.
+///
+/// Build outputs are not in git, so `ci` cannot materialize them from a commit
+/// the way it does source. Copying them into the tree at their repo-relative
+/// paths puts them in the same diff as the source they were built from: one
+/// analysis, one verdict, and paths the reviewer recognizes — `dist/app.js` is
+/// reported as `dist/app.js`. Nothing downstream has to know artifacts exist.
+fn overlay(from: Option<&Path>, onto: &Path, max: usize) -> Result<()> {
+    let Some(from) = from else { return Ok(()) };
+    if !from.is_dir() {
+        // The workflow asked for an artifact comparison and the artifacts are
+        // not there. An axis that silently did not run reads exactly like an
+        // axis that ran and found nothing.
+        warn(&format!(
+            "{} does not exist — build outputs were NOT compared",
+            from.display()
+        ));
+        return Ok(());
+    }
+    let mut copied = 0usize;
+    copy_tree(from, onto, &mut copied, max, 0)?;
+    if copied == 0 {
+        warn(&format!(
+            "{} is empty — build outputs were NOT compared",
+            from.display()
+        ));
+    } else {
+        eprintln!("isomer: {copied} build output(s) from {}", from.display());
+    }
+    Ok(())
+}
+
+/// Directory nesting past this is a build gone wrong, or a hostile one trying
+/// to exhaust the stack.
+const MAX_DEPTH: usize = 64;
+
+/// Copy a tree, refusing anything that would let a build output reach outside
+/// itself or outgrow the scan.
+fn copy_tree(from: &Path, onto: &Path, copied: &mut usize, max: usize, depth: usize) -> Result<()> {
+    if depth > MAX_DEPTH {
+        bail!("build outputs nest deeper than {MAX_DEPTH} directories");
+    }
+    let entries = std::fs::read_dir(from).with_context(|| format!("reading {}", from.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", from.display()))?;
+        let kind = entry.file_type()?;
+        let dest = onto.join(entry.file_name());
+        if kind.is_symlink() {
+            // A build can emit a link pointing anywhere on the runner, and this
+            // tree's contents are quoted as evidence in a comment posted to a
+            // public pull request. Links are never followed: a scan is not
+            // worth turning into an exfiltration primitive.
+            eprintln!("isomer: skipped symlink {}", entry.path().display());
+        } else if kind.is_dir() {
+            std::fs::create_dir_all(&dest)
+                .with_context(|| format!("creating {}", dest.display()))?;
+            copy_tree(&entry.path(), &dest, copied, max, depth + 1)?;
+        } else {
+            *copied += 1;
+            if *copied > max {
+                // Same rule as the source diff: never analyze a subset and
+                // report it as the whole.
+                bail!(
+                    "build outputs exceed --max-files {max}. Point the artifact directory at what \
+                     you ship rather than the whole build tree"
+                );
+            }
+            if entry.metadata()?.len() > MAX_BLOB {
+                eprintln!(
+                    "isomer: skipped {} — larger than {} MiB",
+                    entry.path().display(),
+                    MAX_BLOB >> 20
+                );
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::copy(entry.path(), &dest)
+                .with_context(|| format!("copying {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
 }
 
 // ── what changed ────────────────────────────────────────────────────────────
@@ -107,6 +214,12 @@ impl Refs {
                 (b.clone().unwrap_or(env.0), h.clone().unwrap_or(env.1))
             }
         };
+        // Before either value reaches git. Both sides travel as *positional*
+        // arguments, and neither source is under our control: `--base`/`--head`
+        // come from whatever wrapper invoked us, and the rest from a CI
+        // environment. See [`checked_rev`].
+        base = checked_rev(base, "base")?;
+        head = checked_rev(head, "head")?;
 
         // A shallow checkout of a pull request often has the merge commit but
         // not the head commit the event names. `HEAD` is then the right — and
@@ -214,6 +327,30 @@ fn from_env() -> Option<(String, String)> {
     None
 }
 
+/// Reject a revision that git would read as an option rather than a commit.
+///
+/// Every revision here is passed positionally (`git diff <base> <head>`,
+/// `git show <commit>:<path>`), and git has no way to say "this argument is
+/// data". A value like `--output=/etc/cron.d/isomer` is a real `git diff`
+/// flag, so an unchecked revision turns a read-only scan into an arbitrary
+/// file write. One check at the boundary covers every call below.
+fn checked_rev(rev: String, side: &str) -> Result<String> {
+    if rev.is_empty() || rev.starts_with('-') {
+        bail!(
+            "refusing {side} revision `{}`: a revision cannot be empty or begin with `-`",
+            crate::printable(&rev),
+        );
+    }
+    Ok(rev)
+}
+
+/// Whether a path stays inside the tree it is joined onto — every component is
+/// an ordinary name, with no root, prefix, or `..` to escape through.
+fn is_contained(path: &Path) -> bool {
+    path.components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
 /// git's "no such commit" sentinel, used for the first push to a branch.
 fn is_null_sha(s: &str) -> bool {
     s.chars().all(|c| c == '0')
@@ -252,6 +389,18 @@ fn changed_files(repo: &Path, refs: &Refs, max: usize, policy: &Policy) -> Resul
     let mut excluded = 0usize;
     while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
         let path = os_path(path);
+        // Every path is about to be joined onto a scratch root and written to.
+        // `Path::join` *replaces* the root when handed an absolute path, and a
+        // `..` component walks out of it, so a listing that is not strictly
+        // repo-relative is refused rather than materialized somewhere else.
+        // git cannot produce either, which is exactly why seeing one means the
+        // listing is not what we think it is.
+        if !is_contained(&path) {
+            bail!(
+                "refusing to materialize `{}`: a changed path must be relative and free of `..`",
+                crate::printable(&path.to_string_lossy()),
+            );
+        }
         if policy.excludes(&path.to_string_lossy()) {
             excluded += 1;
             continue;
@@ -358,7 +507,7 @@ fn extract(repo: &Path, commit: &str, path: &Path, dest: &Path) -> Result<()> {
 // ── sinks ───────────────────────────────────────────────────────────────────
 
 /// Write the verdict everywhere this environment can show it.
-fn emit(a: &Analysis<'_>, cli: &Cli, out_dir: Option<&Path>) -> Result<()> {
+fn emit(a: &Analysis<'_>, cli: &Cli, out_dir: Option<&Path>, base: &str) -> Result<()> {
     // stdout keeps whatever the caller asked for, so `isomer ci --format json`
     // still pipes cleanly.
     crate::write_stdout(&a.render(cli.format, cli)?)?;
@@ -393,6 +542,10 @@ fn emit(a: &Analysis<'_>, cli: &Cli, out_dir: Option<&Path>) -> Result<()> {
         ("fail", if a.clean { "false" } else { "true" }),
         ("findings", &findings.to_string()),
         ("suppressed", &a.assessment.suppressed.len().to_string()),
+        // The fork point, not the base branch tip — so a workflow that builds
+        // this commit to produce `--base-artifacts` measures both halves of the
+        // report from the same place.
+        ("base-sha", base),
     ]);
 
     // A failing check needs a reason visible in the job log without scrolling.
@@ -403,6 +556,18 @@ fn emit(a: &Analysis<'_>, cli: &Cli, out_dir: Option<&Path>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Report an axis that could not run, where CI will actually show it.
+///
+/// Degrading quietly is the one failure this tool cannot afford: a scan missing
+/// its artifact comparison must not read like a scan that made it and found
+/// nothing.
+fn warn(message: &str) {
+    eprintln!("isomer: {message}");
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        println!("::warning title=isomer::{}", escape_annotation(message));
+    }
 }
 
 /// Append markdown to the GitHub step summary, when running there.
@@ -512,6 +677,32 @@ mod tests {
         assert!(!safe.contains('\n'));
         assert!(!safe.contains("::"));
         assert_eq!(safe, "line one%0A%3A%3Aerror%3A%3Aforged");
+    }
+
+    /// Revisions travel to git as positional arguments, where a leading `-`
+    /// makes them options — `git diff --output=FILE` writes a file.
+    #[test]
+    fn option_shaped_revisions_are_refused() {
+        assert!(checked_rev("--output=/etc/cron.d/x".into(), "base").is_err());
+        assert!(checked_rev("-n".into(), "head").is_err());
+        assert!(checked_rev(String::new(), "base").is_err());
+        assert_eq!(
+            checked_rev("HEAD~1".into(), "head").ok().as_deref(),
+            Some("HEAD~1")
+        );
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(checked_rev(sha.into(), "base").ok().as_deref(), Some(sha));
+    }
+
+    /// A changed path is joined onto a scratch root and written to; `join` with
+    /// an absolute path silently discards the root.
+    #[test]
+    fn paths_must_stay_inside_the_scratch_tree() {
+        assert!(is_contained(Path::new("src/main.rs")));
+        assert!(is_contained(Path::new("a/b/c.txt")));
+        assert!(!is_contained(Path::new("/etc/passwd")));
+        assert!(!is_contained(Path::new("../../etc/passwd")));
+        assert!(!is_contained(Path::new("a/../../b")));
     }
 
     #[test]
