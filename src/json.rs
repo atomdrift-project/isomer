@@ -61,21 +61,41 @@ pub(crate) struct Provenance<'a> {
     pub new: Option<&'a filefacts::Identity>,
 }
 
-/// One evidence window — a matched region rendered as `locator · code · desc`.
+/// One evidence hunk — a contiguous matched region attributed to its top rule
+/// (criticality × confidence), with a short diff-style excerpt.
 #[derive(Serialize)]
 pub(crate) struct Ev<'a> {
-    /// Archive member the window came from, when the artifact is a container.
+    /// Archive member the hunk came from, when the artifact is a container.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub member: Option<&'a str>,
-    pub locator: &'a str,
-    pub code: &'a str,
-    /// Source line above/below the match (hostile text matches only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub before: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub after: Option<&'a str>,
+    /// `file:line` (text) or `file:0x<offset>` (binary).
+    pub location: &'a str,
+    /// The top rule's severity word.
+    pub severity: &'a str,
+    /// The top rule's description.
     pub desc: &'a str,
-    pub hostile: bool,
+    pub lines: Vec<EvLine<'a>>,
+}
+
+/// One line of an evidence hunk's excerpt.
+#[derive(Serialize)]
+pub(crate) struct EvLine<'a> {
+    /// Source line number, or hex byte offset for binaries.
+    pub locator: &'a str,
+    /// The code (windowed around the match) or a hex byte run.
+    pub text: &'a str,
+    /// `true` when the line is absent from the old version, `false` when
+    /// present in both; omitted when no old text was available to diff.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added: Option<bool>,
+    /// Whether a rule matched on this line (vs pure context). Omitted when
+    /// false.
+    #[serde(rename = "match", skip_serializing_if = "is_false")]
+    pub is_match: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Serialize)]
@@ -203,6 +223,9 @@ pub(crate) struct Structure<'a> {
 #[derive(Serialize)]
 pub(crate) struct Fact<'a> {
     pub severity: &'static str,
+    /// `added` for newly-present structure, `became` for existing structure
+    /// altered in place.
+    pub change: &'static str,
     pub label: &'static str,
     pub detail: &'a str,
 }
@@ -228,18 +251,53 @@ mod tests {
             eng: "isomer/test",
             verb: "fs",
             artifact: Some("liblzma.so"),
-            version: Version { old: Some("5.4.5"), new: Some("5.6.0"), bump: Some("minor") },
-            provenance: Provenance { old: None, new: None },
+            version: Version {
+                old: Some("5.4.5"),
+                new: Some("5.6.0"),
+                bump: Some("minor"),
+            },
+            provenance: Provenance {
+                old: None,
+                new: None,
+            },
             verdict: Verdict {
                 severity: "critical",
                 new_severity: "critical",
-                gate: Gate { on: "new", fail_on: "high", severity: "critical", fail: true },
-                risk: Some(Risk { old: 0.1, new: 0.98, delta: 0.88, model: "azoth" }),
-                proportionality: Prop { disproportionate: true, note: None, skew: None },
-                behavioral: Behavioral { severity: "high", categories: Vec::new() },
-                signature: Signature { severity: "none", cve: None, count: 0, ids: Vec::new() },
-                identity: Identity { severity: "none", changes: Vec::new() },
-                structure: Structure { severity: "high", facts: Vec::new() },
+                gate: Gate {
+                    on: "new",
+                    fail_on: "high",
+                    severity: "critical",
+                    fail: true,
+                },
+                risk: Some(Risk {
+                    old: 0.1,
+                    new: 0.98,
+                    delta: 0.88,
+                    model: "azoth",
+                }),
+                proportionality: Prop {
+                    disproportionate: true,
+                    note: None,
+                    skew: None,
+                },
+                behavioral: Behavioral {
+                    severity: "high",
+                    categories: Vec::new(),
+                },
+                signature: Signature {
+                    severity: "none",
+                    cve: None,
+                    count: 0,
+                    ids: Vec::new(),
+                },
+                identity: Identity {
+                    severity: "none",
+                    changes: Vec::new(),
+                },
+                structure: Structure {
+                    severity: "high",
+                    facts: Vec::new(),
+                },
             },
             evidence: Vec::new(),
             llm: None,
@@ -257,6 +315,8 @@ mod tests {
         assert!(!s.contains("\"llm\""), "llm must be omitted when None");
         assert!(!s.contains("\"note\""), "note must be omitted when None");
         // The gate decision is present and explicit.
-        assert!(s.contains(r#""gate":{"on":"new","fail_on":"high","severity":"critical","fail":true}"#));
+        assert!(
+            s.contains(r#""gate":{"on":"new","fail_on":"high","severity":"critical","fail":true}"#)
+        );
     }
 }

@@ -54,7 +54,10 @@ pub(crate) fn config(cli: &Cli) -> Option<InterpretConfig> {
         .or_else(|| std::env::var("ISOMER_LLM_MODEL").ok())
         .or_else(|| scan::interpret::discover_model(&base_url, api_key.as_deref()))
         .unwrap_or_else(|| scan::interpret::DEFAULT_MODEL.to_string());
-    let timeout = Duration::from_secs(cli.llm_timeout.unwrap_or(scan::interpret::DEFAULT_TIMEOUT_SECS));
+    let timeout = Duration::from_secs(
+        cli.llm_timeout
+            .unwrap_or(scan::interpret::DEFAULT_TIMEOUT_SECS),
+    );
     Some(InterpretConfig {
         base_url,
         model,
@@ -75,17 +78,74 @@ pub(crate) fn interpret(cfg: &InterpretConfig, context: &str) -> Result<Interpre
 fn parse(reply: &str, model: &str) -> Interpretation {
     let json = reply
         .find('{')
-        .and_then(|start| reply[start..].rfind('}').map(|end| &reply[start..=start + end]));
+        .and_then(|start| reply.get(start..))
+        .and_then(|tail| tail.rfind('}').and_then(|end| tail.get(..=end)));
     if let Some(obj) = json.and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok()) {
-        let verdict = obj.get("verdict").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let nature = obj.get("nature").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let verdict = obj
+            .get("verdict")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let nature = obj
+            .get("nature")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if !nature.is_empty() {
-            return Interpretation { verdict, nature, model: model.to_string() };
+            return Interpretation {
+                verdict,
+                nature,
+                model: model.to_string(),
+            };
         }
     }
     Interpretation {
         verdict: String::new(),
         nature: reply.trim().to_string(),
         model: model.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_json_buried_in_prose() {
+        // Chat models routinely wrap the object in commentary and fences; the
+        // first `{` to the last `}` is the widest span that can be the object.
+        let i = parse(
+            "Sure! Here you go:\n```json\n{\"verdict\":\"malicious\",\"nature\":\"adds a reverse shell\"}\n```\nHope that helps.",
+            "m",
+        );
+        assert_eq!(i.verdict, "malicious");
+        assert_eq!(i.nature, "adds a reverse shell");
+    }
+
+    #[test]
+    fn multibyte_prose_around_the_object_does_not_split_a_char() {
+        // The span is cut on byte offsets, so a reply padded with multi-byte
+        // characters is the case that would panic on a naive slice.
+        let i = parse(
+            "判定 → {\"verdict\":\"benign\",\"nature\":\"翻訳のみ\"} ✅",
+            "m",
+        );
+        assert_eq!(i.verdict, "benign");
+        assert_eq!(i.nature, "翻訳のみ");
+    }
+
+    #[test]
+    fn falls_back_to_the_whole_reply_when_unparseable() {
+        // No object, a malformed one, and a well-formed one with nothing usable
+        // in it all degrade to the same place: show the reviewer what was said.
+        for reply in [
+            "I could not analyze this.",
+            "{not json",
+            "{\"nature\":\"\"}",
+        ] {
+            let i = parse(reply, "m");
+            assert_eq!(i.verdict, "");
+            assert_eq!(i.nature, reply);
+        }
     }
 }

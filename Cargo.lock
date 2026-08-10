@@ -2722,12 +2722,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "atomdrift-scan",
+ "chrono",
  "clap",
  "cleave 2.6.0",
  "colored",
  "filefacts",
  "serde",
  "serde_json",
+ "tempfile",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]

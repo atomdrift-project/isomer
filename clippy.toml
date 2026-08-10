@@ -1,0 +1,8 @@
+# `make lint` runs clippy over --all-targets, so the deny-level panic lints in
+# Cargo.toml's [lints.clippy] reach test code too. In a test a panic *is* the
+# failure signal: `unwrap()` on a fixture that must parse states the invariant
+# more directly than a let-else that silently passes. Relax those three inside
+# `#[cfg(test)]` only — every other lint, and all of non-test code, is unchanged.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

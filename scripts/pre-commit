@@ -1,0 +1,40 @@
+#!/bin/sh
+# Pre-commit gate for isomer. Install with `make install-precommit`.
+#
+# Refuses the commit unless:
+#   1. Cargo.toml has no active local path override.
+#   2. `make lint` passes (rustfmt --check, then clippy with -D warnings).
+#   3. `make test` passes.
+#
+# Bypass intentionally with `git commit --no-verify`.
+#
+# Mirrors scripts/pre-commit in ../scan, and check 1 is the same regex the
+# `guard` job in .github/workflows/ci.yml runs — keep the two in sync.
+#
+# Why check 1 covers *every* table, not just [patch]: isomer is developed
+# against sibling checkouts (../cleave, ../scan, ../filefacts), and none of
+# them exist in a fresh clone. A committed `path = "../"` — whether under
+# [dependencies] or a [patch] table — builds against a crate that exists on no
+# other machine, so it breaks CI and produces a release nobody else can
+# reproduce. Push the dep and pin a git rev instead.
+
+set -e
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+# The `[^#]` guard keeps commented-out overrides (Cargo.toml keeps a running
+# log of them) from tripping it.
+if grep -nE '^[[:space:]]*[^#].*path[[:space:]]*=[[:space:]]*"\.\.' Cargo.toml; then
+	echo "pre-commit: refusing commit — Cargo.toml has a local path override (shown above)." >&2
+	echo "Push the dep and pin a git rev, or bypass with: git commit --no-verify" >&2
+	exit 1
+fi
+
+echo "pre-commit: running make lint..."
+make lint
+
+echo "pre-commit: running make test..."
+make test
+
+echo "pre-commit: all checks passed."

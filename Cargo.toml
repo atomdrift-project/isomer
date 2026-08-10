@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
 description = "Supply-chain attack detection at a molecular level"
-repository = "https://codeberg.org/atomdrift/isomer"
+repository = "https://github.com/atomdrift-project/isomer"
 
 [dependencies]
 anyhow = "1"
@@ -20,22 +20,68 @@ colored = "3.1"
 filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `.isomer.toml` (suppression policy) and its `expires` dates. Both already
+# resolve in the graph via cleave/scan, so neither adds a new build.
+toml = { version = "1", default-features = false, features = ["parse"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # atomdrift-scan (lib name `scan`) supplies the azoth ML model for risk
 # scoring each side of the diff, and will later drive purl/oci fetching,
 # bloom skipping, and hopper mirroring.
 atomdrift-scan = { path = "../scan" }
 
+# `isomer ci` materializes the changed files into a scratch tree; tempfile
+# owns its lifetime and permissions. Already in the graph via scan.
+tempfile = "3"
+
+# Mirrors scan's [workspace.lints], plus `unsafe_code = "deny"` — isomer has no
+# reason to write any unsafe at all, so it forbids the block outright rather
+# than only policing unsafe_op_in_unsafe_fn. Keep in sync with ../scan; a lint
+# that fires there should fire here.
 [lints.rust]
 unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
 rust_2018_idioms = { level = "deny", priority = -1 }
+unused_must_use = "deny"
+unused_imports = "deny"
+unused_mut = "deny"
+dead_code = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
 missing_docs = "warn"
+noop_method_call = "warn"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+unimplemented = "deny"
+todo = "deny"
+unreachable = "deny"
+result_unit_err = "deny"
+result_large_err = "deny"
+missing_safety_doc = "warn"
+must_use_candidate = "warn"
+needless_pass_by_value = "warn"
+unnecessary_wraps = "warn"
+match_same_arms = "warn"
+redundant_closure_for_method_calls = "warn"
+manual_let_else = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+wildcard_imports = "warn"
+string_slice = "warn"
+dbg_macro = "deny"
+large_futures = "warn"
+map_err_ignore = "warn"
+significant_drop_in_scrutinee = "warn"
+significant_drop_tightening = "warn"
 
 [patch.crates-io]
 # Mirrors cleave's patch section — patches only apply at the workspace root,

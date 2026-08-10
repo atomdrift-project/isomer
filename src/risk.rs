@@ -40,16 +40,31 @@ fn analyzer() -> Option<&'static scan::Analyzer> {
         .as_ref()
 }
 
-/// Score both sides. Returns `None` if the model is unavailable or either side
-/// fails to score — risk is optional context, never a hard dependency.
-pub(crate) fn score_pair(old: &Path, new: &Path) -> Option<Risk> {
+/// Score every changed file and report the most dangerous one — the file whose
+/// new side scores highest, alongside that same file's old score. A change is
+/// as suspicious as its worst file, and averaging would let one backdoor hide
+/// behind a hundred benign edits.
+///
+/// Returns `None` if the model is unavailable or nothing scored — risk is
+/// optional context, never a hard dependency.
+pub(crate) fn score(pairs: &[crate::analysis::Pair]) -> Option<Risk> {
     let analyzer = analyzer()?;
-    let old_score = analyzer.scan_file(old, &basename(old)).ok()?.probability;
-    let new_score = analyzer.scan_file(new, &basename(new)).ok()?.probability;
-    Some(Risk {
-        old: old_score,
-        new: new_score,
-    })
+    let probability = |p: Option<&Path>| -> Option<f32> {
+        let p = p?;
+        Some(analyzer.scan_file(p, &basename(p)).ok()?.probability)
+    };
+    pairs
+        .iter()
+        .filter_map(|pair| {
+            let new = probability(pair.new.as_deref())?;
+            // A file with no base side is new: it introduced whatever risk it
+            // carries, so the old side reads as zero rather than unknown.
+            Some(Risk {
+                old: probability(pair.old.as_deref()).unwrap_or(0.0),
+                new,
+            })
+        })
+        .max_by(|a, b| a.new.total_cmp(&b.new))
 }
 
 fn basename(p: &Path) -> String {

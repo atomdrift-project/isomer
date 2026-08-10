@@ -12,7 +12,7 @@ compares two states of the same thing (a directory, a git ref, a package, an
 OCI image) and judges the delta in context — behavioral disassembly, software
 classification, version drift, commit intent, and time/size deltas.
 
-Powered by [Atomdrift Scan](https://codeberg.org/atomdrift/scan) and a
+Powered by [Atomdrift Scan](https://github.com/atomdrift-project/scan) and a
 differential ML model (**Valence**). Offline command-line tool with optional
 LLM support. Designed for CI pipelines and local development.
 
@@ -23,10 +23,13 @@ Licensed Apache-2.0.
 ```
 isomer ci                                  # zero-config in CI: derives base..head from the environment
 isomer fs   <old-path> <new-path>          # compare two trees; follows the dependency graph
-isomer git  --repo <url> <old> <new>       # compare two commits/branches/tags of a remote repo
-isomer purl <purl@a> <purl@b>              # compare two published package versions
-isomer oci  <old-image> <new-image>        # compare two container images
+isomer git  --repo <url> <old> <new>       # compare two commits/branches/tags of a remote repo   (planned)
+isomer purl <purl@a> <purl@b>              # compare two published package versions               (planned)
+isomer oci  <old-image> <new-image>        # compare two container images                         (planned)
 ```
+
+`ci` and `fs` are implemented. Output formats: `terminal` (default), `json`,
+`sarif`, `markdown`.
 
 Argument order is always **old, then new** (like `diff`). `--base`/`--head`
 named flags are accepted everywhere for order-proof CI invocations.
@@ -52,6 +55,16 @@ steps:
   - uses: atomdrift/isomer-action@v1
     with:
       fail-on: high
+```
+
+Findings are suppressed in a committed `.isomer.toml`, one reviewable line
+each, with a mandatory reason:
+
+```toml
+[[allow]]
+id = "objectives/command-and-control/*"
+reason = "vendored socket.io client; reviewed in #482"
+expires = "2026-11-09"   # optional
 ```
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the full design.

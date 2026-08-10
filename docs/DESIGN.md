@@ -1,7 +1,15 @@
 # isomer — design
 
-Status: planning (2026-08-07). This document captures the product/technical
-plan; nothing here is implemented unless noted.
+Status: planning (2026-08-07), with the CI path implemented (2026-08-09).
+This document captures the product/technical plan; nothing here is implemented
+unless noted.
+
+**Implemented since the original draft:** `isomer ci` (environment-derived
+base..head, sparse materialization of the changed files, multi-sink emission),
+`--format sarif`, `--format markdown`, the `.isomer.toml` suppression policy,
+and a one-analysis-many-renderers split (`src/analysis.rs` judges;
+`src/terminal.rs`, `src/markdown.rs`, `src/sarif.rs`, and the JSON envelope
+render). See "The `ci` verb" below.
 
 ## Pitch
 
@@ -459,6 +467,49 @@ scan's Makefile.
 
 Next: proportionality bands, then the `purl` verb (fetch + bloom skip via
 scan) and the markdown report body for the PR comment.
+
+## The `ci` verb (implemented)
+
+`isomer ci` derives the range, analyzes only the delta, and writes every sink
+from one scan.
+
+- **Range.** `--base`/`--head` win; otherwise the GitHub event payload
+  (`pull_request.base.sha`/`head.sha`, or a push's `before`/`after`) and the
+  GitLab equivalents. The base is then narrowed to `git merge-base base head`
+  so commits that landed on the base branch after the change was branched are
+  not attributed to it. A head commit absent from a shallow checkout falls back
+  to `HEAD` (the merge commit), which is the only honest answer available
+  there; a missing *base* is a hard error naming the fetch command to run.
+- **Scope.** `git diff --no-renames --name-status -z` lists the change, and
+  each side of each changed path is streamed out of git into
+  `<tmp>/{base,head}/<repo-relative-path>`. Cost is proportional to the change,
+  not the repository, and every reported path is the path the reviewer sees on
+  the forge. `-z` framing means a filename containing a newline cannot hide a
+  file from the scan; paths are handled as OS bytes on Unix for the same
+  reason. Rename detection is off: to a differential analyzer a rename is a
+  delete plus an add, and the added content is what needs judging.
+- **Refusal over silent truncation.** More than `--max-files` (default 1000)
+  changed files aborts the run rather than analyzing a subset — a scanner that
+  quietly skips files reports "clean" for a change it never read. Blobs over
+  128 MiB are skipped with a loud note for the same reason.
+- **Sinks.** stdout gets `--format`'s output; `--out-dir` gets
+  `report.{json,sarif,md}`; `$GITHUB_STEP_SUMMARY` gets the markdown (the one
+  surface that works with a fork's read-only token); `$GITHUB_OUTPUT` gets
+  `verdict`/`severity`/`new-severity`/`fail`/`findings`/`suppressed`, so the
+  action needs no JSON parsing and stays thin. A failing run also emits a
+  `::error::` annotation, with workflow-command metacharacters escaped so
+  attacker-controlled text cannot forge a command.
+
+### Policy file (implemented)
+
+`.isomer.toml` carries suppressions and exclusions only — thresholds stay on
+the command line so there is exactly one place to look when asking why a run
+failed. A `reason` is required (isomer refuses to start otherwise), `expires`
+makes an acceptance temporary, and every suppressed finding is *listed* in
+every report, so a silenced run can never be mistaken for a clean one. The
+suppression id space is exactly the finding id space: trait ids, `identity`,
+and `structure/<slug>` — the same strings the SARIF rule ids use, so a report
+tells the reader precisely what to paste.
 
 ## Ecosystem scope
 

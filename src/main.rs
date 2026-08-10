@@ -14,12 +14,18 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod analysis;
+mod ci;
 mod evidence;
 mod fs;
 mod json;
 mod llm;
+mod markdown;
+mod policy;
 mod risk;
 mod rubric;
+mod sarif;
+mod terminal;
 mod version;
 
 const EXIT_FINDINGS: u8 = 1;
@@ -58,6 +64,11 @@ struct Cli {
     /// verdict. Default output stays diff-terse.
     #[arg(long, global = true)]
     explain: bool,
+
+    /// Suppression policy file. Defaults to `.isomer.toml` in the working
+    /// directory when present; a path given here must exist.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<std::path::PathBuf>,
 
     /// Override the detected base version (e.g. `1.2.3`), for proportionality
     /// when the input path carries no version token.
@@ -160,7 +171,26 @@ impl Color {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Zero-argument CI entry point: derives base..head from the environment.
-    Ci,
+    Ci {
+        /// Base commit. Default: derived from the CI event, then narrowed to
+        /// the merge base with head.
+        #[arg(long, value_name = "REV")]
+        base: Option<String>,
+        /// Head commit. Default: derived from the CI event, falling back to
+        /// `HEAD` when the event's commit is absent from a shallow checkout.
+        #[arg(long, value_name = "REV")]
+        head: Option<String>,
+        /// Repository to inspect.
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        repo: std::path::PathBuf,
+        /// Also write `report.{json,sarif,md}` to this directory.
+        #[arg(long, value_name = "DIR")]
+        out_dir: Option<std::path::PathBuf>,
+        /// Refuse to run when the change touches more files than this, rather
+        /// than analyzing a subset and reporting it as the whole.
+        #[arg(long, value_name = "N", default_value_t = 1000)]
+        max_files: usize,
+    },
     /// Compare two local trees, following the dependency graph.
     Fs {
         /// Old (base) tree.
@@ -195,6 +225,7 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    disable_analysis_cache_if_requested();
     let cli = Cli::parse();
     cli.color.apply();
     match run(&cli) {
@@ -207,11 +238,61 @@ fn main() -> ExitCode {
     }
 }
 
+/// `ISOMER_NO_CACHE=1` disables the analysis-result cache for the run, so a
+/// scan always recomputes from the current bytes and rules — mirroring scan's
+/// `SCAN_NO_ANALYSIS_CACHE`. Use it after changing traits or the analyzer, when
+/// a cache hit would otherwise serve a stale verdict.
+///
+/// Set through cleave's process-wide override rather than by mutating the
+/// environment (isomer denies `unsafe`, and Rust 2024's `set_var` is unsafe).
+/// cleave turns the downstream filefacts extraction cache off with it; the YARA
+/// and trait-mapper *compilation* caches stay on — they hold compiled rules,
+/// not sample analysis, and recompiling costs seconds per run. An explicit
+/// `CLEAVE_SKIP_CACHE` still resolves normally when this switch is off.
+fn disable_analysis_cache_if_requested() {
+    let on =
+        std::env::var("ISOMER_NO_CACHE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    if on {
+        cleave::cache::set_skip_cache_override(Some(true));
+    }
+}
+
+/// Broken-pipe-safe write: a closed downstream pipe (e.g. `| head`) is a normal
+/// exit, not a panic. `println!` would panic here.
+pub(crate) fn write_stdout(s: &str) -> anyhow::Result<()> {
+    use std::io::{self, Write};
+    let mut out = io::stdout().lock();
+    match out.write_all(s.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Runs the selected verb; returns whether the delta is clean at `--fail-on`.
 fn run(cli: &Cli) -> anyhow::Result<bool> {
+    // Loaded once, up front: a malformed policy is an operational error, and
+    // the run should fail on it before doing any expensive analysis.
+    let policy = policy::Policy::load(cli.config.as_deref(), chrono::Utc::now().date_naive())?;
     match &cli.command {
-        Command::Ci => anyhow::bail!("`isomer ci` is not implemented yet"),
-        Command::Fs { old, new } => fs::run(Path::new(old), Path::new(new), cli),
+        Command::Ci {
+            base,
+            head,
+            repo,
+            out_dir,
+            max_files,
+        } => ci::run(
+            cli,
+            &policy,
+            &ci::Args {
+                base: base.clone(),
+                head: head.clone(),
+                repo: repo.clone(),
+                out_dir: out_dir.clone(),
+                max_files: *max_files,
+            },
+        ),
+        Command::Fs { old, new } => fs::run(Path::new(old), Path::new(new), cli, &policy),
         Command::Git { .. } => anyhow::bail!("`isomer git` is not implemented yet"),
         Command::Purl { .. } => anyhow::bail!("`isomer purl` is not implemented yet"),
         Command::Oci { .. } => anyhow::bail!("`isomer oci` is not implemented yet"),

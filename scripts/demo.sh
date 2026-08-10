@@ -10,6 +10,14 @@ set -eu
 ISOMER="${1:-cargo run -q --}"
 DATA="testdata/supplychain"
 
+# LLM read of each case — on by default. Point elsewhere with LLM_URL=…;
+# disable with LLM_URL="" (set-but-empty is honored, unset gets the default).
+LLM_URL="${LLM_URL-http://10.9.8.149:8000/v1}"
+if [ -n "$LLM_URL" ]; then
+    ISOMER_LLM="$LLM_URL"
+    export ISOMER_LLM
+fi
+
 # Palette — matches scan/cleave: bold heading, dim rationale.
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     B='\033[1m'; DIM='\033[2m'; R='\033[0m'

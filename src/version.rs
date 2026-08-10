@@ -62,21 +62,9 @@ impl Version {
 
 /// Maximal substrings composed only of ASCII digits and `.`.
 fn version_char_runs(s: &str) -> Vec<&str> {
-    let bytes = s.as_bytes();
-    let mut runs = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() || bytes[i] == b'.' {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
-                i += 1;
-            }
-            runs.push(&s[start..i]);
-        } else {
-            i += 1;
-        }
-    }
-    runs
+    s.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .filter(|run| !run.is_empty())
+        .collect()
 }
 
 /// Which version component moved.
@@ -108,12 +96,13 @@ impl Bump {
             new.patch.cmp(&old.patch),
         ) {
             (Greater, _, _) => (BumpKind::Major, new.major - old.major),
-            (Less, _, _) => (BumpKind::Downgrade, 0),
             (Equal, Greater, _) => (BumpKind::Minor, new.minor - old.minor),
-            (Equal, Less, _) => (BumpKind::Downgrade, 0),
             (Equal, Equal, Greater) => (BumpKind::Patch, new.patch - old.patch),
-            (Equal, Equal, Less) => (BumpKind::Downgrade, 0),
             (Equal, Equal, Equal) => (BumpKind::Same, 0),
+            // Whichever component moved backwards, the release went backwards;
+            // the depth it happened at carries no extra signal. The arms above
+            // are mutually exclusive with these, so order is not load-bearing.
+            (Less, _, _) | (Equal, Less, _) | (Equal, Equal, Less) => (BumpKind::Downgrade, 0),
         };
         Bump { kind, steps }
     }
@@ -159,7 +148,10 @@ mod tests {
     #[test]
     fn detect_from_real_filenames() {
         assert_eq!(Version::detect("liblzma.so.5.6.0").unwrap().raw, "5.6.0");
-        assert_eq!(Version::detect("node-ipc-12.0.1.tgz").unwrap().raw, "12.0.1");
+        assert_eq!(
+            Version::detect("node-ipc-12.0.1.tgz").unwrap().raw,
+            "12.0.1"
+        );
         assert!(Version::detect("index.js").is_none());
     }
 
@@ -172,10 +164,22 @@ mod tests {
         assert_eq!(b.steps, 2);
         assert_eq!(b.describe(), "2 minor releases");
 
-        assert_eq!(Bump::classify(&v("12.0.0").unwrap(), &v("12.0.1").unwrap()).kind, BumpKind::Patch);
-        assert_eq!(Bump::classify(&v("5.4.5").unwrap(), &v("5.5.0").unwrap()).describe(), "minor release");
-        assert_eq!(Bump::classify(&v("1.0.0").unwrap(), &v("2.0.0").unwrap()).kind, BumpKind::Major);
-        assert_eq!(Bump::classify(&v("2.0.0").unwrap(), &v("1.9.9").unwrap()).kind, BumpKind::Downgrade);
+        assert_eq!(
+            Bump::classify(&v("12.0.0").unwrap(), &v("12.0.1").unwrap()).kind,
+            BumpKind::Patch
+        );
+        assert_eq!(
+            Bump::classify(&v("5.4.5").unwrap(), &v("5.5.0").unwrap()).describe(),
+            "minor release"
+        );
+        assert_eq!(
+            Bump::classify(&v("1.0.0").unwrap(), &v("2.0.0").unwrap()).kind,
+            BumpKind::Major
+        );
+        assert_eq!(
+            Bump::classify(&v("2.0.0").unwrap(), &v("1.9.9").unwrap()).kind,
+            BumpKind::Downgrade
+        );
     }
 
     #[test]
@@ -185,6 +189,13 @@ mod tests {
         assert_eq!(b(BumpKind::Minor).tolerance(), Severity::Medium);
         assert_eq!(b(BumpKind::Major).tolerance(), Severity::High);
         // Two minor releases still don't license a High capability.
-        assert_eq!(Bump { kind: BumpKind::Minor, steps: 2 }.tolerance(), Severity::Medium);
+        assert_eq!(
+            Bump {
+                kind: BumpKind::Minor,
+                steps: 2
+            }
+            .tolerance(),
+            Severity::Medium
+        );
     }
 }
