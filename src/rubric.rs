@@ -687,15 +687,13 @@ fn meaningful_identity_changes(
             });
             return out;
         }
-        (None, Some(n)) => {
-            out.push(IdentityChange {
-                label: "identity",
-                old: "absent".into(),
-                new: describe_side(n),
-            });
-            return out;
-        }
-        (None, None) => return out,
+        // Identity *appearing* (absent → present) is not drift. A remediated
+        // release restoring the author metadata a malicious version stripped is
+        // benign; the suspicious direction — `present → absent`, identity
+        // stripped — is still reported above. Reporting this side too made every
+        // during→after and before→after comparison read as a publisher event
+        // (`absent → Alex Gherghisan`) when nothing was taken over.
+        (None, _) => return out,
     };
 
     let mut push = |label: &'static str, ov: String, nv: String| {

@@ -12,6 +12,7 @@
 use std::fmt::Write as _;
 
 use crate::analysis::Analysis;
+use crate::evidence::Hunk;
 use crate::{Cli, Severity};
 
 /// Hidden HTML comment identifying an isomer report, so the posting step can
@@ -53,12 +54,10 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
     identity(&mut s, a);
     structure(&mut s, a);
     frameworks(&mut s, a);
-    // A change that passes the gate is named, not dissected: metrics and
-    // evidence are for a reviewer who has to act.
-    if a.detailed(cli) {
-        metrics(&mut s, a);
-        evidence(&mut s, a);
-    }
+    // One view: a speaking verdict carries its metrics and the evidence behind
+    // it — the differential hunks are the root cause a reviewer acts on.
+    metrics(&mut s, a);
+    evidence(&mut s, a);
     let _ = write!(s, "\n---\n{}\n", footer(a, cli));
 
     if s.len() > MAX_BODY {
@@ -316,21 +315,69 @@ fn evidence(s: &mut String, a: &Analysis<'_>) {
         "<sub>{}</sub>\n",
         crate::terminal::evidence_note_text(&hunks)
     );
-    for h in &hunks {
-        let where_ = match &h.member {
-            Some(m) => format!("{} → {}", code(&h.file), code(m)),
-            None => code(&h.location),
-        };
-        let _ = writeln!(s, "{} {} — {}\n", dots(h.severity), where_, cell(&h.desc));
-        let body: String = h
-            .lines
-            .iter()
-            .map(|l| {
-                let gutter = if l.added == Some(true) { "+" } else { " " };
-                format!("{gutter} {:>6}  {}\n", l.locator, l.text)
-            })
-            .collect();
-        let _ = writeln!(s, "{}", fence(&body));
+    let file_of = |h: &Hunk| h.member.as_deref().unwrap_or(h.file.as_str()).to_string();
+    let mut i = 0;
+    while i < hunks.len() {
+        if hunks[i].additions {
+            // One heading per changed file — captioned with its strongest rule
+            // — then a single fenced diff of its added lines, an ellipsis at
+            // each gap, mirroring the terminal's grouped view.
+            let name = file_of(hunks[i]);
+            let mut j = i;
+            while j < hunks.len() && hunks[j].additions && file_of(hunks[j]) == name {
+                j += 1;
+            }
+            let group = &hunks[i..j];
+            let sev = group
+                .iter()
+                .map(|h| h.severity)
+                .max()
+                .unwrap_or(crate::Severity::None);
+            let title = group
+                .iter()
+                .filter(|h| !h.desc.is_empty())
+                .max_by(|a, b| {
+                    a.severity
+                        .cmp(&b.severity)
+                        .then(a.score.total_cmp(&b.score))
+                })
+                .map(|h| format!(" — {}", cell(&h.desc)))
+                .unwrap_or_default();
+            let _ = writeln!(s, "{} {}{} — added lines\n", dots(sev), code(&name), title);
+            let mut body = String::new();
+            for (k, h) in group.iter().enumerate() {
+                if k > 0 {
+                    body.push_str("  ⋯\n");
+                }
+                for l in &h.lines {
+                    let _ = writeln!(body, "+ {:>6}  {}", l.locator, l.text);
+                }
+            }
+            let _ = writeln!(s, "{}", fence(&body));
+            i = j;
+        } else {
+            let where_ = match &hunks[i].member {
+                Some(m) => format!("{} → {}", code(&hunks[i].file), code(m)),
+                None => code(&hunks[i].location),
+            };
+            let _ = writeln!(
+                s,
+                "{} {} — {}\n",
+                dots(hunks[i].severity),
+                where_,
+                cell(&hunks[i].desc)
+            );
+            let body: String = hunks[i]
+                .lines
+                .iter()
+                .map(|l| {
+                    let gutter = if l.added == Some(true) { "+" } else { " " };
+                    format!("{gutter} {:>6}  {}\n", l.locator, l.text)
+                })
+                .collect();
+            let _ = writeln!(s, "{}", fence(&body));
+            i += 1;
+        }
     }
 }
 

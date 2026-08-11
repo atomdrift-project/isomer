@@ -45,9 +45,10 @@ fix:
 test:
 	$(CARGO) test --quiet
 
-# Run the curated real-world supply-chain pairs and narrate each verdict.
-# Builds once, then hands the release binary to the demo script so the
-# narration isn't interleaved with cargo output.
+# Run the curated real-world supply-chain attacks — command in, verdict out,
+# nothing else. Doubles as a smoke test: fails if any case drops below notable.
+# Builds once, then hands the release binary to the demo script so the output
+# isn't interleaved with cargo's.
 demo: release
 	@sh scripts/demo.sh "./target/release/$(BINARY)"
 

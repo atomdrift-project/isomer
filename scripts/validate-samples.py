@@ -122,10 +122,12 @@ def run_transition(isomer: str, traits: str | None, fail_on: str,
     env = dict(os.environ)
     if traits:
         env["CLEAVE_TRAITS_DIR"] = traits
-    # A silent LLM: the audit is about the deterministic rubric, not a model
-    # round-trip, and keeps the run hermetic/fast.
-    env["ISOMER_LLM"] = ""
-    cmd = [isomer, "fs", str(old), str(new), "--format", "json", "--fail-on", fail_on]
+    # `--offline` keeps the audit about the deterministic rubric: no model round
+    # trip, and crucially no LLM verdict escalation, so the pass/fail is
+    # reproducible on any machine (an empty ISOMER_LLM still falls back to a
+    # localhost endpoint, which --offline hard-disables).
+    cmd = [isomer, "--offline", "fs", str(old), str(new),
+           "--format", "json", "--fail-on", fail_on]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:

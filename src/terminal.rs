@@ -1,13 +1,14 @@
 //! The terminal report — masthead + grid.
 //!
 //! Output follows the UNIX-diff principle: **silent when there is no
-//! noticeable behavioral change**, and a concise, styled verdict only when
-//! there is something to say. `--explain` adds the full trait ids and cleave's
-//! ledger beneath.
+//! noticeable behavioral change**, and a single styled verdict — masthead,
+//! grid, and the differential evidence behind it — when there is something to
+//! say.
 //!
-//! One grid language throughout — every section is a `pill · dots · body` row
-//! — with a blank line between sections so each triage question (known
-//! campaign? who shipped it? what can it newly do?) reads as its own block.
+//! One grid language throughout — every section is a `label  body` row, its
+//! marker (a severity dot or a change sign) landing in the content column — with
+//! a blank line between sections so each triage question (known campaign? who
+//! shipped it? what can it newly do?) reads as its own block.
 
 use std::fmt::Write as _;
 
@@ -22,37 +23,34 @@ use crate::{Cli, Severity};
 
 const BAR: usize = 20;
 /// Visible width of the section-pill cell (longest pill + a trailing space).
-const PILL_COL: usize = 12;
+const PILL_COL: usize = 10;
 /// Width the capability-class name column pads to.
 const NAME_W: usize = 20;
 
 /// The complete terminal report for one analysis.
 pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
     let mut out = String::new();
-    let detailed = a.detailed(cli);
     if a.speaks(cli) {
-        render(&mut out, a, detailed);
+        render(&mut out, a);
         // The proof: diff-style hunks for the gained traits, each owned by its
-        // strongest rule. A change that passes the gate does not get an
-        // evidence dump — it gets named, and `isomer fs --explain` is one
-        // command away if the reviewer wants to look closer.
-        if detailed {
-            let ids = a.assessment.gained_ids();
-            let rows = a.hunks(crate::evidence::MAX_HUNKS);
-            if rows.is_empty() && !ids.is_empty() {
-                // Say the absence out loud — an analyst reading a verdict with
-                // no proof section should know the gained traits carry no
-                // byte-located matches, not suspect a rendering gap.
-                out.push_str(&evidence_note());
-            } else {
-                out.push_str(&evidence_hunks(&rows));
-            }
+        // strongest rule and drawn from the files the diff actually changed.
+        // Shown on every speaking verdict — the code behind a behavior change
+        // is the root cause a reviewer has to assess, not a detail to gate
+        // behind a flag.
+        let ids = a.assessment.gained_ids();
+        let rows = a.hunks(crate::evidence::MAX_HUNKS);
+        if !rows.is_empty() {
+            out.push_str(&evidence_hunks(&rows, a.diff));
+        } else if !ids.is_empty() {
+            // Say the absence out loud — an analyst reading a verdict with no
+            // proof section should know the gained traits carry no byte-located
+            // matches, not suspect a rendering gap.
+            out.push_str(&evidence_note());
         }
         // Behavior-bearing atoms a source change introduced below the finding
         // floor — the "$HOME read, base64 heredoc" that no single trait scored
-        // high enough to name. Shown on every speaking verdict (not gated on
-        // `detailed`): when they are the *only* reason the diff spoke, they are
-        // the whole story.
+        // high enough to name. When they are the *only* reason the diff spoke,
+        // they are the whole story.
         let obs = a.observations();
         if !obs.is_empty() {
             out.push_str(&observations_section(&obs));
@@ -72,99 +70,64 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
     if !a.deps.is_empty() {
         out.push_str(&dependencies_section(&a.deps));
     }
-    if cli.explain {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&cleave::diff::format::format_terminal(a.report));
-    }
     out
 }
 
 /// The masthead and the detail grid. Order: verdict, ML risk, attribution,
 /// identity, capabilities, structure, metrics, touched files.
 ///
-/// `detailed` is false for a change that passes the gate: the judgement, the
-/// risk move, and the named findings stay, while metrics, the file list, and
-/// the evidence are dropped. The reviewer learns what was noticed in a few
-/// lines instead of a screenful.
-fn render(out: &mut String, a: &Analysis<'_>, detailed: bool) {
-    let (assessment, naming, prop) = (&a.assessment, &a.naming, &a.prop);
+/// One view: a speaking verdict draws the whole grid. isomer stays silent when
+/// there is no noticeable change (see [`Analysis::speaks`]); once it speaks, it
+/// shows the reviewer everything behind the call rather than making them ask.
+fn render(out: &mut String, a: &Analysis<'_>) {
+    let (assessment, naming) = (&a.assessment, &a.naming);
     let mut sections: Vec<String> = Vec::new();
-    let mut head = badge_line(a.verdict, a.diff, naming);
-    // The judgement leads: what isomer makes of the change, before any of the
-    // detail behind it. Annotation lines are indented past the badge so they
-    // align under the artifact name rather than the verdict word.
-    let indent = " ".repeat(badge_parts(a.verdict).0.len() + 5);
-    let judgement = a.judgement();
-    let _ = writeln!(head, "{indent}{}", judgement.truecolor(150, 160, 168));
-    // Then say *why* the change shape is wrong, not just that it is:
-    // behavioral delta vs the version bump's promise, and behavior vs content
-    // skew. Annotations align under the artifact name, not the badge — and are
-    // skipped when the judgement above already *is* the note, so the report
-    // never says the same sentence twice.
-    let mut warn = |text: &str| {
-        let _ = writeln!(
-            head,
-            "{indent}{} {}",
-            "⚠".truecolor(255, 176, 46),
-            text.truecolor(255, 176, 46)
-        );
-    };
-    if prop.disproportionate
-        && let Some(note) = prop.note.as_deref().filter(|n| *n != judgement)
-    {
-        warn(note);
-    }
-    if let Some(skew) = prop.skew.as_deref().filter(|s| *s != judgement) {
-        warn(skew);
-    }
+    sections.push(badge_line(a.verdict, a.diff, naming));
+
+    // Verdict summary block: why (the deterministic reason), model (the read,
+    // when one was computed), and the ML risk move on one line each.
+    let mut summary = String::new();
+    summary.push_str(&grid_line(
+        &pill_cell("why", PILL_HOT),
+        "",
+        &a.reason().truecolor(255, 176, 46).to_string(),
+    ));
     if let Some(i) = a.interp.as_ref().filter(|i| !i.nature.trim().is_empty()) {
-        let _ = writeln!(
-            head,
-            "{indent}✨ {}",
-            i.nature.trim().truecolor(62, 207, 214)
-        );
+        summary.push_str(&grid_line(
+            &pill_cell("model", PILL_OCEAN),
+            "",
+            &i.nature.trim().truecolor(62, 207, 214).to_string(),
+        ));
     }
-    sections.push(head);
-    // The model's read is shown when it moved bands (the reviewer needs to
-    // know either way) or whenever the full report is being drawn.
-    if let Some(r) = a.risk.filter(|_| detailed || a.risk_band_moved()) {
-        sections.push(risk_rows(r));
+    if let Some(r) = a.risk {
+        summary.push_str(&risk_row(r));
     }
+    push_section(&mut sections, &mut summary);
+
     let mut section = String::new();
     signature_grid(&mut section, assessment);
     push_section(&mut sections, &mut section);
     identity_grid(&mut section, assessment);
     push_section(&mut sections, &mut section);
-    let (fresh, expanded): (Vec<_>, Vec<_>) = assessment
-        .behavioral
-        .categories
-        .iter()
-        .partition(|c| assessment.behavioral.is_new_category(c));
-    class_group(&mut section, &fresh, "new", PILL_PLUM, true);
-    push_section(&mut sections, &mut section);
-    class_group(&mut section, &expanded, "expanded", PILL_PLUM_DIM, false);
+    gained_grid(&mut section, assessment);
     push_section(&mut sections, &mut section);
     structure_grid(&mut section, &assessment.structure);
     push_section(&mut sections, &mut section);
     frameworks_grid(&mut section, a);
     push_section(&mut sections, &mut section);
-    // Metrics and the touched-file list are triage aids for a change that
-    // failed; they are noise on one that passed.
-    if detailed {
-        for (i, body) in metrics_rows(a.diff).into_iter().enumerate() {
-            let cell = if i == 0 {
-                pill_cell("metrics", PILL_TEAL)
-            } else {
-                blank_cell()
-            };
-            section.push_str(&grid_line(&cell, "   ", &body));
-        }
-        push_section(&mut sections, &mut section);
-        files_grid(&mut section, a.diff);
-        push_section(&mut sections, &mut section);
+    // Aggregate counts that sum honestly across file types (symbols, sections,
+    // strings); scalar per-file metrics ride each evidence header instead.
+    for (i, body) in stats_rows(a.diff).into_iter().enumerate() {
+        let cell = if i == 0 {
+            pill_cell("stats", PILL_TEAL)
+        } else {
+            blank_cell()
+        };
+        section.push_str(&grid_line(&cell, "", &body));
     }
+    push_section(&mut sections, &mut section);
+    files_grid(&mut section, a.diff);
+    push_section(&mut sections, &mut section);
     out.push_str(&sections.join("\n"));
 }
 
@@ -196,7 +159,7 @@ fn frameworks_grid(out: &mut String, a: &Analysis<'_>) {
                     format!("{kept} unchanged").truecolor(102, 117, 127)
                 ));
             }
-            out.push_str(&grid_line(&cell, "   ", &body));
+            out.push_str(&grid_line(&cell, "", &body));
         }
     }
 }
@@ -214,40 +177,29 @@ fn push_section(sections: &mut Vec<String>, section: &mut String) {
 /// pane. Only containers render this; a single-file diff already names its
 /// file up top.
 fn files_grid(out: &mut String, diff: &DiffReportV1) {
-    const MAX: usize = 6;
-    let mut items: Vec<String> = Vec::new();
+    const MAX: usize = 8;
+    let mut names: Vec<String> = Vec::new();
     for f in &diff.files {
         let Some((_, member)) = f.path.split_once("!!") else {
             continue;
         };
-        let marker = match f.status {
-            cleave::types::FileStatus::Changed => "~",
-            cleave::types::FileStatus::Added => "+",
-            cleave::types::FileStatus::Removed => "−",
-            cleave::types::FileStatus::Unchanged => continue,
-        };
-        items.push(format!("{marker} {member}"));
+        if matches!(f.status, cleave::types::FileStatus::Unchanged) {
+            continue;
+        }
+        names.push(split_path(member).1.to_string());
     }
-    if items.is_empty() {
+    if names.is_empty() {
         return;
     }
-    let overflow = items.len().saturating_sub(MAX);
-    items.truncate(MAX);
+    let overflow = names.len().saturating_sub(MAX);
+    names.truncate(MAX);
     if overflow > 0 {
-        items.push(format!("+{overflow} more"));
+        names.push(format!("+{overflow} more"));
     }
-    for (i, line) in wrap_items(&items, 76).into_iter().enumerate() {
-        let cell = if i == 0 {
-            pill_cell("files", PILL_SLATE)
-        } else {
-            blank_cell()
-        };
-        out.push_str(&grid_line(
-            &cell,
-            "   ",
-            &line.truecolor(150, 160, 168).to_string(),
-        ));
-    }
+    // A plain, space-delimited list; each file's full path and severity live on
+    // its evidence header below.
+    let body = names.join("   ").truecolor(232, 237, 242).to_string();
+    out.push_str(&grid_line(&pill_cell("files", PILL_SLATE), "", &body));
 }
 
 /// The structural-anomaly section (computed by the rubric): a new linked
@@ -308,7 +260,7 @@ pub(crate) fn change_scale(diff: &DiffReportV1) -> Vec<String> {
         total = total.saturating_sub(1);
     }
     if total > 1 {
-        parts.push(format!("{touched} of {total} files"));
+        parts.push(format!("{touched} of {total} files changed"));
     }
     // The content-change scale — one of the three legs (content, behavior,
     // metrics) the report separates; the other two get their own sections.
@@ -319,9 +271,9 @@ pub(crate) fn change_scale(diff: &DiffReportV1) -> Vec<String> {
     parts
 }
 
-/// The ML detector as a grid section: `was`/`now` each on a benign→malware
-/// bar, the jump called out on the `now` row.
-fn risk_rows(r: Risk) -> String {
+/// The ML detector on one line: `old → new` on a benign→malware bar, the band
+/// word, and the jump.
+fn risk_row(r: Risk) -> String {
     let d = r.delta();
     let (arrow, dsev) = if d > 0.005 {
         ("▲", crate::analysis::risk_band(r.new))
@@ -330,24 +282,57 @@ fn risk_rows(r: Risk) -> String {
     } else {
         ("·", Severity::None)
     };
-    let was = format!(
-        "{}  {}  {}  {}",
-        "was".truecolor(102, 117, 127),
+    let body = format!(
+        "{} {} {}  {}  {}   {}",
         format!("{:.2}", r.old).truecolor(140, 150, 158),
-        bar(r.old),
-        risk_word(r.old),
-    );
-    let now = format!(
-        "{}  {}  {}  {}   {}",
-        "now".truecolor(102, 117, 127),
+        "→".truecolor(102, 117, 127),
         paint(crate::analysis::risk_band(r.new), &format!("{:.2}", r.new)).bold(),
         bar(r.new),
         risk_word(r.new),
         paint(dsev, &format!("{arrow} {d:+.2}")),
     );
-    let mut s = grid_line(&pill_cell("risk", PILL_OCEAN), "   ", &was);
-    s.push_str(&grid_line(&blank_cell(), "   ", &now));
-    s
+    grid_line(&pill_cell("risk", PILL_OCEAN), "", &body)
+}
+
+/// The gained capability classes as a tree: a marker per class — green `+` for
+/// one the old version lacked, amber `↑` for an existing class that grew — then
+/// its newly-gained traits as `└─` leaves. Replaces the old new/expanded split
+/// so both directions read in one section, hierarchy explicit.
+fn gained_grid(out: &mut String, a: &Assessment) {
+    let cats = &a.behavioral.categories;
+    // Align the leaf's `└─` just under its class name (past the label + the
+    // 3-wide marker column).
+    let leaf_indent = " ".repeat(PILL_COL + 4);
+    for (i, c) in cats.iter().enumerate() {
+        let cell = if i == 0 {
+            pill_cell("gained", PILL_PLUM)
+        } else {
+            blank_cell()
+        };
+        let marker = if a.behavioral.is_new_category(c) {
+            "+".truecolor(95, 175, 95)
+        } else {
+            "↑".truecolor(255, 176, 46)
+        };
+        let ns = if c.namespaces.is_empty() {
+            c.label.clone()
+        } else {
+            c.namespaces.join(" · ")
+        };
+        out.push_str(&grid_line(
+            &cell,
+            &format!("{marker}  "),
+            &ns.bold().to_string(),
+        ));
+        for id in &c.new_ids {
+            let leaf = id.split("::").last().unwrap_or(id);
+            out.push_str(&format!(
+                "{leaf_indent}{} {}\n",
+                "└─".truecolor(70, 80, 89),
+                leaf.truecolor(76, 178, 255),
+            ));
+        }
+    }
 }
 
 fn bar(value: f32) -> String {
@@ -390,65 +375,6 @@ fn risk_word(p: f32) -> String {
 
 // ── the detail grid ──────────────────────────────────────────────────────
 
-fn class_group(
-    out: &mut String,
-    cats: &[&crate::rubric::Category],
-    label: &str,
-    color: (u8, u8, u8),
-    fresh: bool,
-) {
-    /// A namespace list short enough to sit inline after the class name.
-    const INLINE: usize = 52;
-    /// Wrap width for namespace continuation lines.
-    const WRAP: usize = 58;
-    for (i, c) in cats.iter().enumerate() {
-        let cell = if i == 0 {
-            pill_cell(label, color)
-        } else {
-            blank_cell()
-        };
-        let name = pad_visible(&c.label.as_str().bold().to_string(), &c.label, NAME_W);
-        let refs: Vec<&str> = c.namespaces.iter().map(String::as_str).collect();
-        let head = common_prefix(&refs);
-        let tails: Vec<String> = c
-            .namespaces
-            .iter()
-            .map(|p| strip_prefix_path(p, &head))
-            .filter(|t| !t.is_empty())
-            .collect();
-        let vis = head.chars().count() + tails.iter().map(|t| t.chars().count() + 3).sum::<usize>();
-        if vis <= INLINE {
-            // Fits: `head/tail1 · tail2` inline, as one line.
-            let mut loc = head.as_str().bold().to_string();
-            if !tails.is_empty() {
-                let sep = if head.is_empty() { "" } else { "/" };
-                loc.push_str(
-                    &format!("{sep}{}", tails.join(" · "))
-                        .truecolor(120, 134, 144)
-                        .to_string(),
-                );
-            }
-            let body = format!("{name} {loc}{}", count_str(c, fresh));
-            out.push_str(&grid_line(&cell, &dots(c.severity), &body));
-        } else {
-            // Too many namespaces for one line: the shared prefix and count
-            // up top, every tail wrapped beneath — nothing hidden.
-            let body = format!("{name} {}{}", head.as_str().bold(), count_str(c, fresh));
-            out.push_str(&grid_line(&cell, &dots(c.severity), &body));
-            let items = if tails.is_empty() {
-                c.namespaces.clone()
-            } else {
-                tails
-            };
-            // Indent to two columns past the namespace column above.
-            let indent = " ".repeat(PILL_COL + NAME_W + 8);
-            for line in wrap_items(&items, WRAP) {
-                out.push_str(&format!("{indent}{}\n", line.truecolor(120, 134, 144)));
-            }
-        }
-    }
-}
-
 /// Pack items into lines of at most `width` visible chars, ` · `-joined.
 fn wrap_items(items: &[String], width: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
@@ -466,24 +392,6 @@ fn wrap_items(items: &[String], width: usize) -> Vec<String> {
         lines.push(cur);
     }
     lines
-}
-
-/// A count only when it carries information — a lone new trait is the default.
-fn count_str(c: &crate::rubric::Category, fresh: bool) -> String {
-    let n = c.new_ids.len();
-    let base = match (fresh, n) {
-        (_, 0) | (true, 1) => String::new(),
-        (true, k) => format!("  {}", paint(c.severity, &format!("{k} new"))),
-        (false, k) => format!("  {}", paint(c.severity, &format!("+{k}"))),
-    };
-    if c.escalated_ids.is_empty() {
-        base
-    } else {
-        format!(
-            "{base}  {}",
-            format!("{}↑", c.escalated_ids.len()).truecolor(102, 117, 127)
-        )
-    }
 }
 
 fn signature_grid(out: &mut String, a: &Assessment) {
@@ -574,7 +482,7 @@ fn identity_grid(out: &mut String, a: &Assessment) {
 /// top rule (criticality × confidence) and location, then a short excerpt
 /// with matched lines bright, context dim, and `+` marking lines absent
 /// from the old version.
-fn evidence_hunks(hunks: &[&Hunk]) -> String {
+fn evidence_hunks(hunks: &[&Hunk], diff: &DiffReportV1) -> String {
     if hunks.is_empty() {
         return String::new();
     }
@@ -584,63 +492,143 @@ fn evidence_hunks(hunks: &[&Hunk]) -> String {
         .map(|l| l.locator.chars().count())
         .max()
         .unwrap_or(4);
-    let descs: Vec<String> = hunks.iter().map(|h| crate::clip(&h.desc, 56)).collect();
-    let descw = descs.iter().map(|d| d.chars().count()).max().unwrap_or(0);
-    let mut out = format!(
-        "\n {}  {}\n",
-        pill_cell("evidence", PILL_OCEAN).trim_end(),
-        evidence_note_text(hunks).truecolor(102, 117, 127),
-    );
-    for (h, desc) in hunks.iter().zip(&descs) {
-        out.push('\n');
-        out.push_str(&format!(
-            "   {} {}   {}\n",
-            dots(h.severity),
-            pad_visible(&paint(h.severity, desc), desc, descw),
-            h.location.truecolor(102, 117, 127),
-        ));
-        for l in &h.lines {
-            let gutter = match l.added {
-                Some(true) => "+".truecolor(95, 175, 95).to_string(),
-                _ => " ".to_string(),
-            };
-            // Matched code in terminal foreground, context dimmed behind it.
-            let paint_code = |s: &str| {
-                if l.is_match {
-                    s.truecolor(205, 214, 221).to_string()
-                } else {
-                    s.truecolor(102, 117, 127).to_string()
-                }
-            };
-            // A long matched line wraps across continuation rows: bare
-            // rail, no repeated locator or gutter, a two-space hanging
-            // indent marking the continuation.
-            for (i, row_text) in wrap_code(&l.text, crate::evidence::CODE_W)
-                .into_iter()
-                .enumerate()
-            {
-                let row = if i == 0 {
-                    let loc = format!("{:>locw$}", l.locator, locw = locw);
-                    format!(
-                        "   {} {} {gutter} {}",
-                        loc.truecolor(70, 80, 89),
-                        "│".truecolor(70, 80, 89),
-                        paint_code(&row_text),
-                    )
-                } else {
-                    format!(
-                        "   {} {}     {}",
-                        " ".repeat(locw),
-                        "│".truecolor(70, 80, 89),
-                        paint_code(&row_text),
-                    )
-                };
-                out.push_str(row.trim_end());
-                out.push('\n');
+    // Width of the desc column, over the *window* hunks only (additions render
+    // filename-headed, not desc-padded).
+    let descw = hunks
+        .iter()
+        .filter(|h| !h.additions)
+        .map(|h| crate::clip(&h.desc, 56).chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    let mut i = 0;
+    while i < hunks.len() {
+        if hunks[i].additions {
+            // One header per changed file — a severity bar, the path (directory
+            // dim, basename bright), and the file's strongest rule as caption.
+            // Its runs follow in source order as plain added-line blocks, a
+            // single ellipsis marking each gap; matched lines stay bright so the
+            // detected behavior reads at a glance without per-run headings.
+            let name = file_label(hunks[i]);
+            let mut j = i;
+            while j < hunks.len() && hunks[j].additions && file_label(hunks[j]) == name {
+                j += 1;
             }
+            let group = &hunks[i..j];
+            let sev = group
+                .iter()
+                .map(|h| h.severity)
+                .max()
+                .unwrap_or(Severity::None);
+            let cap = group
+                .iter()
+                .filter(|h| !h.desc.is_empty())
+                .max_by(|a, b| {
+                    a.severity
+                        .cmp(&b.severity)
+                        .then(a.score.total_cmp(&b.score))
+                })
+                .map(|h| format!("   {}", paint(sev, &crate::clip(&h.desc, 56))))
+                .unwrap_or_default();
+            let (dir, base) = split_path(name);
+            let _ = write!(
+                out,
+                "\n  {} {}{}{cap}\n",
+                paint(sev, "▌"),
+                dir.truecolor(70, 80, 89),
+                base.truecolor(232, 237, 242).bold(),
+            );
+            // Per-file scalar metrics (sizes, entropy, ratios) — the ones that
+            // don't sum across files — live here, next to their file.
+            if let Some(ms) = file_metrics_summary(diff, name) {
+                let _ = writeln!(out, "   {}", ms.truecolor(102, 117, 127));
+            }
+            for (k, h) in group.iter().enumerate() {
+                if k > 0 {
+                    // The gap marker sits in the locator lane, no rail.
+                    let _ = writeln!(
+                        out,
+                        "  {}",
+                        format!("{:>locw$}", "⋯", locw = locw).truecolor(70, 80, 89),
+                    );
+                }
+                push_hunk_lines(&mut out, h, locw);
+            }
+            i = j;
+        } else {
+            let name = file_label(hunks[i]);
+            let desc = crate::clip(&hunks[i].desc, 56);
+            let _ = write!(
+                out,
+                "\n   {} {}   {}\n",
+                dots(hunks[i].severity),
+                pad_visible(&paint(hunks[i].severity, &desc), &desc, descw),
+                hunks[i].location.truecolor(102, 117, 127),
+            );
+            // The first hunk of a (binary) file carries its scalar metrics.
+            if (i == 0 || file_label(hunks[i - 1]) != name)
+                && let Some(ms) = file_metrics_summary(diff, name)
+            {
+                let _ = writeln!(out, "   {}", ms.truecolor(102, 117, 127));
+            }
+            push_hunk_lines(&mut out, hunks[i], locw);
+            i += 1;
         }
     }
     out
+}
+
+/// The name a hunk is filed under: the archive member when it is one, else the
+/// pair's own label (a plain file's basename).
+fn file_label(h: &Hunk) -> &str {
+    h.member.as_deref().unwrap_or(h.file.as_str())
+}
+
+/// `Unreal3.2/include/struct.h` → (`Unreal3.2/include/`, `struct.h`); a bare
+/// name → (``, name). The directory is rendered dim, the basename bright.
+fn split_path(p: &str) -> (&str, &str) {
+    // `+ 1` keeps the trailing `/` on the directory; it is one ASCII byte, so
+    // the split lands on a char boundary.
+    match p.rfind('/') {
+        Some(i) => p.split_at(i + 1),
+        None => ("", p),
+    }
+}
+
+/// Push a hunk's code rows: `locator + code`, the `+` gutter doubling as the
+/// rail. Matched lines bright, dim context behind them, long lines wrapped
+/// across bare continuation rows.
+fn push_hunk_lines(out: &mut String, h: &Hunk, locw: usize) {
+    for l in &h.lines {
+        let gutter = match l.added {
+            Some(true) => "+".truecolor(95, 175, 95).to_string(),
+            _ => " ".to_string(),
+        };
+        let paint_code = |s: &str| {
+            if l.is_match {
+                s.truecolor(205, 214, 221).to_string()
+            } else {
+                s.truecolor(102, 117, 127).to_string()
+            }
+        };
+        for (i, row_text) in wrap_code(&l.text, crate::evidence::CODE_W)
+            .into_iter()
+            .enumerate()
+        {
+            let row = if i == 0 {
+                let loc = format!("{:>locw$}", l.locator, locw = locw);
+                format!(
+                    "  {} {gutter} {}",
+                    loc.truecolor(70, 80, 89),
+                    paint_code(&row_text)
+                )
+            } else {
+                format!("  {}   {}", " ".repeat(locw), paint_code(&row_text))
+            };
+            out.push_str(row.trim_end());
+            out.push('\n');
+        }
+    }
 }
 
 /// Say what the evidence marks mean, once, up top, instead of implying it.
@@ -733,7 +721,7 @@ fn dependencies_section(deps: &[crate::deps::DepProfile]) -> String {
     let indent = " ".repeat(PILL_COL + NAME_W + 4);
     for (i, d) in deps.iter().enumerate() {
         let cell = if i == 0 {
-            pill_cell("dependencies", PILL_PLUM)
+            pill_cell("deps", PILL_PLUM)
         } else {
             blank_cell()
         };
@@ -758,18 +746,24 @@ fn dependencies_section(deps: &[crate::deps::DepProfile]) -> String {
     out
 }
 
-fn grid_line(cell: &str, dots: &str, body: &str) -> String {
-    format!(" {cell}{dots} {body}\n")
+/// One grid row: ` {label}{marker}{body}`. `marker` is a 3-wide severity glyph
+/// (`●  `) or a tree/change sign for the rows that carry one, and empty for the
+/// plain label rows — so a marker, when present, lands in the content column and
+/// its body sits just past it.
+fn grid_line(cell: &str, marker: &str, body: &str) -> String {
+    format!(" {cell}{marker}{body}\n")
 }
 
+/// A section label: colored text, left-aligned in the label column — no
+/// background. The color is the section's accent; the width lines every row's
+/// content up at the same column.
 fn pill_cell(label: &str, (r, g, b): (u8, u8, u8)) -> String {
-    let p = format!(" {label} ")
-        .bold()
-        .white()
-        .on_truecolor(r, g, b)
-        .to_string();
-    let vis = label.chars().count() + 2;
-    format!("{p}{}", " ".repeat(PILL_COL.saturating_sub(vis)))
+    format!(
+        "{}",
+        format!("{label:<w$}", w = PILL_COL)
+            .truecolor(r, g, b)
+            .bold()
+    )
 }
 
 fn blank_cell() -> String {
@@ -846,20 +840,165 @@ pub(crate) fn metrics(diff: &DiffReportV1) -> Vec<(String, String, Severity)> {
         .collect()
 }
 
-/// Grid bodies for the metric movers, one per row: `label  value`, the value
-/// tinted by how far the metric moved.
-fn metrics_rows(diff: &DiffReportV1) -> Vec<String> {
-    metrics(diff)
-        .into_iter()
-        .map(|(label, value, sev)| {
-            let painted = label.as_str().truecolor(150, 160, 168).to_string();
-            format!(
-                "{} {}",
-                pad_visible(&painted, &label, NAME_W),
-                paint(sev, &value)
-            )
+/// Aggregate count deltas across the changed files, as `old → new  label  (+Δ)`
+/// with the gained names listed. Only the *count* scopes — symbols, sections,
+/// strings — which sum honestly regardless of file type; the scalar per-file
+/// metrics (sizes, entropy, ratios) ride each evidence header, where they keep
+/// their meaning. Empty when nothing counted moved.
+fn stats_rows(diff: &DiffReportV1) -> Vec<String> {
+    // For an archive, the leaf members carry the counts; skip the container
+    // root so nothing is counted twice. A single-file diff has no `!!` entries,
+    // so every changed entry is a leaf.
+    let archive = diff.files.iter().any(|f| f.path.contains("!!"));
+    let (mut sym_o, mut sym_n) = (0i64, 0i64);
+    let (mut sec_o, mut sec_n) = (0i64, 0i64);
+    let (mut str_o, mut str_n) = (0i64, 0i64);
+    let mut added_syms: Vec<String> = Vec::new();
+    let mut added_secs: Vec<String> = Vec::new();
+    for f in &diff.files {
+        if matches!(f.status, cleave::types::FileStatus::Unchanged)
+            || (archive && !f.path.contains("!!"))
+        {
+            continue;
+        }
+        if let Some(s) = &f.scopes.symbols {
+            sym_o += i64::from(s.old_count);
+            sym_n += i64::from(s.new_count);
+            added_syms.extend(s.added.iter().map(|a| a.symbol.clone()));
+        }
+        if let Some(s) = &f.scopes.sections {
+            sec_o += i64::from(s.old_count);
+            sec_n += i64::from(s.new_count);
+            added_secs.extend(s.added.iter().map(|a| a.name.clone()));
+        }
+        if let Some(s) = &f.scopes.strings {
+            str_o += i64::from(s.old_count);
+            str_n += i64::from(s.new_count);
+        }
+    }
+    let mut raw: Vec<(i64, i64, &str, String)> = Vec::new();
+    if sym_o != sym_n || !added_syms.is_empty() {
+        raw.push((sym_o, sym_n, "symbols", names_note(&added_syms)));
+    }
+    if sec_o != sec_n || !added_secs.is_empty() {
+        raw.push((sec_o, sec_n, "sections", names_note(&added_secs)));
+    }
+    if str_o != str_n {
+        raw.push((str_o, str_n, "strings", String::new()));
+    }
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    // Right-align old/new in one field so every `→` stacks.
+    let w = raw
+        .iter()
+        .map(|(o, n, ..)| o.to_string().len().max(n.to_string().len()))
+        .max()
+        .unwrap_or(1);
+    raw.into_iter()
+        .map(|(o, n, label, note)| {
+            let d = n - o;
+            let delta = if d > 0 {
+                format!("(+{d})").truecolor(95, 175, 95).to_string()
+            } else {
+                format!("({d:+})").truecolor(102, 117, 127).to_string()
+            };
+            let mut body = format!(
+                "{} {} {}  {}  {delta}",
+                format!("{o:>w$}").truecolor(140, 150, 158),
+                "→".truecolor(102, 117, 127),
+                format!("{n:>w$}").truecolor(140, 150, 158),
+                format!("{label:<8}").truecolor(150, 160, 168),
+            );
+            if !note.is_empty() {
+                let _ = write!(body, "  {}", note.truecolor(120, 134, 144));
+            }
+            body
         })
         .collect()
+}
+
+/// A short, `, `-joined list of gained names, capped so one big change can't run
+/// off the row.
+fn names_note(names: &[String]) -> String {
+    const MAX: usize = 5;
+    if names.is_empty() {
+        return String::new();
+    }
+    let mut s = names
+        .iter()
+        .take(MAX)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > MAX {
+        let _ = write!(s, ", +{} more", names.len() - MAX);
+    }
+    s
+}
+
+/// The scalar metric deltas for one changed file — sizes, entropy, ratios,
+/// per-file counts — as `label old→new (Δ%)`, joined with ` · `. These are the
+/// metrics that don't aggregate across files, so they ride the file's own
+/// evidence header. `None` when the file has no scalar movers.
+fn file_metrics_summary(diff: &DiffReportV1, member: &str) -> Option<String> {
+    const CAP: usize = 6;
+    let entry = diff
+        .files
+        .iter()
+        .find(|f| f.path.rsplit_once("!!").map_or(f.path.as_str(), |(_, m)| m) == member)
+        // A single-file (non-archive) diff has one changed entry, unmatched by
+        // name — fall back to it.
+        .or_else(|| single_changed_file(diff))?;
+    let m = entry.scopes.metrics.as_ref()?;
+    let mut movers: Vec<(f64, String, String)> = Vec::new();
+    for c in &m.changed {
+        let p = c.new.path.as_str();
+        // `size_bytes` restates other movers; the rest are archive noise or are
+        // named in the structure section.
+        if p.contains("mtime")
+            || p.contains("timing")
+            || p.contains("dependencies")
+            || p.contains("has_direct_loader_dep")
+            || p.contains("load_segment")
+            || p.ends_with("size_bytes")
+        {
+            continue;
+        }
+        let (Some(o), Some(n)) = (c.old.value.as_f64(), c.new.value.as_f64()) else {
+            continue;
+        };
+        if o == n {
+            continue;
+        }
+        let (label, _) = describe(p, o, n);
+        let (rel, delta) = if o != 0.0 {
+            (
+                (n - o).abs() / o.abs(),
+                format!("{:+.0}%", (n - o) / o * 100.0),
+            )
+        } else {
+            (f64::INFINITY, "new".to_string())
+        };
+        movers.push((
+            rel,
+            label,
+            format!("{}→{} ({delta})", fmt_num(o), fmt_num(n)),
+        ));
+    }
+    movers.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // One row per label — `relacount` and `dynrela_count` both read `relocs`,
+    // so keep the larger mover, not both.
+    let mut seen = std::collections::HashSet::new();
+    movers.retain(|(_, label, _)| seen.insert(label.clone()));
+    movers.truncate(CAP);
+    (!movers.is_empty()).then(|| {
+        movers
+            .into_iter()
+            .map(|(_, label, v)| format!("{label} {v}"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    })
 }
 
 /// `(label, value)` for one metric change.
@@ -903,36 +1042,7 @@ fn intensity_severity(rel: f64) -> Severity {
     }
 }
 
-fn common_prefix(paths: &[&str]) -> String {
-    let Some(first) = paths.first() else {
-        return String::new();
-    };
-    let mut prefix: Vec<&str> = first.split('/').collect();
-    for p in &paths[1..] {
-        let segs: Vec<&str> = p.split('/').collect();
-        let keep = prefix
-            .iter()
-            .zip(segs.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
-        prefix.truncate(keep);
-    }
-    prefix.join("/")
-}
-
-fn strip_prefix_path(path: &str, prefix: &str) -> String {
-    if prefix.is_empty() {
-        return path.to_string();
-    }
-    path.strip_prefix(prefix)
-        .map(|r| r.trim_start_matches('/').to_string())
-        .unwrap_or_else(|| path.to_string())
-}
-
-// ── painters ─────────────────────────────────────────────────────────────
-
 const PILL_PLUM: (u8, u8, u8) = (60, 30, 75);
-const PILL_PLUM_DIM: (u8, u8, u8) = (44, 30, 52);
 const PILL_HOT: (u8, u8, u8) = (127, 43, 43);
 const PILL_TEAL: (u8, u8, u8) = (0, 60, 55);
 const PILL_OCEAN: (u8, u8, u8) = (12, 58, 75);

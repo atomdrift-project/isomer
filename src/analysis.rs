@@ -202,6 +202,10 @@ pub(crate) struct Analysis<'a> {
     pub clean: bool,
     /// Optional `--llm` read of the change.
     pub interp: Option<crate::llm::Interpretation>,
+    /// True when the model's verdict pulled [`Self::risk`]'s new score up to
+    /// its band floor — so the report can attribute the raised number honestly
+    /// (`azoth+llm`) instead of crediting azoth with a value it did not emit.
+    pub risk_llm_raised: bool,
     /// What the comparison actually covered. A verb fills this in when it
     /// knows; `None` means the surface has nothing useful to say about scope
     /// (`fs` compares two paths the caller named, so "source" would be a lie).
@@ -288,10 +292,24 @@ impl<'a> Analysis<'a> {
         });
 
         let verdict = assessment.severity.max(risk_now);
-        let new_verdict = assessment.new_severity().max(risk_jump);
+        // A capability the version bump does not license *is* the supply-chain
+        // signal — so a disproportionate gain is escalated to a gate-failing
+        // severity even when the gained trait's own criticality is only medium.
+        // The bump's tolerance already scopes this: `Minor`/`Major` are only
+        // disproportionate on a High+ gain (already gate-failing, so this is a
+        // no-op), and it bites exactly where it should — a `patch`/`same`
+        // (repack) release that has no business gaining behavior at all
+        // (unrealircd: a same-version repack that gained byte-comparison and
+        // privilege-escalation traits, medium each, under the high gate).
+        let escalation = if prop.disproportionate {
+            Severity::High
+        } else {
+            Severity::None
+        };
+        let new_verdict = assessment.new_severity().max(risk_jump).max(escalation);
         let gated = match cli.gate {
             Gate::New => new_verdict,
-            Gate::Any => verdict,
+            Gate::Any => verdict.max(escalation),
         };
 
         let mut a = Self {
@@ -310,6 +328,7 @@ impl<'a> Analysis<'a> {
             gated,
             clean: !gated.fails(cli.fail_on),
             interp: None,
+            risk_llm_raised: false,
             scope: None,
             deps: Vec::new(),
             hunks: OnceCell::new(),
@@ -328,6 +347,31 @@ impl<'a> Analysis<'a> {
                     None
                 }
             };
+        }
+        // The model's read is a detection signal, not just a caption: fold its
+        // verdict into the *displayed* severity so a change the rubric
+        // under-rates but the model calls malicious is escalated (SUSPICIOUS →
+        // HOSTILE), and pull the risk bar up to the band that call implies. It
+        // only ever raises — a benign read never lowers a rubric finding.
+        //
+        // The gate (`gated`/`clean`, the CI exit code) is deliberately left
+        // deterministic: a model hallucination must not fail someone's build.
+        // So the LLM sharpens the human-facing verdict without making CI
+        // non-reproducible.
+        if let Some(sev) = a.interp.as_ref().map(crate::llm::Interpretation::severity)
+            && sev > Severity::None
+        {
+            a.verdict = a.verdict.max(sev);
+            if let Some(r) = a.risk.as_mut() {
+                let floor = a
+                    .interp
+                    .as_ref()
+                    .map_or(0.0, crate::llm::Interpretation::risk_floor);
+                if r.new < floor {
+                    r.new = floor;
+                    a.risk_llm_raised = true;
+                }
+            }
         }
         Ok(a)
     }
@@ -349,12 +393,10 @@ impl<'a> Analysis<'a> {
     /// unchanged on both sides never enters the diff — so an assessment
     /// reaching Notable means this change introduced something worth naming,
     /// hostile or not. Saying so is also how a reviewer knows the scanner is
-    /// alive between real incidents; keeping it [`brief`](Self::detailed) is
-    /// what stops that from becoming noise. A run with nothing to report still
-    /// says nothing at all.
+    /// alive between real incidents. A run with nothing to report still says
+    /// nothing at all.
     pub(crate) fn speaks(&self, cli: &Cli) -> bool {
-        cli.explain
-            || self.gated.fails(cli.fail_on)
+        self.gated.fails(cli.fail_on)
             // Notable+ is the reporting floor; the tiers below it are atoms
             // and unremarkable observations (see `rubric::is_finding`).
             || self.assessment.severity >= Severity::Medium
@@ -374,14 +416,6 @@ impl<'a> Analysis<'a> {
             || !self.observations().is_empty()
     }
 
-    /// Whether to render the full report — grid, metrics, touched files, and
-    /// evidence — rather than the short "here is what we noticed" form. Only a
-    /// change that actually fails the gate has earned a reviewer's full
-    /// attention; everything else gets a few lines.
-    pub(crate) fn detailed(&self, cli: &Cli) -> bool {
-        cli.explain || !self.clean
-    }
-
     /// Whether the model's read moved between risk bands, in either direction.
     /// A drop matters too: it is how a reviewer sees that a fix landed.
     pub(crate) fn risk_band_moved(&self) -> bool {
@@ -395,6 +429,24 @@ impl<'a> Analysis<'a> {
         if !self.clean {
             return self.headline();
         }
+        self.clean_note()
+    }
+
+    /// Like [`judgement`](Self::judgement) but with the model's read left for
+    /// its own line — used by the terminal, which prints `✨ nature` separately,
+    /// so the two never echo each other.
+    pub(crate) fn reason(&self) -> String {
+        if !self.clean {
+            return self.headline_facts();
+        }
+        self.clean_note()
+    }
+
+    /// The passing-change note: how much was noticed, and whether the model's
+    /// band moved. Shared by [`judgement`](Self::judgement) and
+    /// [`reason`](Self::reason); the LLM's phrasing has no place here (a clean
+    /// verdict's note is about counts, not the read).
+    fn clean_note(&self) -> String {
         let noted = self.assessment.behavioral.categories.len()
             + self.assessment.signature.ids.len()
             + self.assessment.identity.changes.len()
@@ -412,7 +464,12 @@ impl<'a> Analysis<'a> {
     /// The strongest `limit` evidence hunks behind the verdict, in file order.
     pub(crate) fn hunks(&self, limit: usize) -> Vec<&Hunk> {
         let all = self.hunks.get_or_init(|| {
-            crate::evidence::hunks(&self.pairs, self.options, &self.assessment.gained_ids())
+            crate::evidence::hunks(
+                &self.pairs,
+                self.options,
+                &self.assessment.gained_ids(),
+                self.diff,
+            )
         });
         crate::evidence::strongest(all, limit)
     }
@@ -495,6 +552,15 @@ impl<'a> Analysis<'a> {
         if let Some(i) = self.interp.as_ref().filter(|i| !i.nature.trim().is_empty()) {
             return i.nature.trim().to_string();
         }
+        self.headline_facts()
+    }
+
+    /// The deterministic one-liner behind the verdict — proportionality, then
+    /// the worst capability class, signature, or structural fact. The model's
+    /// read is *not* consulted; [`headline`](Self::headline) prefers it, but a
+    /// surface that shows the read on its own line uses this so they do not
+    /// repeat.
+    pub(crate) fn headline_facts(&self) -> String {
         if let Some(note) = self
             .prop
             .note
@@ -627,13 +693,19 @@ impl<'a> Analysis<'a> {
             }
         }
 
-        // Compact evidence — the matched rows and their descriptions, not the
-        // full surrounding dump; keeps the payload focused and the token cost
-        // bounded.
-        let ev = crate::evidence::render(&self.pairs, self.options, &a.gained_ids(), true);
-        if !ev.trim().is_empty() {
-            let _ = writeln!(s, "\nchanged code / bytes (matched by rules):");
-            s.push_str(ev.trim_end());
+        // The distilled top hunks — strongest rule first, one per rule, tiered
+        // context — not every match. A broad trait hitting dozens of benign
+        // files must not bury the one change that matters (unrealircd's
+        // `substr: SYSTEM` read to the model as a false positive when all 30
+        // windows were dumped).
+        let hunks = self.hunks(crate::evidence::LLM_HUNKS);
+        if !hunks.is_empty() {
+            let _ = writeln!(
+                s,
+                "\nchanged code / bytes (top {} matched regions by rule score):",
+                hunks.len()
+            );
+            s.push_str(crate::evidence::render_hunks(&hunks).trim_end());
             s.push('\n');
         }
 
@@ -782,7 +854,11 @@ impl<'a> Analysis<'a> {
                     old: r.old,
                     new: r.new,
                     delta: r.delta(),
-                    model: "azoth",
+                    model: if self.risk_llm_raised {
+                        "azoth+llm"
+                    } else {
+                        "azoth"
+                    },
                 }),
                 proportionality: j::Prop {
                     disproportionate: self.prop.disproportionate,

@@ -12,6 +12,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
+use cleave::types::{DiffReportV1, FileStatus};
+
 use crate::Severity;
 use crate::analysis::Pair;
 use crate::rubric::{crit_rank, namespace_of};
@@ -26,7 +28,15 @@ const MATCH_W: usize = 3 * CODE_W;
 
 /// How many hunks the evidence section shows, and the excerpt height of each.
 pub(crate) const MAX_HUNKS: usize = 5;
-const MAX_HUNK_LINES: usize = 7;
+/// The LLM gets a wider set than the terminal: it reads for reasoning, not at a
+/// glance, so more distinct signals help — but still the ranked, one-per-rule
+/// top, not every match (a `substr: SYSTEM` trait hitting 30 files must not
+/// drown the one change that matters).
+pub(crate) const LLM_HUNKS: usize = 10;
+/// Hard ceiling on a hunk's rendered lines; the per-tier window in [`trim`]
+/// picks the actual count (2·ctx+1), so a hostile hit fills this and a notable
+/// one uses ~5.
+const MAX_HUNK_LINES: usize = 9;
 
 /// One evidence hunk — a contiguous matched region attributed to its top rule
 /// (criticality × confidence, cleave's own ranking), rendered as a small
@@ -56,6 +66,13 @@ pub(crate) struct Hunk {
     pub binary: bool,
     /// Ranking score of the top note (crit × confidence).
     pub score: f32,
+    /// True when this hunk is a run of *added* source lines (the differential
+    /// view), rather than a match window. Additions carry the full change — the
+    /// lines a release introduced, matched or not — so they skip the
+    /// match-centric [`trim`]/[`merge_contiguous`] passes, survive the
+    /// notable-floor retain that culls weak match windows, and render
+    /// filename-grouped rather than one-header-per-window.
+    pub(crate) additions: bool,
     pub lines: Vec<HunkLine>,
     /// 1-based line range covered (text hunks), for contiguity merging.
     span: Option<(u64, u64)>,
@@ -106,10 +123,25 @@ pub(crate) fn hunks(
     pairs: &[Pair],
     options: &cleave::AnalysisOptions,
     gained_ids: &HashSet<&str>,
+    diff: &DiffReportV1,
 ) -> Vec<Hunk> {
     if gained_ids.is_empty() {
         return Vec::new();
     }
+    // The members the diff reports as actually changed. isomer is differential:
+    // a gained trait's proof lives in a file that *moved*, not in an unchanged
+    // bundled library that happened to already carry the same construct
+    // (unrealircd's backdoor `memcmp` in `s_bsd.c`, not the identical `memcmp`
+    // in the untouched `c-ares` copy). Members outside this set are excluded so
+    // the evidence tracks the change, not the whole artifact. A root-level pair
+    // (a plain source file, no `!!`) is always its own changed file, so an empty
+    // set never filters those — [`file_hunks`] only consults it for members.
+    let changed: HashSet<String> = diff
+        .files
+        .iter()
+        .filter(|f| !matches!(f.status, FileStatus::Unchanged))
+        .map(|f| clean_member(&f.path))
+        .collect();
     let mut all: Vec<Hunk> = Vec::new();
     for pair in pairs {
         let Some(new_path) = pair.new.as_deref() else {
@@ -118,23 +150,27 @@ pub(crate) fn hunks(
         let Some(report) = analyze(new_path, options) else {
             continue;
         };
-        file_hunks(pair, &report, gained_ids, &mut all);
+        file_hunks(pair, &report, gained_ids, &changed, &mut all);
         if all.len() >= HUNK_BUDGET {
             break;
         }
     }
 
-    // Contiguous hunks in the same member merge into one, owned by the
-    // stronger rule; each is then trimmed to a short excerpt around its top
-    // match.
+    // Match windows merge and trim to a short excerpt around their hit;
+    // addition runs already carry the whole change, contiguity-grouped and
+    // per-run capped, so both passes leave them untouched.
     merge_contiguous(&mut all);
     for h in &mut all {
-        trim(h);
+        if !h.additions {
+            trim(h);
+        }
     }
-    // Notable+ hunks own the slots; baseline-tier matches qualify only when
-    // nothing stronger exists (they're context, not standalone proof).
+    // Notable+ owns the slots — a baseline *match window* is context, not proof,
+    // and is culled when anything stronger exists. Addition runs are exempt:
+    // they are the change itself, and a sub-notable added line (unrealircd's
+    // `system()` macro) is exactly what must not be dropped.
     if all.iter().any(|h| h.severity >= Severity::Medium) {
-        all.retain(|h| h.severity >= Severity::Medium);
+        all.retain(|h| h.severity >= Severity::Medium || h.additions);
     }
     all.sort_by(|a, b| {
         b.severity
@@ -142,10 +178,17 @@ pub(crate) fn hunks(
             .then(b.score.total_cmp(&a.score))
             .then(a.loc.cmp(&b.loc))
     });
-    // One hunk per rule, so five hunks show five behaviors rather than one
-    // behavior five times.
+    // One window per rule (five hunks show five behaviors, not one behavior five
+    // times); addition runs dedup by location instead — each is a distinct
+    // region of the change, and they share the generic "added code" headline.
     let mut seen: HashSet<String> = HashSet::new();
-    all.retain(|h| seen.insert(h.desc.clone()));
+    all.retain(|h| {
+        seen.insert(if h.additions {
+            h.location.clone()
+        } else {
+            h.desc.clone()
+        })
+    });
     all
 }
 
@@ -162,12 +205,84 @@ pub(crate) fn strongest(all: &[Hunk], limit: usize) -> Vec<&Hunk> {
     shown
 }
 
+/// The distilled hunks as plain text for the LLM payload — strongest rule
+/// first, one per rule, each a small diff excerpt (`+` new, `>` matched, ` `
+/// context). This replaces the dump-every-match [`render`] on the LLM path:
+/// there, one broad trait matching dozens of benign files (unrealircd's
+/// `substr: SYSTEM`) produced dozens of windows and buried the real change,
+/// which then read to the model as a false positive.
+pub(crate) fn render_hunks(hunks: &[&Hunk]) -> String {
+    use std::fmt::Write as _;
+    let file_of = |h: &Hunk| h.member.as_deref().unwrap_or(h.file.as_str()).to_string();
+    let mut s = String::new();
+    let mut i = 0;
+    while i < hunks.len() {
+        if hunks[i].additions {
+            // Filename once, captioned with its strongest rule, then the added
+            // lines run by run (`⋯` at each gap, `>` on matched lines) — the
+            // model sees the whole change with the detected lines marked, not
+            // scattered windows.
+            let name = file_of(hunks[i]);
+            let mut j = i;
+            while j < hunks.len() && hunks[j].additions && file_of(hunks[j]) == name {
+                j += 1;
+            }
+            let group = &hunks[i..j];
+            let top = group.iter().filter(|h| !h.desc.is_empty()).max_by(|a, b| {
+                a.severity
+                    .cmp(&b.severity)
+                    .then(a.score.total_cmp(&b.score))
+            });
+            let caption = match top {
+                Some(t) => format!(" — {} [{}]", t.desc, t.severity.as_str()),
+                None => String::new(),
+            };
+            let _ = writeln!(s, "\n{name}{caption}  (added lines):");
+            for (k, h) in group.iter().enumerate() {
+                if k > 0 {
+                    let _ = writeln!(s, "  ⋯");
+                }
+                for l in &h.lines {
+                    let mark = if l.is_match { ">+" } else { " +" };
+                    let _ = writeln!(s, "  {mark} {}", l.text);
+                }
+            }
+            i = j;
+        } else {
+            let member = hunks[i]
+                .member
+                .as_deref()
+                .map(|m| format!(" ({m})"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                s,
+                "\n{}{}  [{}]  {}",
+                hunks[i].location,
+                member,
+                hunks[i].severity.as_str(),
+                hunks[i].desc
+            );
+            for l in &hunks[i].lines {
+                let mark = match l.added {
+                    Some(true) => '+',
+                    _ if l.is_match => '>',
+                    _ => ' ',
+                };
+                let _ = writeln!(s, "  {mark} {}", l.text);
+            }
+            i += 1;
+        }
+    }
+    s
+}
+
 /// Collect one file's hunks (the file itself plus any archive members) into
 /// `all`.
 fn file_hunks(
     pair: &Pair,
     report: &cleave::AnalysisReport,
     gained_ids: &HashSet<&str>,
+    changed: &HashSet<String>,
     all: &mut Vec<Hunk>,
 ) {
     // The root analysis plus one entry per archive member, all borrowed: these
@@ -199,7 +314,44 @@ fn file_hunks(
     let old_lines = pair.old.as_deref().and_then(|p| old_line_set(p, container));
 
     for (member, fa) in &candidates {
+        // A hunk inside an archive member is evidence only if that member is one
+        // the diff flagged as changed; an unchanged member carrying the same
+        // construct is not what moved. The container root (`member == None`) is
+        // the pair itself — always a changed file — so it is never filtered.
+        if let Some(m) = member
+            && !changed.contains(m)
+        {
+            continue;
+        }
         let shown = member.clone().unwrap_or_else(|| pair.label.clone());
+
+        // Source-additions path: when both sides' text is in reach, the change
+        // *is* the added lines — show them whole (matched or not), so an attack
+        // whose payload sits a few lines from the trait hit (unrealircd's
+        // `system()` macro) stays in view. Needs a text new side and the old
+        // text as the line-diff baseline; archive members are pulled per side.
+        if let (Some(new_src), Some(old_src)) = (
+            member_source(pair.new.as_deref(), member.as_deref()),
+            member_source(pair.old.as_deref(), member.as_deref()),
+        ) && is_text(&new_src)
+        {
+            addition_hunks(
+                &new_src,
+                &old_src,
+                fa,
+                &keep,
+                &pair.label,
+                member.as_deref(),
+                &shown,
+                all,
+            );
+            if all.len() >= HUNK_BUDGET {
+                return;
+            }
+            continue;
+        }
+
+        // Binary / added-file fallback: match windows, cleave's presentation.
         for chunk in &fa.context {
             let kept: Vec<&cleave::types::Note> =
                 chunk.notes.iter().filter(|n| keep(n.id.as_str())).collect();
@@ -228,6 +380,167 @@ fn file_hunks(
                 return;
             }
         }
+    }
+}
+
+/// The source text of one changed file, per side. A plain-file pair reads the
+/// path directly; an archive member is pulled from the archive by cleave (which
+/// owns the decoders). `None` when the bytes are out of reach — a deleted side,
+/// a member inside a nested archive, an unsupported container — and the caller
+/// falls back to match-window evidence.
+fn member_source(archive_or_file: Option<&Path>, member: Option<&str>) -> Option<Vec<u8>> {
+    let p = archive_or_file?;
+    match member {
+        None => std::fs::read(p).ok(),
+        Some(m) => cleave::extract_member(p, m).ok().flatten(),
+    }
+}
+
+/// Whether bytes read as source text: non-empty and no NUL in the head (the
+/// same binary sniff cleave and `old_line_set` use).
+fn is_text(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && !bytes.iter().take(8192).any(|b| *b == 0)
+}
+
+/// 1-based line of a byte offset, by counting newlines before it — maps a
+/// cleave match offset (into this member's own bytes) onto a source line.
+fn line_at(bytes: &[u8], off: u64) -> usize {
+    let end = usize::try_from(off).unwrap_or(usize::MAX).min(bytes.len());
+    1 + bytes[..end].iter().filter(|&&b| b == b'\n').count()
+}
+
+/// Runs of lines a release *added* to one source file, each rendered as a hunk.
+/// A run carrying a gained-trait match takes that rule's tier and headline and
+/// leads the ranking; the rest are shown as plain additions so the whole change
+/// is visible — the point of the differential view.
+#[allow(clippy::too_many_arguments)]
+fn addition_hunks(
+    new: &[u8],
+    old: &[u8],
+    fa: &cleave::types::FileAnalysis,
+    keep: &impl Fn(&str) -> bool,
+    file: &str,
+    member: Option<&str>,
+    shown: &str,
+    all: &mut Vec<Hunk>,
+) {
+    // Lines only on the new side (set-based, matching `analysis::line_diff` so
+    // a moved line reads as context, not an addition).
+    let old_text = String::from_utf8_lossy(old);
+    let old_set: HashSet<&str> = old_text.lines().map(str::trim).collect();
+    let new_text = String::from_utf8_lossy(new);
+    let new_lines: Vec<&str> = new_text.lines().collect();
+
+    // Strongest kept match per 1-based line, from cleave's analysis of the new
+    // side. Offsets are into this member's own bytes, so a newline count places
+    // each on its line.
+    let mut hit: std::collections::HashMap<usize, &cleave::types::Note> =
+        std::collections::HashMap::new();
+    for note in fa.context.iter().flat_map(|c| &c.notes) {
+        if !keep(note.id.as_str()) {
+            continue;
+        }
+        let ln = line_at(new, note.off);
+        hit.entry(ln)
+            .and_modify(|cur| {
+                if score(note) > score(cur) {
+                    *cur = note;
+                }
+            })
+            .or_insert(note);
+    }
+
+    let added = |k: usize| k < new_lines.len() && !old_set.contains(new_lines[k].trim());
+    let mut i = 0;
+    while i < new_lines.len() {
+        if !added(i) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while added(i) {
+            i += 1;
+        }
+        // A run of only blank additions is a reformat, not content.
+        if (start..i).all(|k| new_lines[k].trim().is_empty()) {
+            continue;
+        }
+        all.push(addition_run(
+            &new_lines, start, i, &hit, file, member, shown,
+        ));
+        if all.len() >= HUNK_BUDGET {
+            return;
+        }
+    }
+}
+
+/// One contiguous added-line run (`[start, end)`, 0-based) as a hunk. Capped at
+/// [`MAX_RUN_LINES`] with a `+N more added` tail so a large legitimate edit
+/// cannot flood the evidence.
+fn addition_run(
+    new_lines: &[&str],
+    start: usize,
+    end: usize,
+    hit: &std::collections::HashMap<usize, &cleave::types::Note>,
+    file: &str,
+    member: Option<&str>,
+    shown: &str,
+) -> Hunk {
+    /// Lines shown before the run is summarized — a per-run twin of
+    /// [`MAX_HUNKS`], generous enough for a whole small payload.
+    const MAX_RUN_LINES: usize = 20;
+    let first_line = start + 1;
+    // Strongest match anywhere in the run drives the header and tier.
+    let top = (start..end)
+        .filter_map(|k| hit.get(&(k + 1)).copied())
+        .max_by(|a, b| score(a).total_cmp(&score(b)));
+
+    let mut lines: Vec<HunkLine> = (start..end.min(start + MAX_RUN_LINES))
+        .map(|k| HunkLine {
+            locator: (k + 1).to_string(),
+            text: crate::printable(&crate::clip(new_lines[k].trim_end(), CODE_W)),
+            added: Some(true),
+            is_match: hit.contains_key(&(k + 1)),
+        })
+        .collect();
+    let overflow = (end - start).saturating_sub(MAX_RUN_LINES);
+    if overflow > 0 {
+        lines.push(HunkLine {
+            locator: String::new(),
+            text: format!("… +{overflow} more added"),
+            added: None,
+            is_match: false,
+        });
+    }
+
+    // A run with a match wears that rule's tier and headline and ranks with the
+    // findings; a run without carries `None` and an empty headline — it renders
+    // as a titleless block of added lines under the file, so the detected
+    // behavior still stands out while the rest of the change stays visible.
+    let (severity, score_v, id, desc) = match top {
+        Some(n) => (
+            tier(n.crit),
+            score(n),
+            n.id.as_str().to_string(),
+            desc_of(n),
+        ),
+        None => (Severity::None, 0.0, String::new(), String::new()),
+    };
+    Hunk {
+        file: file.to_string(),
+        member: member.map(str::to_string),
+        line: Some(first_line as u64),
+        loc: first_line as u64,
+        location: format!("{shown}:{first_line}"),
+        id,
+        desc,
+        severity,
+        binary: false,
+        score: score_v,
+        additions: true,
+        lines,
+        span: Some((first_line as u64, end as u64)),
+        top: 0,
     }
 }
 
@@ -332,6 +645,7 @@ fn text_hunk(
         severity: tier(top.crit),
         binary: false,
         score: score(top),
+        additions: false,
         lines,
         span: Some((first_line, first_line + spans.len() as u64 - 1)),
         top: top_idx,
@@ -369,6 +683,7 @@ fn binary_hunk(chunk: &cleave::types::ContextLine, top: &cleave::types::Note, fi
         severity: tier(top.crit),
         binary: true,
         score: score(top),
+        additions: false,
         lines,
         span: None,
         top: 0,
@@ -404,9 +719,11 @@ fn hex_ascii(row: &[u8], stride: usize) -> String {
 fn merge_contiguous(hunks: &mut Vec<Hunk>) {
     let mut out: Vec<Hunk> = Vec::with_capacity(hunks.len());
     for h in hunks.drain(..) {
+        // Addition runs are self-contained (already maximal, per-run capped);
+        // only match windows merge.
         let Some(prev) = out
             .last_mut()
-            .filter(|p| p.file == h.file && p.member == h.member)
+            .filter(|p| p.file == h.file && p.member == h.member && !p.additions && !h.additions)
         else {
             out.push(h);
             continue;
@@ -439,10 +756,20 @@ fn merge_contiguous(hunks: &mut Vec<Hunk>) {
 /// Cap a hunk at [`MAX_HUNK_LINES`] around its top match, then drop blank
 /// edge lines — they pad the excerpt without informing it.
 fn trim(h: &mut Hunk) {
-    if h.lines.len() > MAX_HUNK_LINES {
-        let start = h.top.saturating_sub(2).min(h.lines.len() - MAX_HUNK_LINES);
+    // Context lines each side of the match, by the hunk's tier: a hostile hit
+    // earns room to show intent (the legs a composite fired on read as ordinary
+    // context lines here), a notable one just enough to read the matched line.
+    let ctx = match h.severity {
+        Severity::Critical => 4,
+        Severity::High => 3,
+        Severity::Medium => 2,
+        _ => 1,
+    };
+    let window = (2 * ctx + 1).min(MAX_HUNK_LINES);
+    if h.lines.len() > window {
+        let start = h.top.saturating_sub(ctx).min(h.lines.len() - window);
         h.lines.drain(..start);
-        h.lines.truncate(MAX_HUNK_LINES);
+        h.lines.truncate(window);
     }
     while h.lines.first().is_some_and(|l| l.text.is_empty()) {
         h.lines.remove(0);
@@ -499,95 +826,6 @@ fn excerpt(line: &[u8], col: usize, clipped: bool) -> String {
 /// comment, and an archive is free to name a file `evil\x1b[2J`.
 fn clean_member(path: &str) -> String {
     crate::printable(path.rsplit("!!").next().unwrap_or(path))
-}
-
-/// Render context windows (source lines or hex+ascii, per file type) for the
-/// gained trait ids, using cleave's renderer. Returns an empty string when none
-/// of the gained traits carry byte-located evidence (many structural ELF traits
-/// do not).
-///
-/// `compact` caps the number of windows for the default view; `--explain`
-/// passes `false` for the fuller set.
-pub(crate) fn render(
-    pairs: &[Pair],
-    options: &cleave::AnalysisOptions,
-    gained_ids: &HashSet<&str>,
-    compact: bool,
-) -> String {
-    if gained_ids.is_empty() {
-        return String::new();
-    }
-
-    // Candidate files across every changed file: each root plus any archive
-    // members, converted to the FileAnalysis shape `format_context` consumes.
-    // Owned, because the filtering below rewrites them in place.
-    let mut candidates: Vec<cleave::types::FileAnalysis> = Vec::new();
-    let mut target = None;
-    for pair in pairs {
-        let Some(new_path) = pair.new.as_deref() else {
-            continue;
-        };
-        let Some(mut report) = analyze(new_path, options) else {
-            continue;
-        };
-        candidates.push(report.to_file_analysis(0));
-        if target.is_none() {
-            target = Some(report.target.clone());
-        }
-        candidates.append(&mut report.files);
-    }
-    let Some(target) = target else {
-        return String::new();
-    };
-
-    // The composite legs the gained traits reference, so a gained composite
-    // still renders the component windows that justify it. Owned, so the
-    // borrow of `candidates` ends before they are rewritten below.
-    let legs: HashSet<String> = candidates
-        .iter()
-        .flat_map(|fa| &fa.findings)
-        .filter(|f| gained_ids.contains(f.id.as_str()))
-        .flat_map(|f| f.trait_refs.iter().map(|s| s.as_str().to_string()))
-        .collect();
-    let keep = |id: &str| gained_ids.contains(id) || legs.contains(id);
-
-    // Filter each candidate to the kept traits and drop those left with nothing
-    // to show. Renumber ids so `format_context`'s id→file map stays unique.
-    let mut files: Vec<cleave::types::FileAnalysis> = Vec::new();
-    for (idx, mut fa) in (0u32..).zip(candidates) {
-        fa.id = idx;
-        fa.findings.retain(|f| keep(f.id.as_str()));
-        fa.context
-            .retain(|line| line.notes.iter().any(|n| keep(n.id.as_str())));
-        if !fa.context.is_empty() {
-            files.push(fa);
-        }
-    }
-    if files.is_empty() {
-        return String::new();
-    }
-
-    let mut evidence = cleave::AnalysisReport::new(target);
-    evidence.version = "3".to_string();
-    evidence.files = files;
-
-    let opts = cleave::output::TinyOpts {
-        // We print our own verdict header; cleave renders only the body.
-        card: true,
-        // Compact (default) view: only the hit rows of the strongest gained
-        // traits, no surrounding context. `--explain` widens the net.
-        top_n: if compact { 4 } else { 24 },
-        always_crit: None,
-        min_crit: cleave::Criticality::Baseline,
-        focus_crit: compact.then_some(cleave::Criticality::Notable),
-        context_lines: Some(if compact { 0 } else { 2 }),
-        full_context: !compact,
-        // Plain code in the evidence windows — no match highlighting; the rail
-        // and the `// rule` trailer carry the emphasis instead.
-        color: false,
-        ..cleave::output::TinyOpts::terminal()
-    };
-    cleave::output::format_context(&evidence, &opts)
 }
 
 /// Concise note for the no-change case: when the diff surfaced nothing but the

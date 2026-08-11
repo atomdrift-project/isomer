@@ -62,11 +62,6 @@ struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = Color::Auto)]
     color: Color,
 
-    /// Show full hierarchical trait ids and cleave's diff ledger beneath the
-    /// verdict. Default output stays diff-terse.
-    #[arg(long, global = true)]
-    explain: bool,
-
     /// Override the detected base version (e.g. `1.2.3`), for proportionality
     /// when the input path carries no version token.
     #[arg(long, global = true, value_name = "VER")]

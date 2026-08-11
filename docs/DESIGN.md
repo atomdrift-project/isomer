@@ -242,9 +242,13 @@ Rules that keep it scannable:
 - **Substantial metrics** — the biggest relative metric movers (≥15% floor,
   top 3) render as a dim trailer on single-file diffs (`code +37%`,
   `init_array 2→1`).
-- **`--explain`** — widens the evidence set and appends cleave's full diff
-  ledger. Broken-pipe-safe (`| head` no longer panics); `--color
-  auto|always|never` controls ANSI.
+- **One view** — isomer stays silent when nothing noticeable changed and draws
+  a single, complete verdict when it speaks: masthead, capabilities, the
+  differential hunks (the root-cause code behind each gained trait), metrics,
+  and the touched-file list. No `--explain` / compact split — the proof a
+  reviewer needs is never a flag away. cleave's raw per-file ledger remains
+  available from `cleave diff` directly. Broken-pipe-safe (`| head` no longer
+  panics); `--color auto|always|never` controls ANSI.
 
 ### Header — masthead + grid (`src/fs.rs::header`)
 
@@ -452,10 +456,10 @@ lines for scripts, `📄 member` headers for archives.
  53  global["r"] = require;           // Global campaign identifier with require alias
 ```
 
-Default view is tight (top gained traits, hit rows only, focus on Notable+);
-`--explain` widens context and window count. node-ipc drills into the archive
-member `node-ipc.cjs` and surfaces the `/etc/hosts` string co-located with the
-DNS-lookup + shell-exec payload.
+The view is tight (top gained traits, hit rows only, focus on Notable+) and
+draws its evidence only from the files the diff actually changed. node-ipc
+drills into the archive member `node-ipc.cjs` and surfaces the `/etc/hosts`
+string co-located with the DNS-lookup + shell-exec payload.
 
 ### Testdata + demo
 
