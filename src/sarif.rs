@@ -371,10 +371,10 @@ mod tests {
         assert_eq!(uri("src\\a.js"), "src/a.js");
     }
 
-    /// The SARIF rule id and the `.isomer.toml` suppression id must stay the
-    /// same string: the report tells a reader what to paste.
+    /// Structural rule ids are stable strings: GitHub tracks a Security-tab
+    /// alert by rule id, so changing one silently reopens every alert.
     #[test]
-    fn structure_rule_id_matches_suppression_id() {
+    fn structure_rule_ids_are_stable() {
         assert_eq!(
             crate::rubric::structure_id("loader dependency"),
             "structure/loader-dependency"

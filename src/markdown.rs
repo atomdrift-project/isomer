@@ -3,9 +3,7 @@
 //! The reader is a reviewer looking at a diff, not an analyst at a terminal, so
 //! the body answers their questions in the order they ask them: is this bad,
 //! why, what can the code now do that it couldn't, show me, and how do I make
-//! this go away if it's wrong. The last one matters most — a security tool with
-//! no cheap suppression path gets switched off — so the report writes the
-//! `.isomer.toml` stanza for the reader to paste.
+//! this go away if it's wrong.
 //!
 //! The body carries a hidden [`MARKER`] so the action can find its own comment
 //! and edit it in place; every push updates one comment instead of spamming the
@@ -55,14 +53,12 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
     identity(&mut s, a);
     structure(&mut s, a);
     frameworks(&mut s, a);
-    // A change that passes the gate is named, not dissected: metrics, evidence,
-    // and a paste-ready suppression are for a reviewer who has to act.
+    // A change that passes the gate is named, not dissected: metrics and
+    // evidence are for a reviewer who has to act.
     if a.detailed(cli) {
         metrics(&mut s, a);
         evidence(&mut s, a);
-        suppression(&mut s, a);
     }
-    let _ = write!(s, "{}", suppressed(a));
     let _ = write!(s, "\n---\n{}\n", footer(a, cli));
 
     if s.len() > MAX_BODY {
@@ -92,8 +88,22 @@ fn heading(a: &Analysis<'_>) -> String {
             parts.push(b.describe());
         }
     }
+    if let Some(scope) = a.scope {
+        parts.push(scope.label().to_string());
+    }
     parts.extend(crate::terminal::change_scale(a.diff));
     parts.join(" · ")
+}
+
+/// The whole report for a run with nothing to say, in one line.
+///
+/// The step summary is a page a reviewer opens on purpose, and most of the time
+/// the honest content is "nothing changed behaviourally". Spending a screen on
+/// that teaches people to stop opening it, and the day it matters they will not
+/// look. So: the heading, which already carries the verdict, what was covered,
+/// and how big the change was — and nothing else.
+pub(crate) fn one_line(a: &Analysis<'_>) -> String {
+    format!("### {}\n", heading(a))
 }
 
 /// The body for a change isomer has nothing to say about. Kept short and
@@ -106,34 +116,8 @@ fn clean_body(a: &Analysis<'_>, cli: &Cli) -> String {
         format!(" across {}", scale.join(", "))
     };
     format!(
-        "No newly-introduced capabilities, known-bad signatures, or publisher drift{scope}.\n{}\n{}",
-        suppressed(a),
+        "No newly-introduced capabilities, known-bad signatures, or publisher drift{scope}.\n{}",
         footer(a, cli)
-    )
-}
-
-/// What policy withheld, named. A reviewer must be able to tell a clean run
-/// from a silenced one without opening `.isomer.toml`.
-fn suppressed(a: &Analysis<'_>) -> String {
-    let items = &a.assessment.suppressed;
-    if items.is_empty() {
-        return String::new();
-    }
-    let list: String = items
-        .iter()
-        .map(|s| {
-            format!(
-                "<li><code>{}</code> — {}</li>",
-                cell(&s.id),
-                cell(&s.describe())
-            )
-        })
-        .collect();
-    format!(
-        "\n<details>\n<summary>{} finding{} suppressed by <code>{}</code></summary>\n<ul>{list}</ul>\n</details>\n",
-        items.len(),
-        if items.len() == 1 { "" } else { "s" },
-        cell(a.policy_source()),
     )
 }
 
@@ -348,33 +332,6 @@ fn evidence(s: &mut String, a: &Analysis<'_>) {
             .collect();
         let _ = writeln!(s, "{}", fence(&body));
     }
-}
-
-/// The paste-ready suppression stanza. A false positive must cost one
-/// reviewable line of config, so the report writes the line.
-fn suppression(s: &mut String, a: &Analysis<'_>) {
-    let mut ids: Vec<&str> = Vec::new();
-    for c in &a.assessment.behavioral.categories {
-        ids.extend(c.new_ids.iter().map(String::as_str));
-    }
-    ids.extend(a.assessment.signature.ids.iter().map(|m| m.id.as_str()));
-    ids.truncate(3);
-    if ids.is_empty() {
-        return;
-    }
-    let stanzas: String = ids
-        .iter()
-        .map(|id| format!("[[allow]]\nid = \"{id}\"\nreason = \"\"   # required\n"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let _ = writeln!(
-        s,
-        "<details>\n<summary>False positive? Suppress it in <code>.isomer.toml</code></summary>\n\n\
-         {}\n\
-         An `expires = \"YYYY-MM-DD\"` field is optional; an empty `reason` is rejected, \
-         so the next reader learns why.\n</details>",
-        fence_lang(&stanzas, "toml"),
-    );
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────

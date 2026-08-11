@@ -26,7 +26,6 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 
 use crate::analysis::{self, Analysis};
-use crate::policy::Policy;
 use crate::{Cli, Format};
 
 /// Arguments to the `ci` verb.
@@ -48,7 +47,7 @@ pub(crate) struct Args {
 const MAX_BLOB: u64 = 128 << 20;
 
 /// Analyze the change this CI run is for.
-pub(crate) fn run(cli: &Cli, policy: &Policy, args: &Args) -> Result<bool> {
+pub(crate) fn run(cli: &Cli, args: &Args) -> Result<bool> {
     let repo = args.repo.as_path();
     let refs = Refs::resolve(repo, args)?;
     eprintln!(
@@ -57,7 +56,7 @@ pub(crate) fn run(cli: &Cli, policy: &Policy, args: &Args) -> Result<bool> {
         short(&refs.head)
     );
 
-    let changes = changed_files(repo, &refs, args.max_files, policy)?;
+    let changes = changed_files(repo, &refs, args.max_files)?;
     // Build outputs are judged even when no source file changed: a change to a
     // lockfile or a build script can move the artifact without moving anything
     // this diff would otherwise read.
@@ -84,21 +83,25 @@ pub(crate) fn run(cli: &Cli, policy: &Policy, args: &Args) -> Result<bool> {
         .context("creating work directory")?;
     let (old, new) = (work.path().join("base"), work.path().join("head"));
     materialize(repo, &refs, &changes, &old, &new)?;
-    // One side without the other is a workflow that half-worked — usually a
-    // build that failed on the base. Every artifact would then read as added or
-    // deleted wholesale, which is noise wearing the costume of a finding.
-    if args.base_artifacts.is_some() != args.head_artifacts.is_some() {
-        warn("only one side's build outputs were supplied; the artifact comparison needs both");
-    }
-    overlay(args.base_artifacts.as_deref(), &old, args.max_files)?;
-    overlay(args.head_artifacts.as_deref(), &new, args.max_files)?;
+    let compared = overlay_builds(
+        args.base_artifacts.as_deref(),
+        args.head_artifacts.as_deref(),
+        &old,
+        &new,
+        args.max_files,
+    )?;
 
     let options = cleave::AnalysisOptions::default();
     let report = analysis::diff(&old, &new, &options)?;
-    let mut a = Analysis::new("ci", &old, &new, &options, &report, cli, policy)?;
+    let mut a = Analysis::new("ci", &old, &new, &options, &report, cli)?;
     // `fs` names the artifact it compared; `ci` compares two states of a
     // repository, where the scratch dir the files were staged in is no name.
     a.naming.name = subject(repo);
+    a.scope = Some(if compared {
+        analysis::Scope::SourceAndBuild
+    } else {
+        analysis::Scope::Source
+    });
 
     emit(&a, cli, args.out_dir.as_deref(), &refs.base)?;
     Ok(a.clean)
@@ -106,89 +109,122 @@ pub(crate) fn run(cli: &Cli, policy: &Policy, args: &Args) -> Result<bool> {
 
 // ── build outputs ───────────────────────────────────────────────────────────
 
-/// Lay a built artifact tree over one side of the comparison.
+/// Stage both sides' build outputs into the trees about to be compared.
 ///
 /// Build outputs are not in git, so `ci` cannot materialize them from a commit
-/// the way it does source. Copying them into the tree at their repo-relative
-/// paths puts them in the same diff as the source they were built from: one
-/// analysis, one verdict, and paths the reviewer recognizes — `dist/app.js` is
-/// reported as `dist/app.js`. Nothing downstream has to know artifacts exist.
-fn overlay(from: Option<&Path>, onto: &Path, max: usize) -> Result<()> {
-    let Some(from) = from else { return Ok(()) };
-    if !from.is_dir() {
-        // The workflow asked for an artifact comparison and the artifacts are
-        // not there. An axis that silently did not run reads exactly like an
-        // axis that ran and found nothing.
-        warn(&format!(
-            "{} does not exist — build outputs were NOT compared",
-            from.display()
-        ));
-        return Ok(());
-    }
-    let mut copied = 0usize;
-    copy_tree(from, onto, &mut copied, max, 0)?;
-    if copied == 0 {
-        warn(&format!(
-            "{} is empty — build outputs were NOT compared",
-            from.display()
-        ));
-    } else {
-        eprintln!("isomer: {copied} build output(s) from {}", from.display());
-    }
-    Ok(())
-}
-
-/// Directory nesting past this is a build gone wrong, or a hostile one trying
-/// to exhaust the stack.
-const MAX_DEPTH: usize = 64;
-
-/// Copy a tree, refusing anything that would let a build output reach outside
-/// itself or outgrow the scan.
-fn copy_tree(from: &Path, onto: &Path, copied: &mut usize, max: usize, depth: usize) -> Result<()> {
-    if depth > MAX_DEPTH {
-        bail!("build outputs nest deeper than {MAX_DEPTH} directories");
-    }
-    let entries = std::fs::read_dir(from).with_context(|| format!("reading {}", from.display()))?;
-    for entry in entries {
-        let entry = entry.with_context(|| format!("reading {}", from.display()))?;
-        let kind = entry.file_type()?;
-        let dest = onto.join(entry.file_name());
-        if kind.is_symlink() {
-            // A build can emit a link pointing anywhere on the runner, and this
-            // tree's contents are quoted as evidence in a comment posted to a
-            // public pull request. Links are never followed: a scan is not
-            // worth turning into an exfiltration primitive.
-            eprintln!("isomer: skipped symlink {}", entry.path().display());
-        } else if kind.is_dir() {
-            std::fs::create_dir_all(&dest)
-                .with_context(|| format!("creating {}", dest.display()))?;
-            copy_tree(&entry.path(), &dest, copied, max, depth + 1)?;
-        } else {
-            *copied += 1;
-            if *copied > max {
-                // Same rule as the source diff: never analyze a subset and
-                // report it as the whole.
-                bail!(
-                    "build outputs exceed --max-files {max}. Point the artifact directory at what \
-                     you ship rather than the whole build tree"
-                );
-            }
-            if entry.metadata()?.len() > MAX_BLOB {
-                eprintln!(
-                    "isomer: skipped {} — larger than {} MiB",
-                    entry.path().display(),
-                    MAX_BLOB >> 20
-                );
-                continue;
-            }
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            std::fs::copy(entry.path(), &dest)
-                .with_context(|| format!("copying {}", entry.path().display()))?;
+/// the way it does source. Copying them in at their repo-relative paths puts
+/// them in the same diff as the source they were built from: one analysis, one
+/// verdict, and paths the reviewer recognizes.
+///
+/// Files are paired first. A bundler rewrites `main.4f2a1b9c.js` to
+/// `main.d4e5f60a.js` on every build and a release bumps `libssl.so.1.1` to
+/// `libssl.so.3`; compared by name, the old artifact vanished and an unrelated
+/// one appeared, so everything it could do would read as newly gained — on
+/// every change, forever. A paired file is staged under one name so the two
+/// versions are diffed against each other instead.
+///
+/// Returns whether outputs actually landed — not whether the caller asked for
+/// them. A directory that was missing or empty leaves the artifact axis unrun,
+/// and the report has to say `source only` rather than claim a comparison it
+/// never made.
+fn overlay_builds(
+    base: Option<&Path>,
+    head: Option<&Path>,
+    old: &Path,
+    new: &Path,
+    max: usize,
+) -> Result<bool> {
+    let (Some(base), Some(head)) = (base, head) else {
+        // One side without the other is a workflow that half-worked, usually a
+        // build that failed. Every artifact would read as added or deleted
+        // wholesale, which is noise wearing the costume of a finding.
+        if base.is_some() || head.is_some() {
+            warn("only one side's build outputs were supplied; the comparison needs both");
+        }
+        return Ok(false);
+    };
+    for dir in [base, head] {
+        if !dir.is_dir() {
+            // The workflow asked for a comparison and the artifacts are not
+            // there. An axis that silently did not run reads exactly like an
+            // axis that ran and found nothing.
+            warn(&format!(
+                "{} does not exist — build outputs were NOT compared",
+                dir.display()
+            ));
+            return Ok(false);
         }
     }
+
+    let base_files =
+        crate::rename::list(base).with_context(|| format!("reading {}", base.display()))?;
+    let head_files =
+        crate::rename::list(head).with_context(|| format!("reading {}", head.display()))?;
+    if base_files.is_empty() || head_files.is_empty() {
+        warn("build output directories are empty — build outputs were NOT compared");
+        return Ok(false);
+    }
+    if base_files.len() + head_files.len() > max {
+        // Same rule as the source diff: never analyze a subset and report it as
+        // the whole.
+        bail!(
+            "build outputs exceed --max-files {max}. Point the artifact directories at what \
+             you ship rather than the whole build tree"
+        );
+    }
+
+    // Paired files share the head's name, because that is the one that exists
+    // going forward and the one a reviewer will look for.
+    let pairs = crate::rename::pair(&base_files, &head_files);
+    let mut staged_as: Vec<Option<&str>> = vec![None; base_files.len()];
+    let mut renamed = 0usize;
+    for &(b, h) in &pairs {
+        staged_as[b] = Some(head_files[h].as_str());
+        if base_files[b] != head_files[h] {
+            renamed += 1;
+        }
+    }
+
+    for (i, rel) in base_files.iter().enumerate() {
+        let dest = staged_as[i].unwrap_or(rel.as_str());
+        stage(&base.join(rel), &old.join(dest))?;
+    }
+    for rel in &head_files {
+        stage(&head.join(rel), &new.join(rel))?;
+    }
+
+    eprintln!(
+        "isomer: {} build output(s) from {}, {} from {}{}",
+        base_files.len(),
+        base.display(),
+        head_files.len(),
+        head.display(),
+        match renamed {
+            0 => String::new(),
+            n => format!(" ({n} renamed)"),
+        }
+    );
+    Ok(true)
+}
+
+/// Copy one build output into the tree, bounded the way an extracted blob is.
+fn stage(src: &Path, dest: &Path) -> Result<()> {
+    let size = std::fs::metadata(src)
+        .with_context(|| format!("reading {}", src.display()))?
+        .len();
+    if size > MAX_BLOB {
+        eprintln!(
+            "isomer: skipped {} — larger than {} MiB",
+            src.display(),
+            MAX_BLOB >> 20
+        );
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::copy(src, dest).with_context(|| format!("copying {}", src.display()))?;
     Ok(())
 }
 
@@ -358,74 +394,96 @@ fn is_null_sha(s: &str) -> bool {
 
 /// One changed path and which sides of the comparison it exists on.
 struct Change {
-    path: PathBuf,
-    /// Present in the base commit (i.e. not added by this change).
-    in_base: bool,
-    /// Present in the head commit (i.e. not deleted by this change).
-    in_head: bool,
+    /// Where the file lives in the base commit; `None` when this change adds it.
+    base: Option<PathBuf>,
+    /// Where it lives in the head commit; `None` when this change deletes it.
+    head: Option<PathBuf>,
+}
+
+impl Change {
+    /// The single path both sides are staged under. A rename stages the base
+    /// blob beside its head name, so the comparison sees one file that changed
+    /// rather than one that vanished and another that appeared.
+    fn staged(&self) -> &Path {
+        // `git diff` never reports a change with neither side.
+        self.head
+            .as_deref()
+            .or(self.base.as_deref())
+            .unwrap_or(Path::new(""))
+    }
 }
 
 /// The paths this change touches, from the fork point to head.
 ///
-/// Rename detection is off on purpose: to isomer a rename *is* a delete plus an
-/// add, and the added path is what needs analyzing.
-fn changed_files(repo: &Path, refs: &Refs, max: usize, policy: &Policy) -> Result<Vec<Change>> {
+/// Rename detection is on. Without it a moved file is a delete plus an add, and
+/// everything the added path can do reads as newly introduced — so renaming a
+/// vendored library is indistinguishable from vendoring a hostile one. git
+/// resolves this far more cheaply than we could: identical blobs match by hash,
+/// and `diff.renameLimit` already bounds the similarity search.
+fn changed_files(repo: &Path, refs: &Refs, max: usize) -> Result<Vec<Change>> {
     let out = git(
         repo,
         &[
             "diff",
-            "--no-renames",
+            "--find-renames",
             "--name-status",
             "-z",
             &refs.base,
             &refs.head,
         ],
     )?;
-    // `-z` frames the listing as `status\0path\0…`, so a path containing a
-    // newline — or anything else a line-based parser would split on — cannot
-    // hide a file from the scan.
+    parse_name_status(&out, max)
+}
+
+/// Parse `git diff --name-status -z`.
+///
+/// Split out so the framing can be tested without a repository — it is the one
+/// place a miscount silently drops a file from the scan.
+///
+/// `-z` frames the listing as `status\0path\0…`, so a path containing a
+/// newline — or anything else a line-based parser would split on — cannot hide
+/// a file. `R` and `C` are the exception: they carry the old name *and* the new
+/// one, so a parser that reads one path per status walks out of step and
+/// misreads every entry after the first rename.
+fn parse_name_status(out: &[u8], max: usize) -> Result<Vec<Change>> {
     let mut fields = out.split(|b| *b == 0).filter(|f| !f.is_empty());
     let mut changes = Vec::new();
-    let mut excluded = 0usize;
-    while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
-        let path = os_path(path);
+    while let Some(status) = fields.next() {
+        let kind = status.first().copied().unwrap_or(b'M');
+        let Some(first) = fields.next() else { break };
+        let (from, to) = if matches!(kind, b'R' | b'C') {
+            let Some(second) = fields.next() else { break };
+            (os_path(first), os_path(second))
+        } else {
+            let p = os_path(first);
+            (p.clone(), p)
+        };
         // Every path is about to be joined onto a scratch root and written to.
         // `Path::join` *replaces* the root when handed an absolute path, and a
         // `..` component walks out of it, so a listing that is not strictly
         // repo-relative is refused rather than materialized somewhere else.
         // git cannot produce either, which is exactly why seeing one means the
         // listing is not what we think it is.
-        if !is_contained(&path) {
-            bail!(
-                "refusing to materialize `{}`: a changed path must be relative and free of `..`",
-                crate::printable(&path.to_string_lossy()),
-            );
+        for path in [&from, &to] {
+            if !is_contained(path) {
+                bail!(
+                    "refusing to materialize `{}`: a changed path must be relative and free of `..`",
+                    crate::printable(&path.to_string_lossy()),
+                );
+            }
         }
-        if policy.excludes(&path.to_string_lossy()) {
-            excluded += 1;
-            continue;
-        }
-        let status = status.first().copied().unwrap_or(b'M');
         changes.push(Change {
-            path,
-            in_base: status != b'A',
-            in_head: status != b'D',
+            base: (kind != b'A').then_some(from),
+            head: (kind != b'D').then_some(to),
         });
-    }
-    if excluded > 0 {
-        eprintln!(
-            "isomer: {excluded} file(s) excluded by {}",
-            crate::policy::FILE
-        );
     }
     if changes.len() > max {
         // Never silently analyze a subset: a scanner that quietly skips files
         // reports "clean" for a change it did not read.
         bail!(
             "{} changed files exceeds --max-files {max}. Raise the limit or narrow the scan \
-             with `exclude` in {}",
+             with the action's `working-directory`",
             changes.len(),
-            crate::policy::FILE,
         );
     }
     Ok(changes)
@@ -435,11 +493,12 @@ fn changed_files(repo: &Path, refs: &Refs, max: usize, policy: &Policy) -> Resul
 /// the repository layout.
 fn materialize(repo: &Path, refs: &Refs, changes: &[Change], old: &Path, new: &Path) -> Result<()> {
     for change in changes {
-        if change.in_base {
-            extract(repo, &refs.base, &change.path, &old.join(&change.path))?;
+        let staged = change.staged();
+        if let Some(from) = &change.base {
+            extract(repo, &refs.base, from, &old.join(staged))?;
         }
-        if change.in_head {
-            extract(repo, &refs.head, &change.path, &new.join(&change.path))?;
+        if let Some(to) = &change.head {
+            extract(repo, &refs.head, to, &new.join(staged))?;
         }
     }
     // cleave needs both roots to exist even when a change is all additions or
@@ -528,7 +587,14 @@ fn emit(a: &Analysis<'_>, cli: &Cli, out_dir: Option<&Path>, base: &str) -> Resu
     // The step summary is the one GitHub surface that works without any
     // permission at all — including on a fork's read-only token — so the full
     // report goes there even when the comment and SARIF upload cannot happen.
-    summary(&markdown);
+    //
+    // Which is exactly why a clean run must not spend it. One line when there
+    // is nothing to report; everything when there is.
+    if a.clean {
+        summary(&crate::markdown::one_line(a));
+    } else {
+        summary(&markdown);
+    }
 
     let verdict = crate::terminal::verdict_word(a.verdict);
     let findings = a.assessment.behavioral.categories.len()
@@ -541,7 +607,6 @@ fn emit(a: &Analysis<'_>, cli: &Cli, out_dir: Option<&Path>, base: &str) -> Resu
         ("new-severity", a.new_verdict.as_str()),
         ("fail", if a.clean { "false" } else { "true" }),
         ("findings", &findings.to_string()),
-        ("suppressed", &a.assessment.suppressed.len().to_string()),
         // The fork point, not the base branch tip — so a workflow that builds
         // this commit to produce `--base-artifacts` measures both halves of the
         // report from the same place.
@@ -703,6 +768,52 @@ mod tests {
         assert!(!is_contained(Path::new("/etc/passwd")));
         assert!(!is_contained(Path::new("../../etc/passwd")));
         assert!(!is_contained(Path::new("a/../../b")));
+    }
+
+    /// `R`/`C` carry two paths. A parser that assumes one per status reads the
+    /// *new* name as the next status byte and misreads everything after it, so
+    /// a single rename would corrupt the rest of the listing.
+    #[test]
+    fn rename_entries_carry_both_paths_without_desynchronizing() {
+        let out = b"M\0src/a.js\0R100\0vendor/old.js\0vendor/new.js\0A\0src/b.js\0D\0src/c.js\0";
+        let c = parse_name_status(out, 100).expect("parses");
+        assert_eq!(c.len(), 4, "a rename must not swallow the entries after it");
+
+        assert_eq!(c[0].base.as_deref(), Some(Path::new("src/a.js")));
+        assert_eq!(c[0].head.as_deref(), Some(Path::new("src/a.js")));
+
+        // The rename: both sides present, under different names, staged as one.
+        assert_eq!(c[1].base.as_deref(), Some(Path::new("vendor/old.js")));
+        assert_eq!(c[1].head.as_deref(), Some(Path::new("vendor/new.js")));
+        assert_eq!(c[1].staged(), Path::new("vendor/new.js"));
+
+        // An addition has no base side, a deletion no head side.
+        assert_eq!(c[2].base, None);
+        assert_eq!(c[2].staged(), Path::new("src/b.js"));
+        assert_eq!(c[3].head, None);
+        assert_eq!(c[3].staged(), Path::new("src/c.js"));
+    }
+
+    #[test]
+    fn a_truncated_listing_does_not_invent_a_change() {
+        // A rename whose second path never arrived must be dropped, not paired
+        // with whatever follows.
+        let c = parse_name_status(b"R100\0only/one.js\0", 100).expect("parses");
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn an_escaping_path_is_refused_on_either_side() {
+        for out in [
+            b"M\0../outside.js\0".as_slice(),
+            b"R100\0../outside.js\0inside.js\0".as_slice(),
+            b"R100\0inside.js\0../outside.js\0".as_slice(),
+        ] {
+            assert!(
+                parse_name_status(out, 100).is_err(),
+                "a path leaving the scratch root must be refused"
+            );
+        }
     }
 
     #[test]

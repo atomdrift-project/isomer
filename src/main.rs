@@ -23,7 +23,7 @@ mod fs;
 mod json;
 mod llm;
 mod markdown;
-mod policy;
+mod rename;
 mod risk;
 mod rubric;
 mod sarif;
@@ -66,11 +66,6 @@ struct Cli {
     /// verdict. Default output stays diff-terse.
     #[arg(long, global = true)]
     explain: bool,
-
-    /// Suppression policy file. Defaults to `.isomer.toml` in the working
-    /// directory when present; a path given here must exist.
-    #[arg(long, global = true, value_name = "PATH")]
-    config: Option<std::path::PathBuf>,
 
     /// Override the detected base version (e.g. `1.2.3`), for proportionality
     /// when the input path carries no version token.
@@ -342,9 +337,6 @@ pub(crate) fn write_stdout(s: &str) -> anyhow::Result<()> {
 
 /// Runs the selected verb; returns whether the delta is clean at `--fail-on`.
 fn run(cli: &Cli) -> anyhow::Result<bool> {
-    // Loaded once, up front: a malformed policy is an operational error, and
-    // the run should fail on it before doing any expensive analysis.
-    let policy = policy::Policy::load(cli.config.as_deref(), chrono::Utc::now().date_naive())?;
     match &cli.command {
         Command::Ci {
             base,
@@ -356,7 +348,6 @@ fn run(cli: &Cli) -> anyhow::Result<bool> {
             head_artifacts,
         } => ci::run(
             cli,
-            &policy,
             &ci::Args {
                 base: base.clone(),
                 head: head.clone(),
@@ -367,16 +358,12 @@ fn run(cli: &Cli) -> anyhow::Result<bool> {
                 head_artifacts: head_artifacts.clone(),
             },
         ),
-        Command::Fs { old, new } => fs::run(Path::new(old), Path::new(new), cli, &policy),
+        Command::Fs { old, new } => fs::run(Path::new(old), Path::new(new), cli),
         Command::Git { .. } => anyhow::bail!("`isomer git` is not implemented yet"),
-        Command::Purl { old, new } => fetch::compare("purl", old, new, cli, &policy),
-        Command::Oci { old, new } => fetch::compare(
-            "oci",
-            &fetch::oci_purl(old),
-            &fetch::oci_purl(new),
-            cli,
-            &policy,
-        ),
+        Command::Purl { old, new } => fetch::compare("purl", old, new, cli),
+        Command::Oci { old, new } => {
+            fetch::compare("oci", &fetch::oci_purl(old), &fetch::oci_purl(new), cli)
+        }
     }
 }
 

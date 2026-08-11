@@ -32,9 +32,6 @@ pub(crate) struct Assessment {
     pub signature: Signature,
     pub identity: Identity,
     pub structure: Structure,
-    /// Findings withheld by `.isomer.toml`, deduplicated. Reported so a
-    /// suppressed run never looks the same as a clean one.
-    pub suppressed: Vec<crate::policy::Suppressed>,
 }
 
 /// Behavioral capability drift, grouped by *capability class* (execution-hijack,
@@ -200,23 +197,14 @@ pub(crate) struct StructFact {
 
 /// Judge a whole diff report. `base_classes` is the set of capability classes
 /// present in the *old* version, used to tell a wholly new capability class
-/// from one that merely gained a trait. `policy` withholds findings the repo
-/// has reviewed and accepted.
-pub(crate) fn assess(
-    diff: &DiffReportV1,
-    base_classes: &HashSet<String>,
-    policy: &crate::policy::Policy,
-) -> Assessment {
+/// from one that merely gained a trait.
+pub(crate) fn assess(diff: &DiffReportV1, base_classes: &HashSet<String>) -> Assessment {
     let mut groups: HashMap<String, Category> = HashMap::new();
     let mut sig_ids: Vec<SigMatch> = Vec::new();
     let mut cve: Option<String> = None;
     let mut identity_changes: Vec<IdentityChange> = Vec::new();
-    let mut suppressed: Vec<crate::policy::Suppressed> = Vec::new();
 
     for file in &diff.files {
-        if policy.excludes(&file.path) {
-            continue;
-        }
         // Identity *drift* needs a previous identity to drift from. A file the
         // change adds has none, so cleave reports `absent → <author>` — true,
         // but not a publisher change: committing a first `package.json` would
@@ -227,19 +215,12 @@ pub(crate) fn assess(
             .filter(|i| i.changed)
             .filter(|_| !matches!(file.status, cleave::types::FileStatus::Added))
         {
-            let changes = meaningful_identity_changes(idd.old.as_ref(), idd.new.as_ref());
-            match policy.allows(IDENTITY_ID, &file.path) {
-                // Nothing to withhold means nothing to report as withheld.
-                Some(s) if !changes.is_empty() => suppressed.push(s),
-                Some(_) => {}
-                None => identity_changes.extend(changes),
-            }
+            identity_changes.extend(meaningful_identity_changes(
+                idd.old.as_ref(),
+                idd.new.as_ref(),
+            ));
         }
         for (is_new, tc) in gained_traits(file) {
-            if let Some(s) = policy.allows(&tc.id, &file.path) {
-                suppressed.push(s);
-                continue;
-            }
             // Component atoms are the building blocks composites are assembled
             // from, not findings: `arithmetic-sub-density` exists so that
             // `js-arithmetic-array-init` can require density *and* volume
@@ -333,15 +314,12 @@ pub(crate) fn assess(
         Severity::High
     };
 
-    let structure = structural_facts(diff, policy, &mut suppressed);
+    let structure = structural_facts(diff);
     let structure_sev = structure.severity;
 
     // One line per accepted risk, however many files it covered.
-    suppressed.sort_by(|a, b| a.id.cmp(&b.id).then(a.reason.cmp(&b.reason)));
-    suppressed.dedup_by(|a, b| a.id == b.id && a.reason == b.reason);
 
     Assessment {
-        suppressed,
         severity: behavioral_sev
             .max(signature_sev)
             .max(identity_sev)
@@ -367,11 +345,7 @@ pub(crate) fn assess(
 /// Structural anomalies from the changed files' kv scope. Every fact is an
 /// *added* kv entry, so it is inherently new — a fresh dependency, ifunc, or
 /// import that was absent from the base version.
-fn structural_facts(
-    diff: &DiffReportV1,
-    policy: &crate::policy::Policy,
-    suppressed: &mut Vec<crate::policy::Suppressed>,
-) -> Structure {
+fn structural_facts(diff: &DiffReportV1) -> Structure {
     let (mut deps, mut ifuncs, mut dynsyms): (Vec<String>, Vec<String>, Vec<String>) =
         (Vec::new(), Vec::new(), Vec::new());
     // Newly-declared source-package runtime dependencies (npm `dependencies`,
@@ -389,9 +363,6 @@ fn structural_facts(
     let (mut entropy_new, mut entropy_became): (Vec<String>, Vec<String>) =
         (Vec::new(), Vec::new());
     for file in &diff.files {
-        if policy.excludes(&file.path) {
-            continue;
-        }
         if let Some(kv) = file.scopes.kv.as_ref() {
             for k in &kv.added {
                 let p = &k.path;
@@ -486,12 +457,6 @@ fn structural_facts(
     let mut facts = Vec::new();
     let mut push = |severity: Severity, kind: FactKind, label: &'static str, names: &[String]| {
         if names.is_empty() {
-            return;
-        }
-        // Structural facts are aggregated across the whole change, so they
-        // carry no single path — a path-scoped `[[allow]]` cannot match one.
-        if let Some(s) = policy.allows(&structure_id(label), "") {
-            suppressed.push(s);
             return;
         }
         facts.push(StructFact {
@@ -868,13 +833,9 @@ fn humanize(class: &str) -> String {
     }
 }
 
-/// The suppression id for publisher drift. Identity changes have no trait id
-/// of their own, but `.isomer.toml` must still be able to accept one.
-pub(crate) const IDENTITY_ID: &str = "identity";
-
-/// The suppression id for a structural fact, e.g. `structure/loader-dependency`.
-/// Shared with the SARIF rule ids, so what a report calls a finding is exactly
-/// what `.isomer.toml` calls it.
+/// The stable id for a structural fact, e.g. `structure/loader-dependency`.
+/// This is the SARIF rule id, so a Security-tab alert keeps the same identity
+/// across runs and can be tracked or dismissed there.
 pub(crate) fn structure_id(label: &str) -> String {
     format!("structure/{}", slug(label))
 }

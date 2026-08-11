@@ -8,7 +8,12 @@ BINARY = isomer
 # cleave) don't inherit a malformed MAKEFLAGS. Mirrors scan's Makefile.
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: all build release install lint fix test demo install-precommit clean help
+.PHONY: all build release install lint fix test demo validate-samples install-precommit clean help
+
+# Trait set the sample audit judges with. Defaults to the working-tree
+# traits-dev beside this repo when present, so the audit tracks trait edits;
+# override CLEAVE_TRAITS_DIR to point elsewhere (or leave unset for bundled).
+TRAITS_DIR ?= $(if $(wildcard ../traits-dev/.),../traits-dev,)
 
 all: build
 
@@ -46,6 +51,15 @@ test:
 demo: release
 	@sh scripts/demo.sh "./target/release/$(BINARY)"
 
+# Self-audit against the supply-chain corpus: for every attack, before->during
+# must be detected, and during->after / before->after must not. Prints a
+# violations report and exits non-zero on any miss or false positive. Point at
+# the corpus with ISOMER_SAMPLES_DIR (default ~/src/supplychain-attack-data);
+# it skips cleanly (exit 2) when the corpus is absent.
+validate-samples: release
+	@CLEAVE_TRAITS_DIR="$(TRAITS_DIR)" \
+		python3 scripts/validate-samples.py --isomer "./target/release/$(BINARY)"
+
 # Install the pre-commit gate (no [patch] path overrides + make lint + make
 # test). Bypass an individual commit with `git commit --no-verify`.
 install-precommit:
@@ -65,5 +79,6 @@ help:
 	@echo "  fix       auto-fix clippy + rustfmt"
 	@echo "  test      run the test suite"
 	@echo "  demo      detect every bundled supply-chain case, narrated"
+	@echo "  validate-samples  audit before/during/after corpus for misses + false positives"
 	@echo "  install-precommit  gate commits on lint + test"
 	@echo "  clean     cargo clean"

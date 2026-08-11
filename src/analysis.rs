@@ -35,6 +35,29 @@ pub(crate) fn diff(
     )
 }
 
+/// How much of a change a run actually looked at.
+///
+/// Reported so a reader never has to assume. A pull request whose base build
+/// failed still produces a verdict — but only over the source, and a report
+/// that did not say so would read exactly like one that compared both builds
+/// and found nothing wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// The committed change, and nothing built from it.
+    Source,
+    /// The committed change plus the build outputs of both sides.
+    SourceAndBuild,
+}
+
+impl Scope {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Source => "source only",
+            Self::SourceAndBuild => "source + build output",
+        }
+    }
+}
+
 /// One file's two sides, named the way a reader should see it.
 ///
 /// A comparison is a *set* of these: `fs` on two files has one, `ci` on a pull
@@ -55,12 +78,7 @@ impl Pair {
     /// Pairs for a two-root comparison: the roots themselves when both sides
     /// are single files (cleave pairs them by canonical root, whatever they
     /// are named), otherwise one pair per file the diff reports as touched.
-    fn from_roots(
-        old: &Path,
-        new: &Path,
-        diff: &DiffReportV1,
-        policy: &crate::policy::Policy,
-    ) -> Vec<Self> {
+    fn from_roots(old: &Path, new: &Path, diff: &DiffReportV1) -> Vec<Self> {
         if old.is_file() && new.is_file() {
             return vec![Self {
                 label: basename(new),
@@ -71,7 +89,6 @@ impl Pair {
         diff.files
             .iter()
             .filter(|f| !matches!(f.status, cleave::types::FileStatus::Unchanged))
-            .filter(|f| !policy.excludes(&f.path))
             // Archive members are decomposed by the analysis of their
             // container, which has its own pair; pairing them again would
             // double-count and point at paths that don't exist on disk.
@@ -185,13 +202,14 @@ pub(crate) struct Analysis<'a> {
     pub clean: bool,
     /// Optional `--llm` read of the change.
     pub interp: Option<crate::llm::Interpretation>,
+    /// What the comparison actually covered. A verb fills this in when it
+    /// knows; `None` means the surface has nothing useful to say about scope
+    /// (`fs` compares two paths the caller named, so "source" would be a lie).
+    pub scope: Option<Scope>,
     /// Profiles of the dependencies this change added — what each can do,
     /// attributed to the dependency. Empty unless `--deps` was requested; a
     /// verb fills it after construction, since it is a separate network step.
     pub deps: Vec<crate::deps::DepProfile>,
-    /// The policy file that was actually loaded, if any — reports name it so
-    /// `--config ours.toml` is never reported as `.isomer.toml`.
-    policy_file: Option<String>,
     /// Evidence hunks, ranked strongest-first, computed on first use.
     ///
     /// Collecting them re-analyzes every changed file, and `ci` renders four
@@ -239,20 +257,19 @@ impl<'a> Analysis<'a> {
         options: &'a cleave::AnalysisOptions,
         report: &'a AnalysisReport,
         cli: &Cli,
-        policy: &crate::policy::Policy,
     ) -> Result<Self> {
         let diff = report
             .diff
             .as_ref()
             .context("diff_paths returned a report without a diff")?;
 
-        let pairs = Pair::from_roots(old, new, diff, policy);
+        let pairs = Pair::from_roots(old, new, diff);
 
         // One walk over both sides: the base's capability classes (so a wholly
         // new class is distinguishable from one that merely gained a trait)
         // and the ATT&CK / MBC annotations each side carries.
         let survey = crate::evidence::survey(&pairs, options);
-        let assessment = crate::rubric::assess(diff, &survey.base_classes, policy);
+        let assessment = crate::rubric::assess(diff, &survey.base_classes);
         let naming = Naming::resolve(old, new, cli);
         let prop = Proportionality::eval(&assessment, &naming, diff);
 
@@ -293,8 +310,8 @@ impl<'a> Analysis<'a> {
             gated,
             clean: !gated.fails(cli.fail_on),
             interp: None,
+            scope: None,
             deps: Vec::new(),
-            policy_file: policy.source.as_ref().map(|p| p.display().to_string()),
             hunks: OnceCell::new(),
             source_changes: OnceCell::new(),
         };
@@ -390,11 +407,6 @@ impl<'a> Analysis<'a> {
                 if n == 1 { "" } else { "s" },
             ),
         }
-    }
-
-    /// The policy file suppressions came from, for the report.
-    pub(crate) fn policy_source(&self) -> &str {
-        self.policy_file.as_deref().unwrap_or(crate::policy::FILE)
     }
 
     /// The strongest `limit` evidence hunks behind the verdict, in file order.

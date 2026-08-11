@@ -2727,7 +2727,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "atomdrift-scan",
- "chrono",
  "clap",
  "cleave 2.6.0 (git+https://github.com/atomdrift-project/cleave.git?rev=6393436e5542c33fcbe95112ec2ab71aae0ecf3b)",
  "colored",
@@ -2735,7 +2734,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]

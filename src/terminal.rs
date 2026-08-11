@@ -72,25 +72,6 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
     if !a.deps.is_empty() {
         out.push_str(&dependencies_section(&a.deps));
     }
-    // Accepted risk is still risk: a run that withheld findings must not read
-    // as one that found none.
-    if !a.assessment.suppressed.is_empty() {
-        let _ = writeln!(
-            out,
-            "\n {}  {}",
-            pill_cell("suppressed", PILL_SLATE).trim_end(),
-            format!("{} by {}", a.assessment.suppressed.len(), a.policy_source())
-                .truecolor(102, 117, 127),
-        );
-        for s in &a.assessment.suppressed {
-            let _ = writeln!(
-                out,
-                "   {}  {}",
-                s.id.as_str().truecolor(150, 160, 168),
-                s.describe().truecolor(102, 117, 127),
-            );
-        }
-    }
     if cli.explain {
         if !out.is_empty() {
             out.push('\n');

@@ -16,19 +16,12 @@ use anyhow::{Context, Result};
 use tempfile::TempDir;
 
 use crate::analysis::{self, Analysis};
-use crate::policy::Policy;
 use crate::{Cli, Format};
 
 /// Fetch two published versions of one artifact and judge the delta between
 /// them, exactly as `fs` judges two local trees. `verb` names the surface
 /// (`purl` / `oci`) in the report.
-pub(crate) fn compare(
-    verb: &'static str,
-    old: &str,
-    new: &str,
-    cli: &Cli,
-    policy: &Policy,
-) -> Result<bool> {
+pub(crate) fn compare(verb: &'static str, old: &str, new: &str, cli: &Cli) -> Result<bool> {
     if cli.offline {
         anyhow::bail!("`isomer {verb}` fetches from a registry; not available under --offline");
     }
@@ -44,7 +37,7 @@ pub(crate) fn compare(
 
     let options = cleave::AnalysisOptions::default();
     let report = analysis::diff(&old_path, &new_path, &options)?;
-    let mut a = Analysis::new(verb, &old_path, &new_path, &options, &report, cli, policy)?;
+    let mut a = Analysis::new(verb, &old_path, &new_path, &options, &report, cli)?;
     if cli.deps {
         a.deps = crate::deps::profiles(a.diff, &options, progress);
     }
