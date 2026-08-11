@@ -1,0 +1,20 @@
+# Cross-compilation images for the musl release targets.
+#
+# Ubuntu's musl-tools ships only musl-gcc (C). `unrar_sys` — reached through
+# cleave — compiles C++ and asks for `<target>-linux-musl-g++`, which Debian and
+# Ubuntu do not package at all. cross-rs's musl images are musl-cross-make built
+# with C++ support, so they have it.
+#
+# Images are pinned by manifest digest, not by tag: `cross` pulls a third-party
+# container that ends up producing a binary this action's users execute in CI.
+# A tag can be repointed; a digest cannot. Updating one is therefore a visible
+# supply-chain change in this file's diff.
+#
+# These digests are the ones ../scan already builds and ships from — same
+# dependency graph, same images, reviewed once.
+
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:77db671d8356a64ae72a3e1415e63f547f26d374fbe3c4762c1cd36c7eac7b99"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4"

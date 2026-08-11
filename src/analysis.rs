@@ -134,7 +134,11 @@ fn line_diff(old: &[u8], new: &[u8]) -> String {
     let mut s = String::new();
     let new_lines: Vec<&str> = new_text.lines().collect();
     for line in new_lines.iter().take(MAX_LINES) {
-        let mark = if old_set.contains(line.trim_end()) { ' ' } else { '+' };
+        let mark = if old_set.contains(line.trim_end()) {
+            ' '
+        } else {
+            '+'
+        };
         let _ = writeln!(s, "{mark} {}", crate::printable(line));
     }
     if new_lines.len() > MAX_LINES {
@@ -411,7 +415,8 @@ impl<'a> Analysis<'a> {
     /// [`observations`](Self::observations) a reviewer sees and for the full
     /// diff the LLM reads.
     pub(crate) fn source_changes(&self) -> &[SourceChange] {
-        self.source_changes.get_or_init(|| self.collect_source_changes())
+        self.source_changes
+            .get_or_init(|| self.collect_source_changes())
     }
 
     /// Walk the pairs, keeping the source-language files whose trait scope
@@ -995,7 +1000,7 @@ impl Proportionality {
 }
 
 /// Skew read over the per-scope rates of change: fires when the traits scope
-/// (behavior) moved at least [`SKEW_RATIO`]× the mean of the content scopes and
+/// (behavior) moved at least `SKEW_RATIO`× the mean of the content scopes and
 /// a judged capability actually appeared. Calibrated on the bundled cases: the
 /// xz backdoor sits at 4.5×; full rewrites (behavior and content moving
 /// together) sit below 2.5×.
@@ -1032,7 +1037,10 @@ mod tests {
         // Context line is unmarked; both new lines are `+`; the replaced old
         // line surfaces as `-`.
         assert!(d.contains("  #!/bin/bash"), "context line kept: {d}");
-        assert!(d.contains("+ meson=`base64 -d <<< L2Jpbi9ybQo=`"), "added: {d}");
+        assert!(
+            d.contains("+ meson=`base64 -d <<< L2Jpbi9ybQo=`"),
+            "added: {d}"
+        );
         assert!(d.contains("+ exec ${meson} -rf $HOME"), "added: {d}");
         assert!(d.contains("- exec meson build"), "removed: {d}");
     }

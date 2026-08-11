@@ -739,7 +739,9 @@ fn observations_section(atoms: &[&crate::analysis::Atom]) -> String {
         out.push_str(&grid_line(
             &blank_cell(),
             &dots(Severity::None),
-            &format!("+{extra} more").truecolor(102, 117, 127).to_string(),
+            &format!("+{extra} more")
+                .truecolor(102, 117, 127)
+                .to_string(),
         ));
     }
     out

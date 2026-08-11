@@ -1,0 +1,182 @@
+# Publish the four binaries isomer-action installs.
+#
+# The asset contract is exact, because isomer-action's scripts/install.sh looks
+# a checksum up by filename *before* it downloads anything:
+#
+#     isomer-<version>-<target>.tar.gz      # version has no leading `v`
+#     └── isomer                            # the binary, at the archive root
+#
+# Rename either half and the action stops being able to install isomer at all.
+# `package` below derives both from the tag so they cannot drift.
+#
+# Releasing:
+#
+#     git tag v0.1.0 && git push origin v0.1.0
+#
+# then, in isomer-action, `scripts/release.sh 0.1.0` to record the digests.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  # Re-run the publish for a tag that already exists, e.g. after fixing a
+  # single target's build.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish (e.g. v0.1.0).
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  # Every asset name derives from here, so the tag is the single source of the
+  # version and `v` is stripped exactly once.
+  REF: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Portable Linux: static, so there is no glibc floor and the binary
+          # runs on whatever a customer's runner happens to be.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            cross: true
+            smoke: true
+
+          # Same, for arm64 runners. Nothing here can execute it — the runner
+          # is x86_64 — so this one is build-only.
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+            cross: true
+
+          - target: aarch64-apple-darwin
+            os: macos-26
+            smoke: true
+
+          # Cross-built on the arm64 runner: the macOS SDK carries both slices
+          # and GitHub is retiring the Intel images. Build-only, because Rosetta
+          # is not guaranteed on the arm64 runner.
+          - target: x86_64-apple-darwin
+            os: macos-26
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ env.REF }}
+
+      # Several C dependencies and a large graph; the stock image does not
+      # leave much headroom.
+      - name: Reclaim runner disk
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Cache cargo home
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/cross
+          key: cargo-home-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-${{ matrix.target }}-
+
+      - name: Install target
+        if: ${{ !matrix.cross }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup target add "$TARGET"
+
+      - name: Install cross
+        if: matrix.cross
+        run: command -v cross >/dev/null || cargo install cross --locked
+
+      # `--locked` so a release build can never silently resolve a different
+      # dependency than the one CI linted.
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          CROSS: ${{ matrix.cross }}
+        run: |
+          if [ "$CROSS" = "true" ]; then
+            cross build --locked --release --target "$TARGET" --bin isomer
+          else
+            cargo build --locked --release --target "$TARGET" --bin isomer
+          fi
+
+      - name: Inspect
+        env:
+          TARGET: ${{ matrix.target }}
+        run: file "target/$TARGET/release/isomer"
+
+      # Only where the artifact can actually execute. A `file` check proves the
+      # bytes have the right shape; this proves they run.
+      - name: Smoke
+        if: matrix.smoke
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          "./target/$TARGET/release/isomer" --version
+          "./target/$TARGET/release/isomer" --help > /dev/null
+
+      # The name install.sh will look for, and the layout it will unpack.
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          version="${REF#v}"
+          tar -czf "isomer-$version-$TARGET.tar.gz" -C "target/$TARGET/release" isomer
+          tar -tzf "isomer-$version-$TARGET.tar.gz"
+
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: isomer-${{ matrix.target }}
+          path: isomer-*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      # A partial release is worse than none: isomer-action refuses to install a
+      # target it has no checksum for, so a release missing one of the four
+      # silently strands every runner of that architecture.
+      - name: Require all four targets
+        run: |
+          ls -l dist
+          count=$(find dist -name 'isomer-*.tar.gz' | wc -l)
+          [ "$count" -eq 4 ] || { echo "expected 4 assets, found $count" >&2; exit 1; }
+
+      # Recorded in the release body so a consumer can verify by eye what
+      # isomer-action's checksums.txt claims after `scripts/release.sh`.
+      - name: Checksums
+        run: |
+          cd dist && sha256sum isomer-*.tar.gz | tee SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$REF" dist/isomer-*.tar.gz dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "isomer ${REF#v}" \
+            --notes "SHA-256 of every asset is in SHA256SUMS, and recorded in isomer-action's checksums.txt by \`scripts/release.sh ${REF#v}\`."
