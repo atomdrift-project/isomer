@@ -299,33 +299,49 @@ fn risk_row(r: Risk) -> String {
 /// its newly-gained traits as `└─` leaves. Replaces the old new/expanded split
 /// so both directions read in one section, hierarchy explicit.
 fn gained_grid(out: &mut String, a: &Assessment) {
-    let cats = &a.behavioral.categories;
     // Align the leaf's `└─` just under its class name (past the label + the
     // 3-wide marker column).
     let leaf_indent = " ".repeat(PILL_COL + 4);
-    for (i, c) in cats.iter().enumerate() {
-        let cell = if i == 0 {
-            pill_cell("gained", PILL_PLUM)
-        } else {
-            blank_cell()
-        };
-        let marker = if a.behavioral.is_new_category(c) {
-            "+".truecolor(95, 175, 95)
-        } else {
-            "↑".truecolor(255, 176, 46)
-        };
+    // Group categories by namespace so a namespace shows once with all its
+    // gained traits beneath it — xz's three `binary/linking/runtime` traits are
+    // one class, not three. A group is `new` (green `+`) only when every trait
+    // in it is; a mix means the class already existed and grew (amber `↑`).
+    let mut groups: Vec<(String, bool, Vec<String>)> = Vec::new();
+    for c in &a.behavioral.categories {
         let ns = if c.namespaces.is_empty() {
             c.label.clone()
         } else {
             c.namespaces.join(" · ")
         };
+        let new = a.behavioral.is_new_category(c);
+        let leaves = c
+            .new_ids
+            .iter()
+            .map(|id| id.rsplit("::").next().unwrap_or(id).to_string());
+        if let Some(g) = groups.iter_mut().find(|(n, ..)| *n == ns) {
+            g.1 = g.1 && new;
+            g.2.extend(leaves);
+        } else {
+            groups.push((ns, new, leaves.collect()));
+        }
+    }
+    for (i, (ns, all_new, leaves)) in groups.iter().enumerate() {
+        let cell = if i == 0 {
+            pill_cell("gained", PILL_PLUM)
+        } else {
+            blank_cell()
+        };
+        let marker = if *all_new {
+            "+".truecolor(95, 175, 95)
+        } else {
+            "↑".truecolor(255, 176, 46)
+        };
         out.push_str(&grid_line(
             &cell,
             &format!("{marker}  "),
-            &ns.bold().to_string(),
+            &ns.as_str().bold().to_string(),
         ));
-        for id in &c.new_ids {
-            let leaf = id.split("::").last().unwrap_or(id);
+        for leaf in leaves {
             out.push_str(&format!(
                 "{leaf_indent}{} {}\n",
                 "└─".truecolor(70, 80, 89),
@@ -787,65 +803,12 @@ fn single_changed_file(diff: &DiffReportV1) -> Option<&FileDiffEntry> {
     changed.next().is_none().then_some(only)
 }
 
-/// The metric movers as `(label, value, severity)`, largest relative change
-/// first. Shared with the markdown report: the terminal paints them by
-/// severity, markdown renders the same words plain.
-pub(crate) fn metrics(diff: &DiffReportV1) -> Vec<(String, String, Severity)> {
-    const FLOOR: f64 = 0.12;
-    const KEEP: usize = 5;
-    let Some(file) = single_changed_file(diff) else {
-        return Vec::new();
-    };
-    let Some(m) = file.scopes.metrics.as_ref() else {
-        return Vec::new();
-    };
-    let mut movers: Vec<(f64, String, String, Severity)> = Vec::new();
-    for c in &m.changed {
-        // `load_segment_*`/`size_bytes` restate other movers; `dependencies`
-        // and the loader flag are named in the structure section.
-        let p = &c.new.path;
-        if p.contains("load_segment")
-            || p.ends_with("size_bytes")
-            || p.contains("dependencies")
-            || p.contains("has_direct_loader_dep")
-        {
-            continue;
-        }
-        let (Some(o), Some(n)) = (c.old.value.as_f64(), c.new.value.as_f64()) else {
-            continue;
-        };
-        if o == n {
-            continue;
-        }
-        let rel = if o != 0.0 {
-            (n - o).abs() / o.abs()
-        } else {
-            f64::INFINITY
-        };
-        if rel < FLOOR {
-            continue;
-        }
-        let (label, value) = describe(&c.new.path, o, n);
-        movers.push((rel, label, value, intensity_severity(rel)));
-    }
-    movers.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    // One row per label, keeping the largest mover — so `relacount` and
-    // `dynrela_count` collapse to a single `relocs`.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    movers.retain(|(_, label, _, _)| seen.insert(label.clone()));
-    movers.truncate(KEEP);
-    movers
-        .into_iter()
-        .map(|(_, label, value, sev)| (label, value, sev))
-        .collect()
-}
-
-/// Aggregate count deltas across the changed files, as `old → new  label  (+Δ)`
-/// with the gained names listed. Only the *count* scopes — symbols, sections,
-/// strings — which sum honestly regardless of file type; the scalar per-file
-/// metrics (sizes, entropy, ratios) ride each evidence header, where they keep
-/// their meaning. Empty when nothing counted moved.
-fn stats_rows(diff: &DiffReportV1) -> Vec<String> {
+/// Aggregate count deltas across the changed files as `(old, new, label, note)`
+/// — only the *count* scopes (symbols, sections, strings), which sum honestly
+/// regardless of file type; the scalar per-file metrics (sizes, entropy, ratios)
+/// ride each evidence header, where they keep their meaning. Pure data, shared
+/// by the terminal and the markdown report. Empty when nothing counted moved.
+pub(crate) fn stats_data(diff: &DiffReportV1) -> Vec<(i64, i64, &'static str, String)> {
     // For an archive, the leaf members carry the counts; skip the container
     // root so nothing is counted twice. A single-file diff has no `!!` entries,
     // so every changed entry is a leaf.
@@ -876,7 +839,7 @@ fn stats_rows(diff: &DiffReportV1) -> Vec<String> {
             str_n += i64::from(s.new_count);
         }
     }
-    let mut raw: Vec<(i64, i64, &str, String)> = Vec::new();
+    let mut raw: Vec<(i64, i64, &'static str, String)> = Vec::new();
     if sym_o != sym_n || !added_syms.is_empty() {
         raw.push((sym_o, sym_n, "symbols", names_note(&added_syms)));
     }
@@ -886,10 +849,16 @@ fn stats_rows(diff: &DiffReportV1) -> Vec<String> {
     if str_o != str_n {
         raw.push((str_o, str_n, "strings", String::new()));
     }
+    raw
+}
+
+/// The stats section rows for the terminal — [`stats_data`] formatted with old
+/// and new right-aligned so every `→` stacks.
+fn stats_rows(diff: &DiffReportV1) -> Vec<String> {
+    let raw = stats_data(diff);
     if raw.is_empty() {
         return Vec::new();
     }
-    // Right-align old/new in one field so every `→` stacks.
     let w = raw
         .iter()
         .map(|(o, n, ..)| o.to_string().len().max(n.to_string().len()))
@@ -941,7 +910,7 @@ fn names_note(names: &[String]) -> String {
 /// per-file counts — as `label old→new (Δ%)`, joined with ` · `. These are the
 /// metrics that don't aggregate across files, so they ride the file's own
 /// evidence header. `None` when the file has no scalar movers.
-fn file_metrics_summary(diff: &DiffReportV1, member: &str) -> Option<String> {
+pub(crate) fn file_metrics_summary(diff: &DiffReportV1, member: &str) -> Option<String> {
     const CAP: usize = 6;
     let entry = diff
         .files
@@ -1027,18 +996,6 @@ fn fmt_num(v: f64) -> String {
         format!("{v:.0}")
     } else {
         format!("{v:.2}")
-    }
-}
-
-fn intensity_severity(rel: f64) -> Severity {
-    if rel >= 0.50 {
-        Severity::Critical
-    } else if rel >= 0.20 {
-        Severity::High
-    } else if rel >= 0.05 {
-        Severity::Medium
-    } else {
-        Severity::None
     }
 }
 

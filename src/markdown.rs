@@ -56,7 +56,7 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
     frameworks(&mut s, a);
     // One view: a speaking verdict carries its metrics and the evidence behind
     // it — the differential hunks are the root cause a reviewer acts on.
-    metrics(&mut s, a);
+    stats(&mut s, a);
     evidence(&mut s, a);
     let _ = write!(s, "\n---\n{}\n", footer(a, cli));
 
@@ -291,17 +291,24 @@ fn frameworks(s: &mut String, a: &Analysis<'_>) {
     let _ = writeln!(s);
 }
 
-fn metrics(s: &mut String, a: &Analysis<'_>) {
-    let m = crate::terminal::metrics(a.diff);
-    if m.is_empty() {
+fn stats(s: &mut String, a: &Analysis<'_>) {
+    let rows = crate::terminal::stats_data(a.diff);
+    if rows.is_empty() {
         return;
     }
-    let joined = m
+    let joined = rows
         .iter()
-        .map(|(label, value, _)| format!("{label} {value}"))
+        .map(|(o, n, label, note)| {
+            let d = n - o;
+            let mut r = format!("{o} → {n} {label} ({d:+})");
+            if !note.is_empty() {
+                let _ = write!(r, " — {}", code(note));
+            }
+            r
+        })
         .collect::<Vec<_>>()
         .join(" · ");
-    let _ = writeln!(s, "**Metrics** {joined}\n");
+    let _ = writeln!(s, "**Stats** {joined}\n");
 }
 
 fn evidence(s: &mut String, a: &Analysis<'_>) {
@@ -344,6 +351,9 @@ fn evidence(s: &mut String, a: &Analysis<'_>) {
                 .map(|h| format!(" — {}", cell(&h.desc)))
                 .unwrap_or_default();
             let _ = writeln!(s, "{} {}{} — added lines\n", dots(sev), code(&name), title);
+            if let Some(ms) = crate::terminal::file_metrics_summary(a.diff, &name) {
+                let _ = writeln!(s, "<sub>{}</sub>\n", cell(&ms));
+            }
             let mut body = String::new();
             for (k, h) in group.iter().enumerate() {
                 if k > 0 {
