@@ -644,6 +644,9 @@ impl<'a> Analysis<'a> {
         if restored_endgame_package_shape(self.display_diff()) {
             return "restored package runtime tree and declared entrypoint".to_string();
         }
+        if dependency_with_fallback_load(&self.assessment, &self.judged_diff) {
+            return "added dependency alongside fallback module load".to_string();
+        }
         if let Some(note) = self
             .prop
             .note
@@ -2021,13 +2024,7 @@ fn change_shape_escalation(
     // how it is loaded, even when neither fact is individually high severity.
     // Keep the size bound so a large, ordinary framework rewrite does not trip
     // merely because it also reorganized imports.
-    let dependency_with_fallback_load = s.files_changed + s.files_added + s.files_removed <= 16
-        && a.structure.facts.iter().any(|f| f.label == "dependency")
-        && a.behavioral
-            .categories
-            .iter()
-            .any(|c| c.class == "os/module" && !c.new_ids.is_empty())
-        && s.overall_roc <= 0.25;
+    let dependency_with_fallback_load = dependency_with_fallback_load(a, diff);
     // A newly added encrypted ZIP disguised as another resource format is a
     // compact payload-delivery clue. Keep the differential rule narrow: it
     // must contain many encrypted entries and an executable member, so a
@@ -2257,6 +2254,23 @@ fn endgame_package_shape(summary: &DiffSummary) -> bool {
         && summary.files_changed <= 8
         && summary.overall_roc >= 0.50
         && summary.scope_roc.traits >= 0.75
+}
+
+/// A dependency addition paired with a new fallback module load is a compact
+/// supply-chain shape even when neither signal is individually high. The file
+/// count and overall movement bounds keep ordinary framework rewrites out.
+fn dependency_with_fallback_load(a: &Assessment, diff: &DiffReportV1) -> bool {
+    let summary = &diff.summary;
+    summary.files_changed + summary.files_added + summary.files_removed <= 16
+        && a.structure
+            .facts
+            .iter()
+            .any(|fact| fact.label == "dependency")
+        && a.behavioral
+            .categories
+            .iter()
+            .any(|category| category.class == "os/module" && !category.new_ids.is_empty())
+        && summary.overall_roc <= 0.25
 }
 
 /// The inverse of [`endgame_package_shape`], strengthened with direct evidence
