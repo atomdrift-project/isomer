@@ -187,8 +187,51 @@ def extension(path: str | None) -> str:
     return Path(path).suffix.lower() if path else ""
 
 
+def version_components(sample: dict | None) -> tuple[int, ...] | None:
+    """Return a simple numeric release tuple from metadata or its filename.
+
+    Corpus versions are overwhelmingly semver-like, but requiring a packaging
+    library here would defeat this script's dependency-free fallback. The
+    manifest's explicit version wins; the basename is only a recovery path.
+    """
+    if not sample:
+        return None
+    values = [sample.get("version"), Path(sample.get("path", "")).name]
+    for value in values:
+        if not value:
+            continue
+        matches = re.findall(r"(?<!\d)(\d+(?:\.\d+){1,3})(?!\d)", str(value))
+        if matches:
+            return tuple(int(part) for part in matches[-1].split("."))
+    return None
+
+
+def version_affinity(sample: dict, reference: tuple[int, ...] | None) -> tuple[int, int]:
+    """Prefer the nearest release line without pretending to order semver.
+
+    Same major+minor beats merely same-major, which beats a cross-major pair.
+    The numeric distance is only a tie-breaker inside that compatibility tier.
+    """
+    candidate = version_components(sample)
+    if not reference or not candidate:
+        return 3, sys.maxsize
+    common = 0
+    for old, new in zip(reference, candidate):
+        if old != new:
+            break
+        common += 1
+    line = 0 if common >= 2 else 1 if common >= 1 else 2
+    width = max(len(reference), len(candidate))
+    old = reference + (0,) * (width - len(reference))
+    new = candidate + (0,) * (width - len(candidate))
+    distance = sum(abs(a - b) * (1000 ** (width - i - 1))
+                   for i, (a, b) in enumerate(zip(old, new)))
+    return line, distance
+
+
 def pick(samples: list[dict], prefer: tuple[str, ...], root: Path,
          match_path: str | None = None,
+         match_version: tuple[int, ...] | None = None,
          exclude_sha256: str | None = None) -> dict | None:
     """Pick a present sample, preferring class and matching file form.
 
@@ -214,12 +257,13 @@ def pick(samples: list[dict], prefer: tuple[str, ...], root: Path,
             return None
         candidates = matching
 
-    def rank(item: tuple[int, dict]) -> tuple[int, int, int]:
+    def rank(item: tuple[int, dict]) -> tuple[int, int, int, int, int]:
         i, sample = item
         cls = sample.get("classification")
         class_rank = prefer.index(cls) if cls in prefer else len(prefer)
         extension_rank = 0 if extension(sample.get("path")) == extension(match_path) else 1
-        return class_rank, extension_rank, i
+        version_line, version_distance = version_affinity(sample, match_version)
+        return class_rank, extension_rank, version_line, version_distance, i
 
     return min(candidates, key=rank)[1]
 
@@ -244,9 +288,12 @@ def load_artifacts(corpus: Path) -> list[Artifact]:
         for art, phases in by_art.items():
             before = pick(phases.get("before", []), CLEAN, base)
             before_path = before.get("path") if before else None
+            before_version = version_components(before)
             during = pick(
-                phases.get("during", []), COMPROMISED, base, before_path,
-                before.get("sha256") if before else None,
+                phases.get("during", []), COMPROMISED, base,
+                match_path=before_path,
+                match_version=before_version,
+                exclude_sha256=before.get("sha256") if before else None,
             )
             # Some incidents preserve the clean archive alongside a payload
             # fragment or extracted source file. Fall back across formats only
@@ -256,7 +303,10 @@ def load_artifacts(corpus: Path) -> list[Artifact]:
             # comparators. In the fallback case incomparable after phases stay
             # unset below.
             if not during:
-                duplicate = pick(phases.get("during", []), COMPROMISED, base, before_path)
+                duplicate = pick(
+                    phases.get("during", []), COMPROMISED, base, before_path,
+                    match_version=before_version,
+                )
                 if (
                     duplicate
                     and before
@@ -268,7 +318,11 @@ def load_artifacts(corpus: Path) -> list[Artifact]:
                         exclude_sha256=before.get("sha256"),
                     )
             during_path = during.get("path") if during else before_path
-            after = pick(phases.get("after", []), REMEDIATED, base, during_path)
+            after = pick(
+                phases.get("after", []), REMEDIATED, base,
+                match_path=during_path,
+                match_version=version_components(during),
+            )
             if not (before and during):
                 continue
 
