@@ -336,7 +336,6 @@ impl<'a> Analysis<'a> {
         );
         let cleanup_signature = remediation_cleanup_context(&assessment, &judged_diff, risk);
 
-        let verdict = assessment.severity.max(risk_now);
         // A capability the version bump does not license *is* the supply-chain
         // signal — so a disproportionate gain is escalated to a gate-failing
         // severity even when the gained trait's own criticality is only medium.
@@ -361,6 +360,17 @@ impl<'a> Analysis<'a> {
         } else {
             shape_escalation
         };
+        // The human-facing deterministic verdict must include the same
+        // escalation signals as the gate. Otherwise a shape-only attack can
+        // fail a High gate while the masthead still says NOTABLE (faker's
+        // endgame package deletion was the concrete example). Keep the raw
+        // Azoth probability untouched: a low model score beside a gate-worthy
+        // deterministic verdict honestly shows which detector caught it.
+        let verdict = assessment
+            .severity
+            .max(risk_now)
+            .max(escalation)
+            .max(shape_new);
         let new_verdict = rubric_new.max(risk_jump).max(escalation).max(shape_new);
         let gated = match cli.gate {
             Gate::New => new_verdict,
@@ -631,6 +641,9 @@ impl<'a> Analysis<'a> {
     /// surface that shows the read on its own line uses this so they do not
     /// repeat.
     pub(crate) fn headline_facts(&self) -> String {
+        if restored_endgame_package_shape(self.display_diff()) {
+            return "restored package runtime tree and declared entrypoint".to_string();
+        }
         if let Some(note) = self
             .prop
             .note
@@ -715,6 +728,12 @@ impl<'a> Analysis<'a> {
         ));
         if let Some(size) = root_size_delta(d) {
             lines.push(format!("package size: {size}"));
+        }
+        if restored_endgame_package_shape(d) {
+            lines.push(
+                "restoration shape: a previously absent declared entrypoint and its large runtime tree returned"
+                    .to_string(),
+            );
         }
         lines.push(format!(
             "deterministic assessment: current {} · new {} · gate: {} · known-bad signatures: {}",
@@ -1996,11 +2015,7 @@ fn change_shape_escalation(
                     .iter()
                     .any(|c| c.class == *class && !c.new_ids.is_empty())
             });
-    let endgame = s.files_removed >= 100
-        && s.files_added <= 2
-        && s.files_changed <= 8
-        && s.overall_roc >= 0.50
-        && s.scope_roc.traits >= 0.75;
+    let endgame = endgame_package_shape(s);
     // A dependency addition paired with a new fallback module load is a
     // compact supply-chain shape: the release pulls in new code and changes
     // how it is loaded, even when neither fact is individually high severity.
@@ -2230,6 +2245,42 @@ fn change_shape_escalation(
     } else {
         Severity::None
     }
+}
+
+/// A package that retains only a tiny shell after deleting nearly all of its
+/// behavior has the shape of an intentional endgame release. File deletion by
+/// itself is ordinary cleanup; the high trait-ROC floor requires the removed
+/// tree to account for most of the package's behavior as well as its content.
+fn endgame_package_shape(summary: &DiffSummary) -> bool {
+    summary.files_removed >= 100
+        && summary.files_added <= 2
+        && summary.files_changed <= 8
+        && summary.overall_roc >= 0.50
+        && summary.scope_roc.traits >= 0.75
+}
+
+/// The inverse of [`endgame_package_shape`], strengthened with direct evidence
+/// that the old package's declared npm entrypoint was absent. This lets humans
+/// and the LLM distinguish restoration of a stripped package from introduction
+/// of a large new payload: generic capabilities inside the returning library
+/// are baseline context unless direct implant evidence says otherwise.
+fn restored_endgame_package_shape(diff: &DiffReportV1) -> bool {
+    let summary = &diff.summary;
+    let entrypoint_restored = diff.files.iter().any(|file| {
+        file.scopes.traits.as_ref().is_some_and(|traits| {
+            traits.removed.iter().any(|trait_change| {
+                trait_change
+                    .id
+                    .ends_with("::npm-main-entrypoint-not-shipped")
+            })
+        })
+    });
+    entrypoint_restored
+        && summary.files_added >= 100
+        && summary.files_removed <= 2
+        && summary.files_changed <= 8
+        && summary.overall_roc >= 0.50
+        && summary.scope_roc.traits >= 0.75
 }
 
 /// A newly-added executable can be an implant even when every individual API
@@ -2764,14 +2815,87 @@ mod tests {
 
     use super::{
         CapabilityShape, add_capability_text, capability_shape_score, changed_test_carrier,
-        executable_member_layout, is_compiled_binary_file_type, is_source_archive, line_diff,
-        normalized_archive_diff, normalized_member_path, npm_snapshot_member_key,
-        source_build_macro_score,
+        endgame_package_shape, executable_member_layout, is_compiled_binary_file_type,
+        is_source_archive, line_diff, normalized_archive_diff, normalized_member_path,
+        npm_snapshot_member_key, restored_endgame_package_shape, source_build_macro_score,
     };
     use cleave::Criticality;
     use cleave::types::{
-        DiffReportV1, FileDiffEntry, FileStatus, ScopeDiff, ScopeDiffs, TraitChange,
+        DiffReportV1, DiffSummary, FileDiffEntry, FileStatus, ScopeDiff, ScopeDiffs, ScopeRocs,
+        TraitChange,
     };
+
+    #[test]
+    fn endgame_shape_requires_behavioral_collapse_not_just_cleanup() {
+        let faker = DiffSummary {
+            files_removed: 1_785,
+            files_added: 0,
+            files_changed: 2,
+            overall_roc: 1.0,
+            scope_roc: ScopeRocs {
+                traits: 0.99,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(endgame_package_shape(&faker));
+
+        let ordinary_cleanup = DiffSummary {
+            scope_roc: ScopeRocs {
+                traits: 0.20,
+                ..Default::default()
+            },
+            ..faker
+        };
+        assert!(!endgame_package_shape(&ordinary_cleanup));
+    }
+
+    #[test]
+    fn restoration_shape_requires_the_broken_entrypoint_to_be_repaired() {
+        let removed_trait = |id: &str| TraitChange {
+            id: id.to_string(),
+            trait_section: "metadata".to_string(),
+            crit: Criticality::Notable,
+            desc: "declared entrypoint absent".to_string(),
+            count: 1,
+        };
+        let make_diff = |id: &str| DiffReportV1 {
+            old_root: "stripped.tgz".to_string(),
+            new_root: "restored.tgz".to_string(),
+            summary: DiffSummary {
+                files_added: 1_785,
+                files_changed: 2,
+                overall_roc: 1.0,
+                scope_roc: ScopeRocs {
+                    traits: 0.99,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            scopes: Default::default(),
+            files: vec![FileDiffEntry {
+                path: "<root>".to_string(),
+                status: FileStatus::Changed,
+                identity: None,
+                scopes: ScopeDiffs {
+                    traits: Some(ScopeDiff {
+                        removed: vec![removed_trait(id)],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                old_formula: None,
+                new_formula: None,
+            }],
+        };
+
+        assert!(restored_endgame_package_shape(&make_diff(
+            "metadata/package/manifest/entrypoint::npm-main-entrypoint-not-shipped"
+        )));
+        assert!(!restored_endgame_package_shape(&make_diff(
+            "metadata/package/files::ordinary-tree-change"
+        )));
+    }
 
     #[test]
     fn line_diff_marks_additions_removals_and_context() {
