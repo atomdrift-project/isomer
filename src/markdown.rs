@@ -90,7 +90,7 @@ fn heading(a: &Analysis<'_>) -> String {
     if let Some(scope) = a.scope {
         parts.push(scope.label().to_string());
     }
-    parts.extend(crate::terminal::change_scale(a.diff));
+    parts.extend(crate::terminal::change_scale(a.display_diff()));
     parts.join(" · ")
 }
 
@@ -108,7 +108,7 @@ pub(crate) fn one_line(a: &Analysis<'_>) -> String {
 /// The body for a change isomer has nothing to say about. Kept short and
 /// affirmative: this is the state a reviewer should see most of the time.
 fn clean_body(a: &Analysis<'_>, cli: &Cli) -> String {
-    let scale = crate::terminal::change_scale(a.diff);
+    let scale = crate::terminal::change_scale(a.display_diff());
     let scope = if scale.is_empty() {
         String::new()
     } else {
@@ -292,7 +292,7 @@ fn frameworks(s: &mut String, a: &Analysis<'_>) {
 }
 
 fn stats(s: &mut String, a: &Analysis<'_>) {
-    let rows = crate::terminal::stats_data(a.diff);
+    let rows = crate::terminal::stats_data(a.display_diff());
     if rows.is_empty() {
         return;
     }
@@ -351,7 +351,7 @@ fn evidence(s: &mut String, a: &Analysis<'_>) {
                 .map(|h| format!(" — {}", cell(&h.desc)))
                 .unwrap_or_default();
             let _ = writeln!(s, "{} {}{} — added lines\n", dots(sev), code(&name), title);
-            if let Some(ms) = crate::terminal::file_metrics_summary(a.diff, &name) {
+            if let Some(ms) = crate::terminal::file_metrics_summary(a.display_diff(), &name) {
                 let _ = writeln!(s, "<sub>{}</sub>\n", cell(&ms));
             }
             let mut body = String::new();

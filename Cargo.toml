@@ -11,12 +11,9 @@ repository = "https://github.com/atomdrift-project/isomer"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
 # default-features = false drops cleave's jemalloc default (matches scan).
-#
-# Pinned by explicit rev, not left to float on the default branch: a bare
-# `git =` moves the moment anyone regenerates Cargo.lock, and this crate ends
-# up inside a binary other people's CI executes. Same reasoning as the
-# digest-pinned images in Cross.toml — a branch can be repointed, a rev cannot.
-cleave = { git = "https://github.com/atomdrift-project/cleave.git", rev = "6393436e5542c33fcbe95112ec2ab71aae0ecf3b", default-features = false }
+# The git source is declared without a rev, like scan's dependencies; the
+# resolved commit remains pinned in Cargo.lock and cargo update advances it.
+cleave = { git = "https://github.com/atomdrift-project/cleave.git", default-features = false }
 # Same major as cleave's, so the theme's painters and our override agree on
 # one global colorize state.
 colored = "3.1"
@@ -28,9 +25,9 @@ serde_json = "1"
 
 # atomdrift-scan (lib name `scan`) supplies the azoth ML model for risk
 # scoring each side of the diff, and will later drive purl/oci fetching,
-# bloom skipping, and hopper mirroring. Rev-pinned for the same reason as
-# cleave above.
-atomdrift-scan = { git = "https://github.com/atomdrift-project/scan.git", rev = "1d17d4a24299d6b8b9c26e80de01f0919e393cad" }
+# bloom skipping, and hopper mirroring. The resolved commit is pinned in
+# Cargo.lock and advances with cargo update, like cleave above.
+atomdrift-scan = { git = "https://github.com/atomdrift-project/scan.git" }
 
 # `isomer ci` materializes the changed files into a scratch tree; tempfile
 # owns its lifetime and permissions. Already in the graph via scan.
@@ -94,9 +91,3 @@ significant_drop_tightening = "warn"
 wasmtime = { git = "https://github.com/tstromberg/wasmtime.git", branch = "freebsd-aarch64-43.0.2" }
 tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
 tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
-
-# DEV-ONLY, DO NOT COMMIT: link the working-tree cleave so `extract_member`
-# (added locally) is visible before it lands upstream. Bump the git rev above
-# once cleave is pushed, then remove this. The pre-commit hook rejects it.
-
-

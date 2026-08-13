@@ -8,9 +8,9 @@
 //!   resolver trips here with no signature — the axis that would have caught
 //!   xz-utils (CVE-2024-3094) on release day. Grouped into human categories
 //!   (execution-hijack, network, obfuscation, …).
-//! - **signature** — cleave criticality of gained known-bad traits
-//!   (`third_party/*` YARA hits, malware/hidden-payload objectives). Catches
-//!   *known* attacks; summarized as a count plus any referenced CVE.
+//! - **signature** — cleave criticality of gained known-entity traits
+//!   (`third_party/*` detections and `well-known/malware/*`). Catches *known*
+//!   attacks; summarized as a count plus any referenced CVE.
 //! - **identity** — a drifted signer/publisher forces at least High on its own.
 //!
 //! Known-bad signature ids carry no capability segments, so the behavioral axis
@@ -91,27 +91,41 @@ impl Assessment {
     /// inherently new). This is what a CI gate keyed on new issues (rather than
     /// re-litigating pre-existing ones) uses.
     pub(crate) fn new_severity(&self) -> Severity {
-        let behavioral = self
-            .behavioral
+        self.new_behavioral_severity()
+            .max(self.new_signature_severity())
+            .max(self.identity.severity)
+            .max(self.structure.severity)
+    }
+
+    /// New severity excluding known-signature matches. A remediation release
+    /// may quote the indicator it removes (for example, deleting a malicious
+    /// `wp-comments-posts.php` dropper); the surrounding behavioral change is
+    /// still meaningful, but the quoted name is not a newly introduced
+    /// capability.
+    pub(crate) fn new_severity_without_signatures(&self) -> Severity {
+        self.new_behavioral_severity()
+            .max(self.identity.severity)
+            .max(self.structure.severity)
+    }
+
+    fn new_behavioral_severity(&self) -> Severity {
+        self.behavioral
             .categories
             .iter()
             .filter(|c| !c.new_ids.is_empty())
             .map(|c| c.severity)
             .max()
-            .unwrap_or(Severity::None);
-        let signature = self
-            .signature
+            .unwrap_or(Severity::None)
+    }
+
+    fn new_signature_severity(&self) -> Severity {
+        self.signature
             .ids
             .iter()
             .filter(|m| m.is_new)
             .map(|m| m.severity)
             .max()
-            .unwrap_or(Severity::None);
-        // Structural facts are all added kv entries — inherently new.
-        behavioral
-            .max(signature)
-            .max(self.identity.severity)
-            .max(self.structure.severity)
+            .unwrap_or(Severity::None)
     }
 }
 
@@ -696,8 +710,36 @@ fn meaningful_identity_changes(
         (None, _) => return out,
     };
 
+    // Some analyzers emit an Identity object on both sides even when the old
+    // object carries no claims. Treating `empty -> named` as drift makes a
+    // clean release that restores package metadata look like a publisher
+    // takeover (notably on downgrade/remediation comparisons).
+    let has_claims = |i: &Identity| {
+        i.signer.as_ref().is_some_and(|s| {
+            s.common_name
+                .as_deref()
+                .or(s.organization.as_deref())
+                .or(s.subject.as_deref())
+                .is_some_and(|v| !v.is_empty())
+        }) || i
+            .authors
+            .iter()
+            .any(|p| p.name.as_deref().is_some_and(|v| !v.is_empty()))
+            || i.name.as_ref().is_some_and(|c| !c.value.is_empty())
+            || i.organization.as_ref().is_some_and(|c| !c.value.is_empty())
+            || i.producer.as_ref().is_some_and(|c| !c.value.is_empty())
+            || i.team_id.as_ref().is_some_and(|c| !c.value.is_empty())
+            || !i.unique_ids.is_empty()
+    };
+    if !has_claims(o) && has_claims(n) {
+        return out;
+    }
+
     let mut push = |label: &'static str, ov: String, nv: String| {
-        if ov != nv {
+        // A previously empty claim becoming populated is metadata recovery,
+        // not evidence that the publisher changed. The suspicious direction
+        // is populated -> empty or populated -> a different claim.
+        if ov != nv && !(ov.is_empty() && !nv.is_empty()) {
             out.push(IdentityChange {
                 label,
                 old: ov,
@@ -722,10 +764,7 @@ fn meaningful_identity_changes(
 /// Known-bad detection namespaces. A hit means "we recognize this", not "this
 /// behaves badly" — that's the behavioral axis's job.
 fn is_signature(id: &str) -> bool {
-    id.starts_with("third_party/")
-        || id.contains("malware/")
-        || id.contains("hidden-payload")
-        || id.contains("trojanized")
+    id.starts_with("third_party/") || id.starts_with("well-known/malware/")
 }
 
 /// Whether a criticality tier is worth reporting as a change.
@@ -889,6 +928,20 @@ fn extract_cve(id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signatures_are_known_entities_not_behavior_objectives() {
+        assert!(is_signature("third_party/elastic/XZBackdoor"));
+        assert!(is_signature(
+            "well-known/malware/trojan/pegglecrew::pegglecrew-mbr-wiper"
+        ));
+        assert!(!is_signature(
+            "objectives/supply-chain/trojanized/app/installer::unsigned-branded-mbr-wiper"
+        ));
+        assert!(!is_signature(
+            "objectives/supply-chain/hidden-payload/staging::remote-loader"
+        ));
+    }
 
     /// The class comes from the taxonomy, at a depth that suits each root, so
     /// a branch nobody enumerated still gets a class instead of vanishing.

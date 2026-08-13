@@ -82,7 +82,7 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
 fn render(out: &mut String, a: &Analysis<'_>) {
     let (assessment, naming) = (&a.assessment, &a.naming);
     let mut sections: Vec<String> = Vec::new();
-    sections.push(badge_line(a.verdict, a.diff, naming));
+    sections.push(badge_line(a.verdict, a.display_diff(), naming));
 
     // Verdict summary block: why (the deterministic reason), model (the read,
     // when one was computed), and the ML risk move on one line each.
@@ -102,12 +102,15 @@ fn render(out: &mut String, a: &Analysis<'_>) {
     if let Some(r) = a.risk {
         summary.push_str(&risk_row(r));
     }
+    differential_grid(&mut summary, a);
     push_section(&mut sections, &mut summary);
 
     let mut section = String::new();
     signature_grid(&mut section, assessment);
     push_section(&mut sections, &mut section);
     identity_grid(&mut section, assessment);
+    push_section(&mut sections, &mut section);
+    identity_claims_grid(&mut section, a);
     push_section(&mut sections, &mut section);
     gained_grid(&mut section, assessment);
     push_section(&mut sections, &mut section);
@@ -117,7 +120,7 @@ fn render(out: &mut String, a: &Analysis<'_>) {
     push_section(&mut sections, &mut section);
     // Aggregate counts that sum honestly across file types (symbols, sections,
     // strings); scalar per-file metrics ride each evidence header instead.
-    for (i, body) in stats_rows(a.diff).into_iter().enumerate() {
+    for (i, body) in stats_rows(a.display_diff()).into_iter().enumerate() {
         let cell = if i == 0 {
             pill_cell("stats", PILL_TEAL)
         } else {
@@ -126,9 +129,63 @@ fn render(out: &mut String, a: &Analysis<'_>) {
         section.push_str(&grid_line(&cell, "", &body));
     }
     push_section(&mut sections, &mut section);
-    files_grid(&mut section, a.diff);
+    files_grid(&mut section, a.display_diff());
     push_section(&mut sections, &mut section);
     out.push_str(&sections.join("\n"));
+}
+
+/// Parsed claims about what the changed artifact or member says it is. These
+/// are context only; the trust marker distinguishes cryptographic provenance
+/// from unsigned manifest/version metadata.
+fn identity_claims_grid(out: &mut String, a: &Analysis<'_>) {
+    for (i, line) in a.identity_summary().into_iter().enumerate() {
+        let cell = if i == 0 {
+            pill_cell("claims", PILL_SLATE)
+        } else {
+            blank_cell()
+        };
+        out.push_str(&grid_line(
+            &cell,
+            "",
+            &line.truecolor(190, 201, 209).to_string(),
+        ));
+    }
+}
+
+/// The compact facts that make a large package diff legible: member topology,
+/// scope rates, delivery anomalies, and executable replacement. This is the
+/// same distilled view supplied to the local model, so a human can audit the
+/// facts behind its conclusion without opening the raw JSON.
+fn differential_grid(out: &mut String, a: &Analysis<'_>) {
+    let mut rows = Vec::new();
+    for line in a.differential_summary() {
+        let (label, body) = line.split_once(": ").unwrap_or(("diff", line.as_str()));
+        if label == "payload indicators" {
+            rows.extend(
+                body.split(" · ")
+                    .map(|item| (label.to_string(), item.to_string())),
+            );
+        } else {
+            rows.push((label.to_string(), body.to_string()));
+        }
+    }
+    for (i, (label, body)) in rows.into_iter().enumerate() {
+        let cell = if i == 0 {
+            pill_cell("diff", PILL_TEAL)
+        } else {
+            blank_cell()
+        };
+        let name = if i == 0 || label != "payload indicators" {
+            label.bold().to_string()
+        } else {
+            "".to_string()
+        };
+        out.push_str(&grid_line(
+            &cell,
+            "",
+            &format!("{}  {}", name, body.truecolor(190, 201, 209)),
+        ));
+    }
 }
 
 /// The MITRE ATT&CK and MBC ids this change moved.

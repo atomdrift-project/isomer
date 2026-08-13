@@ -133,8 +133,9 @@ enum Format {
     Json,
     Sarif,
     Markdown,
-    /// The exact payload isomer would send to the LLM (minus the prompt), for
-    /// debugging `--llm`.
+    /// The exact user payload isomer would send to the LLM (without the system
+    /// prompt), for inspection/replay. Like scan, this is local-only and does
+    /// not contact the LLM endpoint.
     Interpret,
 }
 
