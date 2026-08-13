@@ -650,6 +650,9 @@ impl<'a> Analysis<'a> {
         if obfuscated_remote_script_loader(self.display_diff()) {
             return "gained obfuscated remote browser script loader".to_string();
         }
+        if external_remote_script_loader(self.display_diff()) {
+            return "gained external browser script loader".to_string();
+        }
         if let Some(note) = self
             .prop
             .note
@@ -744,6 +747,11 @@ impl<'a> Analysis<'a> {
         if obfuscated_remote_script_loader(d) {
             lines.push(
                 "joined behavior: one file builds text from a long numeric array and injects it as a remote browser script"
+                    .to_string(),
+            );
+        } else if external_remote_script_loader(d) {
+            lines.push(
+                "joined behavior: one file creates a script element and dynamically loads a literal external host"
                     .to_string(),
             );
         }
@@ -2067,13 +2075,15 @@ fn change_shape_escalation(
     // Keep the size bound so a large, ordinary framework rewrite does not trip
     // merely because it also reorganized imports.
     let dependency_with_fallback_load = dependency_with_fallback_load(a, diff);
-    // A remote browser loader assembled from character codes is much stronger
-    // than any of its component atomics. Require the complete convergence on
-    // one file, and use it as release-pressure evidence only for same/patch
-    // releases: a major browser framework can legitimately add a loader, but
-    // a patch has almost no budget for a concealed new remote-code path.
-    let obfuscated_remote_script_loader = bump.is_some_and(|b| {
-        matches!(b.kind, BumpKind::Same | BumpKind::Patch) && obfuscated_remote_script_loader(diff)
+    // A remote browser loader, whether its destination is a literal host or is
+    // assembled from character codes, is much stronger than any component
+    // atomic. Require complete convergence on one file and use it as release-
+    // pressure evidence only for same/patch releases: a major browser
+    // framework can legitimately add a loader, but a patch has almost no
+    // budget for a new remote-code path.
+    let remote_script_loader = bump.is_some_and(|b| {
+        matches!(b.kind, BumpKind::Same | BumpKind::Patch)
+            && (obfuscated_remote_script_loader(diff) || external_remote_script_loader(diff))
     });
     // A newly added encrypted ZIP disguised as another resource format is a
     // compact payload-delivery clue. Keep the differential rule narrow: it
@@ -2278,7 +2288,7 @@ fn change_shape_escalation(
         || cross_domain_cluster
         || endgame
         || dependency_with_fallback_load
-        || obfuscated_remote_script_loader
+        || remote_script_loader
         || added_encrypted_payload_archive
         || same_version_archive_replacement
         || nested_payload_cluster
@@ -2345,6 +2355,30 @@ fn obfuscated_remote_script_loader(diff: &DiffReportV1) -> bool {
         };
         has("::long-numeric-array-literal")
             && has("::fromcharcode-call")
+            && has("::browser-create-script-element")
+            && has("::dynamic-script-element-load")
+    })
+}
+
+/// The non-obfuscated sibling of [`obfuscated_remote_script_loader`]: one file
+/// gains script-element creation, dynamic loading, and a literal remote host.
+/// This catches a payload appended plainly to a distributed browser bundle;
+/// the modest-release guard belongs to [`change_shape_escalation`].
+fn external_remote_script_loader(diff: &DiffReportV1) -> bool {
+    diff.files.iter().any(|file| {
+        if !matches!(file.status, FileStatus::Added | FileStatus::Changed) {
+            return false;
+        }
+        let Some(traits) = file.scopes.traits.as_ref() else {
+            return false;
+        };
+        let has = |suffix: &str| {
+            traits
+                .added
+                .iter()
+                .any(|trait_change| trait_change.id.ends_with(suffix))
+        };
+        has("::js-remote-host-url")
             && has("::browser-create-script-element")
             && has("::dynamic-script-element-load")
     })
@@ -2987,9 +3021,10 @@ mod tests {
     use super::{
         CapabilityShape, add_capability_text, capability_shape_score, changed_identity_claims,
         changed_test_carrier, endgame_package_shape, executable_member_layout,
-        identity_claim_fields, is_compiled_binary_file_type, is_source_archive, line_diff,
-        normalized_archive_diff, normalized_member_path, npm_snapshot_member_key,
-        obfuscated_remote_script_loader, restored_endgame_package_shape, source_build_macro_score,
+        external_remote_script_loader, identity_claim_fields, is_compiled_binary_file_type,
+        is_source_archive, line_diff, normalized_archive_diff, normalized_member_path,
+        npm_snapshot_member_key, obfuscated_remote_script_loader, restored_endgame_package_shape,
+        source_build_macro_score,
     };
     use cleave::Criticality;
     use cleave::types::{
@@ -3105,6 +3140,7 @@ mod tests {
             "dynamic-script-element-load",
         ];
         assert!(obfuscated_remote_script_loader(&make_diff(&complete)));
+        assert!(!external_remote_script_loader(&make_diff(&complete)));
         for omitted in &complete {
             let partial = complete
                 .iter()
@@ -3112,6 +3148,22 @@ mod tests {
                 .filter(|id| id != omitted)
                 .collect::<Vec<_>>();
             assert!(!obfuscated_remote_script_loader(&make_diff(&partial)));
+        }
+
+        let literal = [
+            "js-remote-host-url",
+            "browser-create-script-element",
+            "dynamic-script-element-load",
+        ];
+        assert!(external_remote_script_loader(&make_diff(&literal)));
+        assert!(!obfuscated_remote_script_loader(&make_diff(&literal)));
+        for omitted in &literal {
+            let partial = literal
+                .iter()
+                .copied()
+                .filter(|id| id != omitted)
+                .collect::<Vec<_>>();
+            assert!(!external_remote_script_loader(&make_diff(&partial)));
         }
     }
 
