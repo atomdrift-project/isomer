@@ -138,7 +138,7 @@ fn render(out: &mut String, a: &Analysis<'_>) {
 /// are context only; the trust marker distinguishes cryptographic provenance
 /// from unsigned manifest/version metadata.
 fn identity_claims_grid(out: &mut String, a: &Analysis<'_>) {
-    for (i, line) in a.identity_summary().into_iter().enumerate() {
+    for (i, line) in a.identity_change_summary().into_iter().enumerate() {
         let cell = if i == 0 {
             pill_cell("claims", PILL_SLATE)
         } else {

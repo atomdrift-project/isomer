@@ -10,7 +10,7 @@
 //! single scan, and analysis is the expensive part.
 
 use std::cell::OnceCell;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -647,6 +647,9 @@ impl<'a> Analysis<'a> {
         if dependency_with_fallback_load(&self.assessment, &self.judged_diff) {
             return "added dependency alongside fallback module load".to_string();
         }
+        if obfuscated_remote_script_loader(self.display_diff()) {
+            return "gained obfuscated remote browser script loader".to_string();
+        }
         if let Some(note) = self
             .prop
             .note
@@ -735,6 +738,12 @@ impl<'a> Analysis<'a> {
         if restored_endgame_package_shape(d) {
             lines.push(
                 "restoration shape: a previously absent declared entrypoint and its large runtime tree returned"
+                    .to_string(),
+            );
+        }
+        if obfuscated_remote_script_loader(d) {
+            lines.push(
+                "joined behavior: one file builds text from a long numeric array and injects it as a remote browser script"
                     .to_string(),
             );
         }
@@ -905,6 +914,39 @@ impl<'a> Analysis<'a> {
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         entries.truncate(6);
+        entries.into_iter().map(|(_, text)| text).collect()
+    }
+
+    /// Identity claims that actually changed, for the compact terminal view.
+    /// The masthead already names the root artifact and version, so repeating
+    /// an unchanged `name`, `identifier`, and `version` block adds no context.
+    /// Member versions remain eligible because they are not represented there.
+    pub(crate) fn identity_change_summary(&self) -> Vec<String> {
+        let mut entries: Vec<(usize, String)> = Vec::new();
+        for file in &self.judged_diff.files {
+            let Some(identity) = file.identity.as_ref() else {
+                continue;
+            };
+            let include_version = file.path != "<root>";
+            let old = identity
+                .old
+                .as_ref()
+                .map(|id| identity_claim_fields(id, include_version))
+                .unwrap_or_default();
+            let new = identity
+                .new
+                .as_ref()
+                .map(|id| identity_claim_fields(id, include_version))
+                .unwrap_or_default();
+            let priority = usize::from(file.path != "<root>");
+            entries.extend(
+                changed_identity_claims(&display_member_path(&file.path), &old, &new)
+                    .into_iter()
+                    .map(|line| (priority, line)),
+            );
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        entries.truncate(8);
         entries.into_iter().map(|(_, text)| text).collect()
     }
 
@@ -2025,6 +2067,14 @@ fn change_shape_escalation(
     // Keep the size bound so a large, ordinary framework rewrite does not trip
     // merely because it also reorganized imports.
     let dependency_with_fallback_load = dependency_with_fallback_load(a, diff);
+    // A remote browser loader assembled from character codes is much stronger
+    // than any of its component atomics. Require the complete convergence on
+    // one file, and use it as release-pressure evidence only for same/patch
+    // releases: a major browser framework can legitimately add a loader, but
+    // a patch has almost no budget for a concealed new remote-code path.
+    let obfuscated_remote_script_loader = bump.is_some_and(|b| {
+        matches!(b.kind, BumpKind::Same | BumpKind::Patch) && obfuscated_remote_script_loader(diff)
+    });
     // A newly added encrypted ZIP disguised as another resource format is a
     // compact payload-delivery clue. Keep the differential rule narrow: it
     // must contain many encrypted entries and an executable member, so a
@@ -2228,6 +2278,7 @@ fn change_shape_escalation(
         || cross_domain_cluster
         || endgame
         || dependency_with_fallback_load
+        || obfuscated_remote_script_loader
         || added_encrypted_payload_archive
         || same_version_archive_replacement
         || nested_payload_cluster
@@ -2271,6 +2322,32 @@ fn dependency_with_fallback_load(a: &Assessment, diff: &DiffReportV1) -> bool {
             .iter()
             .any(|category| category.class == "os/module" && !category.new_ids.is_empty())
         && summary.overall_roc <= 0.25
+}
+
+/// A single changed file gained all parts of a concealed browser-side remote
+/// loader: a long numeric character array, conversion through
+/// `String.fromCharCode`, creation of a script element, and dynamic loading of
+/// that script. Keeping the join file-local avoids combining unrelated helpers
+/// spread throughout a normal web application.
+fn obfuscated_remote_script_loader(diff: &DiffReportV1) -> bool {
+    diff.files.iter().any(|file| {
+        if !matches!(file.status, FileStatus::Added | FileStatus::Changed) {
+            return false;
+        }
+        let Some(traits) = file.scopes.traits.as_ref() else {
+            return false;
+        };
+        let has = |suffix: &str| {
+            traits
+                .added
+                .iter()
+                .any(|trait_change| trait_change.id.ends_with(suffix))
+        };
+        has("::long-numeric-array-literal")
+            && has("::fromcharcode-call")
+            && has("::browser-create-script-element")
+            && has("::dynamic-script-element-load")
+    })
 }
 
 /// The inverse of [`endgame_package_shape`], strengthened with direct evidence
@@ -2674,6 +2751,86 @@ fn identity_claims(identity: &filefacts::Identity) -> Vec<String> {
     claims
 }
 
+/// Flatten claims for a field-level terminal diff. Values retain their trust
+/// marker so a claim becoming verified (or losing verification) is visible
+/// even when its text did not change.
+fn identity_claim_fields(
+    identity: &filefacts::Identity,
+    include_version: bool,
+) -> BTreeMap<&'static str, String> {
+    let mut claims = BTreeMap::new();
+    let mut add = |label: &'static str, claim: Option<&filefacts::Claim>| {
+        let Some(claim) = claim else {
+            return;
+        };
+        let value = crate::printable(&claim.value);
+        if value.is_empty() {
+            return;
+        }
+        let provenance = if claim.verified {
+            "verified"
+        } else {
+            "claimed"
+        };
+        claims.insert(label, format!("{value} [{provenance}]"));
+    };
+    add("name", identity.name.as_ref());
+    add("title", identity.title.as_ref());
+    add("project", identity.project.as_ref());
+    add("identifier", identity.identifier.as_ref());
+    if include_version {
+        add("version", identity.version.as_ref());
+    }
+    add("organization", identity.organization.as_ref());
+    add("producer", identity.producer.as_ref());
+    add("team", identity.team_id.as_ref());
+    if let Some(signer) = &identity.signer {
+        let signer_name = signer
+            .organization
+            .as_deref()
+            .or(signer.common_name.as_deref())
+            .unwrap_or_default();
+        if !signer_name.is_empty() {
+            claims.insert(
+                "signer",
+                format!(
+                    "{} [parsed, {}]",
+                    crate::printable(signer_name),
+                    trust_label(identity.trust)
+                ),
+            );
+        }
+    } else if identity.trust != filefacts::Trust::Unsigned {
+        claims.insert("trust", trust_label(identity.trust));
+    }
+    claims
+}
+
+fn changed_identity_claims(
+    path: &str,
+    old: &BTreeMap<&'static str, String>,
+    new: &BTreeMap<&'static str, String>,
+) -> Vec<String> {
+    let fields = old
+        .keys()
+        .chain(new.keys())
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut fields = fields.into_iter().collect::<Vec<_>>();
+    fields.sort_unstable();
+    fields
+        .into_iter()
+        .filter_map(|field| match (old.get(field), new.get(field)) {
+            (Some(old), Some(new)) if old != new => {
+                Some(format!("{path}: ~ {field} {old} → {new}"))
+            }
+            (Some(old), None) => Some(format!("{path}: − {field} {old}")),
+            (None, Some(new)) => Some(format!("{path}: + {field} {new}")),
+            _ => None,
+        })
+        .collect()
+}
+
 fn trust_label(trust: filefacts::Trust) -> String {
     format!("{trust:?}").to_ascii_lowercase()
 }
@@ -2825,13 +2982,14 @@ fn remediation_cleanup_context(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
 
     use super::{
-        CapabilityShape, add_capability_text, capability_shape_score, changed_test_carrier,
-        endgame_package_shape, executable_member_layout, is_compiled_binary_file_type,
-        is_source_archive, line_diff, normalized_archive_diff, normalized_member_path,
-        npm_snapshot_member_key, restored_endgame_package_shape, source_build_macro_score,
+        CapabilityShape, add_capability_text, capability_shape_score, changed_identity_claims,
+        changed_test_carrier, endgame_package_shape, executable_member_layout,
+        identity_claim_fields, is_compiled_binary_file_type, is_source_archive, line_diff,
+        normalized_archive_diff, normalized_member_path, npm_snapshot_member_key,
+        obfuscated_remote_script_loader, restored_endgame_package_shape, source_build_macro_score,
     };
     use cleave::Criticality;
     use cleave::types::{
@@ -2909,6 +3067,83 @@ mod tests {
         assert!(!restored_endgame_package_shape(&make_diff(
             "metadata/package/files::ordinary-tree-change"
         )));
+    }
+
+    #[test]
+    fn obfuscated_remote_loader_requires_convergence_on_one_file() {
+        let trait_change = |suffix: &str| TraitChange {
+            id: format!("micro-behaviors/test::{suffix}"),
+            trait_section: "micro-behaviors".to_string(),
+            crit: Criticality::Notable,
+            desc: suffix.to_string(),
+            count: 1,
+        };
+        let make_diff = |ids: &[&str]| DiffReportV1 {
+            old_root: "old.tgz".to_string(),
+            new_root: "new.tgz".to_string(),
+            summary: Default::default(),
+            scopes: Default::default(),
+            files: vec![FileDiffEntry {
+                path: "<root>!!package/browser.js".to_string(),
+                status: FileStatus::Changed,
+                identity: None,
+                scopes: ScopeDiffs {
+                    traits: Some(ScopeDiff {
+                        added: ids.iter().map(|id| trait_change(id)).collect(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                old_formula: None,
+                new_formula: None,
+            }],
+        };
+        let complete = [
+            "long-numeric-array-literal",
+            "fromcharcode-call",
+            "browser-create-script-element",
+            "dynamic-script-element-load",
+        ];
+        assert!(obfuscated_remote_script_loader(&make_diff(&complete)));
+        for omitted in &complete {
+            let partial = complete
+                .iter()
+                .copied()
+                .filter(|id| id != omitted)
+                .collect::<Vec<_>>();
+            assert!(!obfuscated_remote_script_loader(&make_diff(&partial)));
+        }
+    }
+
+    #[test]
+    fn terminal_claim_diff_omits_unchanged_root_identity_and_version() {
+        let identity = |version: &str, organization: Option<&str>| filefacts::Identity {
+            name: Some(filefacts::Claim::claimed("node-ipc", "test")),
+            identifier: Some(filefacts::Claim::claimed("node-ipc", "test")),
+            version: Some(filefacts::Claim::claimed(version, "test")),
+            organization: organization.map(|value| filefacts::Claim::claimed(value, "test")),
+            ..Default::default()
+        };
+        let old = identity("12.0.0", None);
+        let new = identity("12.0.1", None);
+        let old_fields = identity_claim_fields(&old, false);
+        let new_fields = identity_claim_fields(&new, false);
+        assert!(changed_identity_claims("<root>", &old_fields, &new_fields).is_empty());
+
+        let changed = identity("12.0.1", Some("new publisher"));
+        let changed_fields = identity_claim_fields(&changed, false);
+        assert_eq!(
+            changed_identity_claims("<root>", &new_fields, &changed_fields),
+            vec!["<root>: + organization new publisher [claimed]"]
+        );
+
+        // A member version is still available when it is not duplicated by
+        // the artifact masthead.
+        let member_fields: BTreeMap<_, _> = identity_claim_fields(&new, true);
+        assert_eq!(
+            member_fields.get("version").map(String::as_str),
+            Some("12.0.1 [claimed]")
+        );
     }
 
     #[test]
