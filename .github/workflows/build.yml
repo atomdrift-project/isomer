@@ -167,7 +167,7 @@ jobs:
       # tests are already #[ignore]d.
       - name: Test
         if: matrix.test
-        run: cargo test --locked --lib
+        run: cargo test --locked
 
       # --- macOS signing ------------------------------------------------------
       # Unsigned path: an ad-hoc signature, matching what `make release` does on
@@ -531,7 +531,7 @@ jobs:
             # Non-fatal during bring-up: this is the first time the suite has
             # run on FreeBSD in CI, and we want the artifact either way. Make
             # it fatal once we know it's green.
-            cargo test --locked --lib || echo "::warning::FreeBSD unit tests failed"
+            cargo test --locked || echo "::warning::FreeBSD unit tests failed"
         env:
           BUILD_PROFILE: ${{ inputs.profile }}
 
@@ -698,7 +698,7 @@ jobs:
             "$CARGO_TARGET_DIR/$BUILD_PROFILE/isomer" --version
             cp "$CARGO_TARGET_DIR/$BUILD_PROFILE/isomer" ./isomer
             # This is the W^X canary — see the note above the job.
-            cargo test --locked --lib || echo "::warning::OpenBSD unit tests failed"
+            cargo test --locked || echo "::warning::OpenBSD unit tests failed"
         env:
           BUILD_PROFILE: ${{ inputs.profile }}
 
@@ -746,7 +746,7 @@ jobs:
             cargo build --locked --profile "$BUILD_PROFILE" --bin isomer
             "/tmp/target/$BUILD_PROFILE/isomer" --version
             cp "/tmp/target/$BUILD_PROFILE/isomer" ./isomer
-            cargo test --locked --lib || echo "::warning::NetBSD unit tests failed"
+            cargo test --locked || echo "::warning::NetBSD unit tests failed"
         env:
           BUILD_PROFILE: ${{ inputs.profile }}
 
@@ -802,7 +802,7 @@ jobs:
             cargo build --locked --profile "$BUILD_PROFILE" --bin isomer
             "/tmp/target/$BUILD_PROFILE/isomer" --version
             cp "/tmp/target/$BUILD_PROFILE/isomer" ./isomer
-            cargo test --locked --lib || echo "::warning::DragonFlyBSD unit tests failed"
+            cargo test --locked || echo "::warning::DragonFlyBSD unit tests failed"
         env:
           BUILD_PROFILE: ${{ inputs.profile }}
 
@@ -1094,7 +1094,7 @@ jobs:
             cargo build --locked --profile "$BUILD_PROFILE" --bin isomer
             "$CARGO_TARGET_DIR/$BUILD_PROFILE/isomer" --version
             cp "$CARGO_TARGET_DIR/$BUILD_PROFILE/isomer" ./isomer
-            cargo test --locked --lib || echo "::warning::OmniOS unit tests failed"
+            cargo test --locked || echo "::warning::OmniOS unit tests failed"
         env:
           BUILD_PROFILE: ${{ inputs.profile }}
 
