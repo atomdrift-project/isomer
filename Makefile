@@ -8,7 +8,12 @@ BINARY = isomer
 # cleave) don't inherit a malformed MAKEFLAGS. Mirrors scan's Makefile.
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: all build release quick install lint fix test demo validate-samples install-precommit clean help
+# Cargo package name, which is not always the binary name (scan's package is
+# `atomdrift-scan` but ships `atomscan`). Read from Cargo.toml so `cut-release`
+# passes the right `-p` without a second place to keep in sync.
+PACKAGE := $(shell awk -F'"' '/^name = /{print $$2; exit}' Cargo.toml)
+
+.PHONY: all build release quick install lint fix test demo validate-samples install-precommit cut-release clean help
 
 # Trait set the sample audit judges with. Defaults to the working-tree
 # traits-dev beside this repo when present, so the audit tracks trait edits;
@@ -73,6 +78,43 @@ install-precommit:
 	chmod +x "$$(git rev-parse --git-dir)/hooks/pre-commit"
 	@echo "✓ Pre-commit hook installed."
 
+# Cut a release: set the version everywhere it is recorded, prove the result
+# builds the way CI will, and commit + tag it as one unit.
+#
+#     make cut-release VERSION=0.5.0
+#
+# The version lives in three places that must agree — Cargo.toml, Cargo.lock,
+# and the tag — and release.yml rejects the build if any pair disagrees. Doing
+# it by hand cost four failed release runs in one day: a tag ahead of
+# Cargo.toml, then Cargo.toml ahead of Cargo.lock, each discovered ~40 minutes
+# into a matrix that `cargo check --locked` disproves in seconds.
+#
+# Pushing stays manual on purpose. That is the step that spends an hour of CI
+# and publishes artifacts people download, so it gets a human; everything this
+# target does is local and revertible with `git reset --hard HEAD~1` plus
+# `git tag -d`.
+cut-release:
+	@test -n "$(VERSION)" || { echo "usage: make cut-release VERSION=x.y.z" >&2; exit 1; }
+	@printf '%s\n' "$(VERSION)" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$$' \
+		|| { echo "VERSION must look like 1.2.3 (got '$(VERSION)')" >&2; exit 1; }
+	@test -z "$$(git status --porcelain)" \
+		|| { echo "working tree is dirty — the tag must capture exactly what was tested:" >&2; \
+		     git status --short >&2; exit 1; }
+	@if git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null; then \
+		echo "tag v$(VERSION) already exists" >&2; exit 1; fi
+	@# Rewrite only the first `version =`, which is the one in [package].
+	@awk -v v="$(VERSION)" 'BEGIN{d=0} /^version = "/ && !d {print "version = \"" v "\""; d=1; next} {print}' \
+		Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml
+	$(CARGO) update -p $(PACKAGE) --offline
+	@# The exact gate release.yml applies, minus the hour of linking.
+	$(CARGO) check --locked --all-targets
+	git add Cargo.toml Cargo.lock
+	git commit -m "v$(VERSION)"
+	git tag -a "v$(VERSION)" -m "$(BINARY) $(VERSION)"
+	@echo
+	@echo "tagged v$(VERSION). to release:"
+	@echo "    git push origin $$(git rev-parse --abbrev-ref HEAD) && git push origin v$(VERSION)"
+
 clean:
 	$(CARGO) clean
 
@@ -88,4 +130,5 @@ help:
 	@echo "  demo      detect every bundled supply-chain case, narrated"
 	@echo "  validate-samples  audit before/during/after corpus for misses + false positives"
 	@echo "  install-precommit  gate commits on lint + test"
+	@echo "  cut-release  bump version + lockfile, verify, commit, tag (VERSION=x.y.z)"
 	@echo "  clean     cargo clean"

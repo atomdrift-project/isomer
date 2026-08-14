@@ -486,14 +486,18 @@ def run_transition(isomer: str, traits: str | None, fail_on: str,
     return Transition(bool(gate["fail"]), gate.get("severity", "?"))
 
 
-def audit(art: Artifact, isomer: str, traits: str | None, fail_on: str,
-          timeout: int) -> Result:
-    def go(old: SampleFile, new: SampleFile) -> Transition:
-        return run_transition(isomer, traits, fail_on, old, new, timeout)
+def transitions_of(art: Artifact) -> list[tuple[str, SampleFile, SampleFile]]:
+    """The isomer runs this artifact needs, as (kind, old, new)."""
+    work = [("bd", art.before, art.during)]
+    if art.after:
+        work.append(("da", art.during, art.after))
+        work.append(("ba", art.before, art.after))
+    return work
 
-    bd = go(art.before, art.during)
-    da = go(art.during, art.after) if art.after else None
-    ba = go(art.before, art.after) if art.after else None
+
+def audit(art: Artifact, runs: dict[str, Transition]) -> Result:
+    """Judge one artifact from its already-executed transitions."""
+    bd, da, ba = runs["bd"], runs.get("da"), runs.get("ba")
     res = Result(art.name, art.year, bd, da, ba)
 
     if bd.error:
@@ -542,8 +546,10 @@ def main() -> int:
     ap.add_argument("--fail-on", default="high",
                     choices=["low", "medium", "high", "critical"],
                     help="severity that counts as a detection")
-    ap.add_argument("--jobs", type=int, default=1,
-                    help="parallel artifacts (1 keeps resource use and output deterministic)")
+    ap.add_argument("--jobs", type=int, default=0,
+                    help="concurrent isomer runs (0 = one per CPU; the report stays "
+                         "deterministic either way, since runs are independent and "
+                         "results are sorted before printing)")
     ap.add_argument("--timeout", type=int, default=0,
                     help="per-run seconds (0 = unlimited; timed-out comparisons are errors)")
     ap.add_argument("--limit", type=int, default=0, help="cap artifacts (0=all)")
@@ -562,18 +568,31 @@ def main() -> int:
         print(f"validate-samples: no before+during pairs under {args.corpus}", file=sys.stderr)
         return 2
 
-    print(f"auditing {len(artifacts)} artifacts against {args.isomer} "
-          f"(detect = fail-on {args.fail_on})…", file=sys.stderr)
-
     timeout = args.timeout or None
-    results: list[Result] = []
-    with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        futs = {ex.submit(audit, a, args.isomer, args.traits, args.fail_on,
-                          timeout): a for a in artifacts}
-        for i, fut in enumerate(cf.as_completed(futs), 1):
-            results.append(fut.result())
-            print(f"\r  {i}/{len(artifacts)}", end="", file=sys.stderr, flush=True)
+    # Every transition is an independent isomer run, so schedule all of them as
+    # one flat queue rather than three serial runs per artifact. A single run
+    # only saturates a couple of cores, and the corpus holds a few archives that
+    # cost minutes on their own; queueing per transition lets that long pole
+    # overlap the rest of the corpus instead of leaving the machine idle.
+    work = [(i, kind, old, new)
+            for i, art in enumerate(artifacts)
+            for kind, old, new in transitions_of(art)]
+    jobs = args.jobs or (os.cpu_count() or 4)
+    print(f"auditing {len(artifacts)} artifacts ({len(work)} comparisons, {jobs} at a "
+          f"time) against {args.isomer} (detect = fail-on {args.fail_on})…",
+          file=sys.stderr)
+
+    runs: dict[tuple[int, str], Transition] = {}
+    with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+        futs = {ex.submit(run_transition, args.isomer, args.traits, args.fail_on,
+                          old, new, timeout): (i, kind)
+                for i, kind, old, new in work}
+        for n, fut in enumerate(cf.as_completed(futs), 1):
+            runs[futs[fut]] = fut.result()
+            print(f"\r  {n}/{len(work)}", end="", file=sys.stderr, flush=True)
     print("", file=sys.stderr)
+    results = [audit(art, {k: runs[(i, k)] for k, _, _ in transitions_of(art)})
+               for i, art in enumerate(artifacts)]
     results.sort(key=lambda r: (r.year, r.name))
 
     # Tallies.
