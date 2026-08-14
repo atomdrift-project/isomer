@@ -36,6 +36,10 @@ pub(crate) struct Envelope<'a, R: Serialize> {
     pub provenance: Provenance<'a>,
     /// The differential assessment plus the gate decision.
     pub verdict: Verdict<'a>,
+    /// Stable, uncapped machine-learning feature record. Unlike the curated
+    /// terminal view, this preserves every per-file trait, metric, fact, and
+    /// section delta, plus the complete scope totals.
+    pub features: FeatureSet<'a>,
     /// The proof behind the verdict: context windows for the gained traits, in
     /// file order (locator · code · description). Present so the UI and a cache
     /// can render the evidence table without re-reading the artifact.
@@ -52,6 +56,152 @@ pub(crate) struct Envelope<'a, R: Serialize> {
     /// reading top-down meets the verdict before the bulk, and so a consumer
     /// (prism, the CLI cache) can regenerate anything the curated view omits.
     pub raw: &'a R,
+}
+
+/// Stable differential features, versioned separately from the surrounding
+/// presentation envelope so model pipelines can evolve on their own cadence.
+#[derive(Serialize)]
+pub(crate) struct FeatureSet<'a> {
+    pub v: &'static str,
+    pub topology: Topology,
+    pub scopes: FeatureScopes,
+    pub files: Vec<FileFeatures<'a>>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct Topology {
+    pub added: u32,
+    pub removed: u32,
+    pub changed: u32,
+    pub unchanged: u32,
+    pub compared: u32,
+}
+
+#[derive(Serialize)]
+pub(crate) struct FeatureScopes {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traits: Option<ScopeStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<ScopeStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facts: Option<ScopeStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbols: Option<ScopeStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strings: Option<ScopeStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sections: Option<ScopeStats>,
+}
+
+/// Counts and weights are Cleave's complete pre-presentation totals. The
+/// explicit row counts make accidental upstream truncation observable.
+#[derive(Serialize)]
+pub(crate) struct ScopeStats {
+    pub added: usize,
+    pub removed: usize,
+    pub changed: usize,
+    pub old_count: u32,
+    pub new_count: u32,
+    pub old_weight: f32,
+    pub new_weight: f32,
+    pub change_weight: f32,
+    pub roc: f32,
+    pub truncated: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct FileFeatures<'a> {
+    pub path: &'a str,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<&'a str>,
+    pub status: &'static str,
+    pub archive_depth: usize,
+    pub identity_changed: bool,
+    pub scopes: FeatureScopes,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub traits: Vec<TraitDelta<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<ValueDelta<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<FactDelta<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<SectionDelta<'a>>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct TraitDelta<'a> {
+    pub id: &'a str,
+    pub change: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old: Option<TraitSide<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new: Option<TraitSide<'a>>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct TraitSide<'a> {
+    pub criticality: &'static str,
+    pub confidence: f32,
+    /// Criticality weight multiplied by confidence: the same importance used
+    /// to rank terminal traits.
+    pub score: f32,
+    pub count: u32,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub description: &'a str,
+}
+
+/// A metric value transition. Numeric fields are populated whenever both the
+/// underlying JSON value and the requested calculation are meaningful.
+#[derive(Serialize)]
+pub(crate) struct ValueDelta<'a> {
+    pub path: &'a str,
+    pub change: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub absolute_delta: Option<f64>,
+    /// Signed change relative to `abs(old)`. Undefined for additions and a
+    /// zero old value rather than represented as infinity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_delta: Option<f64>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct FactDelta<'a> {
+    pub path: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub namespace: &'a str,
+    pub change: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new: Option<&'a serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SectionDelta<'a> {
+    pub name: &'a str,
+    pub change: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old: Option<SectionSide<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new: Option<SectionSide<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_delta: Option<i128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entropy_delta: Option<f64>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SectionSide<'a> {
+    pub size: u64,
+    pub entropy: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<&'a str>,
 }
 
 /// One added dependency, profiled by fetching and analyzing it.
@@ -287,7 +437,7 @@ mod tests {
     fn envelope_shape_is_stable() {
         let raw = serde_json::json!({"diff": "…"});
         let env = Envelope::<'_, serde_json::Value> {
-            v: "1",
+            v: "2",
             eng: "isomer/test",
             verb: "fs",
             artifact: Some("liblzma.so"),
@@ -351,6 +501,25 @@ mod tests {
                     facts: Vec::new(),
                 },
             },
+            features: FeatureSet {
+                v: "1",
+                topology: Topology {
+                    added: 0,
+                    removed: 0,
+                    changed: 1,
+                    unchanged: 0,
+                    compared: 1,
+                },
+                scopes: FeatureScopes {
+                    traits: None,
+                    metrics: None,
+                    facts: None,
+                    symbols: None,
+                    strings: None,
+                    sections: None,
+                },
+                files: Vec::new(),
+            },
             evidence: Vec::new(),
             deps: Vec::new(),
             llm: None,
@@ -358,7 +527,13 @@ mod tests {
         };
         let s = serde_json::to_string(&env).unwrap();
         // Field order: verdict and its proof precede the bulky raw diff.
-        let order = ["\"v\"", "\"verdict\"", "\"evidence\"", "\"raw\""];
+        let order = [
+            "\"v\"",
+            "\"verdict\"",
+            "\"features\"",
+            "\"evidence\"",
+            "\"raw\"",
+        ];
         for k in order {
             assert!(s.contains(k), "missing {k}");
         }

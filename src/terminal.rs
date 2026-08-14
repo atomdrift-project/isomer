@@ -358,6 +358,7 @@ fn risk_row(r: Risk) -> String {
 /// its newly-gained traits as `└─` leaves. Replaces the old new/expanded split
 /// so both directions read in one section, hierarchy explicit.
 fn gained_grid(out: &mut String, a: &Assessment) {
+    const MAX_TRAITS: usize = 24;
     // Align the leaf's `└─` just under its class name (past the label + the
     // 3-wide marker column).
     let leaf_indent = " ".repeat(PILL_COL + 4);
@@ -365,23 +366,43 @@ fn gained_grid(out: &mut String, a: &Assessment) {
     // gained traits beneath it — xz's three `binary/linking/runtime` traits are
     // one class, not three. A group is `new` (green `+`) only when every trait
     // in it is; a mix means the class already existed and grew (amber `↑`).
-    let mut groups: Vec<(String, bool, Vec<String>)> = Vec::new();
+    let mut ranked: Vec<(f32, String, bool, String, String)> = Vec::new();
     for c in &a.behavioral.categories {
         let ns = if c.namespaces.is_empty() {
             c.label.clone()
         } else {
             c.namespaces.join(" · ")
         };
-        let new = a.behavioral.is_new_category(c);
-        let leaves = c
-            .new_ids
-            .iter()
-            .map(|id| id.rsplit("::").next().unwrap_or(id).to_string());
+        ranked.extend(c.new_ids.iter().map(|id| {
+            (
+                c.trait_scores.get(id).copied().unwrap_or_default(),
+                ns.clone(),
+                a.behavioral.is_new_category(c),
+                id.rsplit("::").next().unwrap_or(id).to_string(),
+                id.clone(),
+            )
+        }));
+        ranked.extend(c.escalated_ids.iter().map(|id| {
+            (
+                c.trait_scores.get(id).copied().unwrap_or_default(),
+                ns.clone(),
+                false,
+                id.rsplit("::").next().unwrap_or(id).to_string(),
+                id.clone(),
+            )
+        }));
+    }
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.4.cmp(&b.4)));
+    let overflow = ranked.len().saturating_sub(MAX_TRAITS);
+    ranked.truncate(MAX_TRAITS);
+
+    let mut groups: Vec<(String, bool, Vec<String>)> = Vec::new();
+    for (_, ns, new, leaf, _) in ranked {
         if let Some(g) = groups.iter_mut().find(|(n, ..)| *n == ns) {
             g.1 = g.1 && new;
-            g.2.extend(leaves);
+            g.2.push(leaf);
         } else {
-            groups.push((ns, new, leaves.collect()));
+            groups.push((ns, new, vec![leaf]));
         }
     }
     for (i, (ns, all_new, leaves)) in groups.iter().enumerate() {
@@ -407,6 +428,13 @@ fn gained_grid(out: &mut String, a: &Assessment) {
                 leaf.truecolor(76, 178, 255),
             ));
         }
+    }
+    if overflow > 0 {
+        out.push_str(&format!(
+            "{leaf_indent}{} {}\n",
+            "└─".truecolor(70, 80, 89),
+            format!("+{overflow} more lower-scoring traits").truecolor(102, 117, 127),
+        ));
     }
 }
 
@@ -1130,5 +1158,64 @@ fn paint(sev: Severity, text: &str) -> String {
         Severity::High => cleave::theme::paint_suspicious(text).to_string(),
         Severity::Medium | Severity::Low => cleave::theme::paint_notable(text).to_string(),
         Severity::None => cleave::theme::paint_baseline(text).to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::file_metrics_summary;
+    use cleave::types::{
+        Changed, DiffReportV1, FileDiffEntry, FileStatus, MetricChange, ScopeDiff, ScopeDiffs,
+    };
+
+    #[test]
+    fn metric_summary_keeps_the_six_largest_relative_moves() {
+        let change = |name: &str, new: f64| Changed {
+            old: MetricChange {
+                path: format!("metric.{name}"),
+                value: serde_json::json!(100.0),
+            },
+            new: MetricChange {
+                path: format!("metric.{name}"),
+                value: serde_json::json!(new),
+            },
+        };
+        let diff = DiffReportV1 {
+            old_root: "old".to_string(),
+            new_root: "new".to_string(),
+            summary: Default::default(),
+            scopes: Default::default(),
+            files: vec![FileDiffEntry {
+                path: "sample".to_string(),
+                file_type: Some("elf".to_string()),
+                status: FileStatus::Changed,
+                identity: None,
+                scopes: ScopeDiffs {
+                    metrics: Some(ScopeDiff {
+                        changed: vec![
+                            change("largest", 1000.0),
+                            change("second", 800.0),
+                            change("third", 600.0),
+                            change("fourth", 500.0),
+                            change("fifth", 400.0),
+                            change("sixth", 300.0),
+                            change("seventh", 200.0),
+                            change("smallest", 110.0),
+                        ],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                old_formula: None,
+                new_formula: None,
+            }],
+        };
+
+        let summary = file_metrics_summary(&diff, "sample").unwrap();
+        assert!(summary.starts_with("largest "));
+        assert!(summary.contains("sixth "));
+        assert!(!summary.contains("seventh "));
+        assert!(!summary.contains("smallest "));
+        assert_eq!(summary.matches(" · ").count(), 5);
     }
 }

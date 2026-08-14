@@ -70,6 +70,10 @@ pub(crate) struct Category {
     pub new_ids: Vec<String>,
     /// Full ids of traits that existed before and were escalated in criticality.
     pub escalated_ids: Vec<String>,
+    /// Cleave's per-trait importance (`criticality weight × confidence`).
+    /// Judgement keeps every id; terminal rendering uses this only to choose
+    /// the most informative leaves when space is bounded.
+    pub trait_scores: HashMap<String, f32>,
 }
 
 impl Assessment {
@@ -271,9 +275,16 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &HashSet<String>) -> Ass
                     namespaces: Vec::new(),
                     new_ids: Vec::new(),
                     escalated_ids: Vec::new(),
+                    trait_scores: HashMap::new(),
                 });
                 entry.severity = entry.severity.max(sev);
                 entry.namespaces.push(namespace_of(&tc.id));
+                let score = tc.crit.score_weight() as f32 * tc.conf;
+                entry
+                    .trait_scores
+                    .entry(tc.id.clone())
+                    .and_modify(|old| *old = old.max(score))
+                    .or_insert(score);
                 if is_new {
                     entry.new_ids.push(tc.id.clone());
                 } else {

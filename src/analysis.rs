@@ -31,13 +31,11 @@ pub(crate) fn diff(
     new: &Path,
     options: &cleave::AnalysisOptions,
 ) -> Result<AnalysisReport> {
-    cleave::diff::diff_paths(
-        old,
-        new,
-        options,
-        cleave::diff::ScopeMask::all(),
-        cleave::diff::DEFAULT_LIMIT_CHANGES,
-    )
+    // Analysis and JSON retain the complete differential. Human renderers own
+    // their presentation caps and rank what they show; imposing Cleave's CLI
+    // row cap here would silently remove inputs from the rubric and feature
+    // record before either consumer sees them.
+    cleave::diff::diff_paths(old, new, options, cleave::diff::ScopeMask::all(), 0)
 }
 
 /// How much of a change a run actually looked at.
@@ -1362,9 +1360,10 @@ impl<'a> Analysis<'a> {
             .iter()
             .find_map(|f| f.identity.as_ref())
             .map_or((None, None), |idd| (idd.old.as_ref(), idd.new.as_ref()));
+        let features = feature_set(self.display_diff());
 
         let envelope = j::Envelope {
-            v: "1",
+            v: "2",
             eng: concat!("isomer/", env!("CARGO_PKG_VERSION")),
             verb: self.verb,
             artifact: (!self.naming.name.is_empty()).then_some(self.naming.name.as_str()),
@@ -1435,6 +1434,7 @@ impl<'a> Analysis<'a> {
                     facts,
                 },
             },
+            features,
             evidence,
             deps: self
                 .deps
@@ -1461,6 +1461,272 @@ impl<'a> Analysis<'a> {
 /// Evidence hunks to embed in `--format json`. Higher than the terminal's
 /// display cap: the JSON is a complete, cacheable record, not a screenful.
 const EVIDENCE_JSON_CAP: usize = 24;
+
+/// Convert Cleave's complete judged differential into a compact, stable
+/// feature record. This intentionally has no display cap: terminal rendering
+/// is the only consumer allowed to discard low-importance rows.
+fn feature_set(diff: &DiffReportV1) -> crate::json::FeatureSet<'_> {
+    use crate::json as j;
+
+    let summary = &diff.summary;
+    let compared = summary.files_added
+        + summary.files_removed
+        + summary.files_changed
+        + summary.files_unchanged;
+    j::FeatureSet {
+        v: "1",
+        topology: j::Topology {
+            added: summary.files_added,
+            removed: summary.files_removed,
+            changed: summary.files_changed,
+            unchanged: summary.files_unchanged,
+            compared,
+        },
+        scopes: feature_scopes(&diff.scopes),
+        files: diff.files.iter().map(file_features).collect(),
+    }
+}
+
+fn feature_scopes(scopes: &ScopeDiffs) -> crate::json::FeatureScopes {
+    crate::json::FeatureScopes {
+        traits: scopes.traits.as_ref().map(scope_stats),
+        metrics: scopes.metrics.as_ref().map(scope_stats),
+        facts: scopes.kv.as_ref().map(scope_stats),
+        symbols: scopes.symbols.as_ref().map(scope_stats),
+        strings: scopes.strings.as_ref().map(scope_stats),
+        sections: scopes.sections.as_ref().map(scope_stats),
+    }
+}
+
+fn scope_stats<T>(scope: &ScopeDiff<T>) -> crate::json::ScopeStats {
+    crate::json::ScopeStats {
+        added: scope.added.len(),
+        removed: scope.removed.len(),
+        changed: scope.changed.len(),
+        old_count: scope.old_count,
+        new_count: scope.new_count,
+        old_weight: scope.old_weight,
+        new_weight: scope.new_weight,
+        change_weight: scope.change_weight,
+        roc: scope.roc,
+        truncated: scope.truncated,
+    }
+}
+
+fn file_features(file: &FileDiffEntry) -> crate::json::FileFeatures<'_> {
+    use crate::json as j;
+
+    j::FileFeatures {
+        path: &file.path,
+        file_type: file.file_type.as_deref(),
+        status: file_status(file.status),
+        archive_depth: file.path.matches("!!").count(),
+        identity_changed: file.identity.as_ref().is_some_and(|id| id.changed),
+        scopes: feature_scopes(&file.scopes),
+        traits: trait_features(file.scopes.traits.as_ref()),
+        metrics: metric_features(file.scopes.metrics.as_ref()),
+        facts: fact_features(file.scopes.kv.as_ref()),
+        sections: section_features(file.scopes.sections.as_ref()),
+    }
+}
+
+fn file_status(status: FileStatus) -> &'static str {
+    match status {
+        FileStatus::Added => "added",
+        FileStatus::Removed => "removed",
+        FileStatus::Changed => "changed",
+        FileStatus::Unchanged => "unchanged",
+    }
+}
+
+fn trait_side(t: &TraitChange) -> crate::json::TraitSide<'_> {
+    crate::json::TraitSide {
+        criticality: criticality_name(t.crit),
+        confidence: t.conf,
+        score: t.crit.score_weight() as f32 * t.conf,
+        count: t.count,
+        description: &t.desc,
+    }
+}
+
+fn criticality_name(criticality: cleave::Criticality) -> &'static str {
+    match criticality {
+        cleave::Criticality::Hostile => "hostile",
+        cleave::Criticality::Suspicious => "suspicious",
+        cleave::Criticality::Notable => "notable",
+        cleave::Criticality::Baseline => "baseline",
+        cleave::Criticality::Component => "component",
+        cleave::Criticality::Exception => "exception",
+        cleave::Criticality::Filtered => "filtered",
+    }
+}
+
+fn trait_features(scope: Option<&ScopeDiff<TraitChange>>) -> Vec<crate::json::TraitDelta<'_>> {
+    use crate::json::TraitDelta;
+
+    let Some(scope) = scope else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(scope.added.len() + scope.removed.len() + scope.changed.len());
+    out.extend(scope.added.iter().map(|t| TraitDelta {
+        id: &t.id,
+        change: "added",
+        old: None,
+        new: Some(trait_side(t)),
+    }));
+    out.extend(scope.removed.iter().map(|t| TraitDelta {
+        id: &t.id,
+        change: "removed",
+        old: Some(trait_side(t)),
+        new: None,
+    }));
+    out.extend(scope.changed.iter().map(|t| TraitDelta {
+        id: &t.new.id,
+        change: "changed",
+        old: Some(trait_side(&t.old)),
+        new: Some(trait_side(&t.new)),
+    }));
+    out
+}
+
+fn numeric_delta(old: Option<f64>, new: Option<f64>) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let delta = match (old, new) {
+        (Some(old), Some(new)) => Some(new - old),
+        (None, Some(new)) => Some(new),
+        (Some(old), None) => Some(-old),
+        (None, None) => None,
+    };
+    let absolute = delta.map(f64::abs);
+    let relative = match (old, new) {
+        (Some(old), Some(new)) if old != 0.0 => Some((new - old) / old.abs()),
+        _ => None,
+    };
+    (delta, absolute, relative)
+}
+
+fn value_delta<'a>(
+    path: &'a str,
+    change: &'static str,
+    old: Option<&'a serde_json::Value>,
+    new: Option<&'a serde_json::Value>,
+) -> crate::json::ValueDelta<'a> {
+    let (delta, absolute_delta, relative_delta) = numeric_delta(
+        old.and_then(serde_json::Value::as_f64),
+        new.and_then(serde_json::Value::as_f64),
+    );
+    crate::json::ValueDelta {
+        path,
+        change,
+        old,
+        new,
+        delta,
+        absolute_delta,
+        relative_delta,
+    }
+}
+
+fn metric_features(scope: Option<&ScopeDiff<MetricChange>>) -> Vec<crate::json::ValueDelta<'_>> {
+    let Some(scope) = scope else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(scope.added.len() + scope.removed.len() + scope.changed.len());
+    out.extend(
+        scope
+            .added
+            .iter()
+            .map(|m| value_delta(&m.path, "added", None, Some(&m.value))),
+    );
+    out.extend(
+        scope
+            .removed
+            .iter()
+            .map(|m| value_delta(&m.path, "removed", Some(&m.value), None)),
+    );
+    out.extend(scope.changed.iter().map(|m| {
+        value_delta(
+            &m.new.path,
+            "changed",
+            Some(&m.old.value),
+            Some(&m.new.value),
+        )
+    }));
+    out
+}
+
+fn fact_features(scope: Option<&ScopeDiff<KvChange>>) -> Vec<crate::json::FactDelta<'_>> {
+    use crate::json::FactDelta;
+
+    let Some(scope) = scope else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(scope.added.len() + scope.removed.len() + scope.changed.len());
+    out.extend(scope.added.iter().map(|f| FactDelta {
+        path: &f.path,
+        namespace: &f.namespace,
+        change: "added",
+        old: None,
+        new: Some(&f.value),
+    }));
+    out.extend(scope.removed.iter().map(|f| FactDelta {
+        path: &f.path,
+        namespace: &f.namespace,
+        change: "removed",
+        old: Some(&f.value),
+        new: None,
+    }));
+    out.extend(scope.changed.iter().map(|f| FactDelta {
+        path: &f.new.path,
+        namespace: &f.new.namespace,
+        change: "changed",
+        old: Some(&f.old.value),
+        new: Some(&f.new.value),
+    }));
+    out
+}
+
+fn section_side(s: &SectionChange) -> crate::json::SectionSide<'_> {
+    crate::json::SectionSide {
+        size: s.size,
+        entropy: s.entropy,
+        permissions: s.permissions.as_deref(),
+    }
+}
+
+fn section_features(
+    scope: Option<&ScopeDiff<SectionChange>>,
+) -> Vec<crate::json::SectionDelta<'_>> {
+    use crate::json::SectionDelta;
+
+    let Some(scope) = scope else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(scope.added.len() + scope.removed.len() + scope.changed.len());
+    out.extend(scope.added.iter().map(|s| SectionDelta {
+        name: &s.name,
+        change: "added",
+        old: None,
+        new: Some(section_side(s)),
+        size_delta: Some(i128::from(s.size)),
+        entropy_delta: None,
+    }));
+    out.extend(scope.removed.iter().map(|s| SectionDelta {
+        name: &s.name,
+        change: "removed",
+        old: Some(section_side(s)),
+        new: None,
+        size_delta: Some(-i128::from(s.size)),
+        entropy_delta: None,
+    }));
+    out.extend(scope.changed.iter().map(|s| SectionDelta {
+        name: &s.new.name,
+        change: "changed",
+        old: Some(section_side(&s.old)),
+        new: Some(section_side(&s.new)),
+        size_delta: Some(i128::from(s.new.size) - i128::from(s.old.size)),
+        entropy_delta: Some(s.new.entropy - s.old.entropy),
+    }));
+    out
+}
 
 /// Map an ML malware probability to a severity band (mirrors the risk words:
 /// benign / elevated / suspicious / malware).
@@ -1685,6 +1951,7 @@ fn normalized_archive_diff(diff: &DiffReportV1) -> DiffReportV1 {
             };
         files.push(FileDiffEntry {
             path: new.path.clone(),
+            file_type: new.file_type.clone().or_else(|| old.file_type.clone()),
             status,
             identity,
             scopes,
@@ -3274,7 +3541,7 @@ mod tests {
         changed_identity_claims, changed_test_carrier, endgame_package_shape,
         executable_member_layout, external_remote_script_loader, identity_claim_fields,
         immediate_entry_return_count, is_compiled_binary_file_type, is_source_archive, line_diff,
-        normalized_archive_diff, normalized_member_path, npm_snapshot_member_key,
+        normalized_archive_diff, normalized_member_path, npm_snapshot_member_key, numeric_delta,
         obfuscated_remote_script_loader, removed_high_risk_traits, restored_endgame_package_shape,
         source_build_macro_score,
     };
@@ -3305,11 +3572,32 @@ mod tests {
     }
 
     #[test]
+    fn numeric_feature_deltas_are_signed_and_safe_at_zero() {
+        assert_eq!(
+            numeric_delta(Some(10.0), Some(15.0)),
+            (Some(5.0), Some(5.0), Some(0.5))
+        );
+        assert_eq!(
+            numeric_delta(None, Some(15.0)),
+            (Some(15.0), Some(15.0), None)
+        );
+        assert_eq!(
+            numeric_delta(Some(15.0), None),
+            (Some(-15.0), Some(15.0), None)
+        );
+        assert_eq!(
+            numeric_delta(Some(0.0), Some(2.0)),
+            (Some(2.0), Some(2.0), None)
+        );
+    }
+
+    #[test]
     fn attack_removal_requires_strong_disappearing_traits_and_no_replacement() {
         let finding = |id: &str, crit| TraitChange {
             id: id.to_string(),
             trait_section: "objectives".to_string(),
             crit,
+            conf: 1.0,
             desc: id.to_string(),
             count: 1,
         };
@@ -3320,6 +3608,7 @@ mod tests {
             scopes: ScopeDiffs::default(),
             files: vec![FileDiffEntry {
                 path: "workflow.yml".to_string(),
+                file_type: Some("yaml".to_string()),
                 status: FileStatus::Changed,
                 identity: None,
                 scopes: ScopeDiffs {
@@ -3397,6 +3686,7 @@ mod tests {
             id: id.to_string(),
             trait_section: "metadata".to_string(),
             crit: Criticality::Notable,
+            conf: 1.0,
             desc: "declared entrypoint absent".to_string(),
             count: 1,
         };
@@ -3416,6 +3706,7 @@ mod tests {
             scopes: Default::default(),
             files: vec![FileDiffEntry {
                 path: "<root>".to_string(),
+                file_type: None,
                 status: FileStatus::Changed,
                 identity: None,
                 scopes: ScopeDiffs {
@@ -3444,6 +3735,7 @@ mod tests {
             id: format!("micro-behaviors/test::{suffix}"),
             trait_section: "micro-behaviors".to_string(),
             crit: Criticality::Notable,
+            conf: 1.0,
             desc: suffix.to_string(),
             count: 1,
         };
@@ -3454,6 +3746,7 @@ mod tests {
             scopes: Default::default(),
             files: vec![FileDiffEntry {
                 path: "<root>!!package/browser.js".to_string(),
+                file_type: Some("javascript".to_string()),
                 status: FileStatus::Changed,
                 identity: None,
                 scopes: ScopeDiffs {
@@ -3629,11 +3922,13 @@ mod tests {
             id: id.to_string(),
             trait_section: "micro-behaviors".to_string(),
             crit: Criticality::Notable,
+            conf: 1.0,
             desc: "same trait".to_string(),
             count: 1,
         };
         let old = FileDiffEntry {
             path: "<root>!!widget-1.0.0/lib/a.php".to_string(),
+            file_type: Some("php".to_string()),
             status: FileStatus::Removed,
             identity: None,
             scopes: ScopeDiffs {
@@ -3651,6 +3946,7 @@ mod tests {
         };
         let new = FileDiffEntry {
             path: "<root>!!widget-1.0.1/lib/a.php".to_string(),
+            file_type: Some("php".to_string()),
             status: FileStatus::Added,
             identity: None,
             scopes: ScopeDiffs {
@@ -3685,6 +3981,7 @@ mod tests {
     fn npm_package_root_pairs_with_versioned_source_snapshot() {
         let old = FileDiffEntry {
             path: "<root>!!flatmap-stream-0.1.0/index.min.js".to_string(),
+            file_type: Some("javascript".to_string()),
             status: FileStatus::Removed,
             identity: None,
             scopes: ScopeDiffs::default(),
@@ -3693,6 +3990,7 @@ mod tests {
         };
         let new = FileDiffEntry {
             path: "<root>!!package/index.min.js".to_string(),
+            file_type: Some("javascript".to_string()),
             status: FileStatus::Added,
             identity: None,
             scopes: ScopeDiffs::default(),
@@ -3748,6 +4046,7 @@ mod tests {
     fn changed_test_carrier_requires_compression_and_test_context() {
         let entry = |path: &str, status| FileDiffEntry {
             path: path.to_string(),
+            file_type: None,
             status,
             identity: None,
             scopes: ScopeDiffs::default(),
