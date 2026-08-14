@@ -1086,22 +1086,28 @@ mod tests {
 
     #[test]
     fn filename_fallback_is_not_treated_as_package_identity_drift() {
-        let mut reconstructed = filefacts::Identity::default();
-        reconstructed.name = Some(filefacts::Claim::claimed("@bitwarden-cli", "file.basename"));
-        reconstructed.version = Some(filefacts::Claim::claimed(
-            "2026.4.0-RECONSTRUCTED",
-            "file.basename",
-        ));
+        let reconstructed = filefacts::Identity {
+            name: Some(filefacts::Claim::claimed("@bitwarden-cli", "file.basename")),
+            version: Some(filefacts::Claim::claimed(
+                "2026.4.0-RECONSTRUCTED",
+                "file.basename",
+            )),
+            ..Default::default()
+        };
 
-        let mut package = filefacts::Identity::default();
-        package.name = Some(filefacts::Claim::claimed("@bitwarden/cli", "npm.name"));
+        let package = filefacts::Identity {
+            name: Some(filefacts::Claim::claimed("@bitwarden/cli", "npm.name")),
+            ..Default::default()
+        };
 
         assert!(meaningful_identity_changes(Some(&reconstructed), Some(&package)).is_empty());
         assert!(filename_only_identity(&reconstructed));
         assert!(!filename_only_identity(&package));
 
-        let mut renamed_package = filefacts::Identity::default();
-        renamed_package.name = Some(filefacts::Claim::claimed("@bitwarden/sdk", "npm.name"));
+        let renamed_package = filefacts::Identity {
+            name: Some(filefacts::Claim::claimed("@bitwarden/sdk", "npm.name")),
+            ..Default::default()
+        };
         let changes = meaningful_identity_changes(Some(&package), Some(&renamed_package));
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].label, "package name");

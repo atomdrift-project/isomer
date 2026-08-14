@@ -1,6 +1,6 @@
 [package]
 name = "isomer"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
@@ -81,6 +81,21 @@ large_futures = "warn"
 map_err_ignore = "warn"
 significant_drop_in_scrutinee = "warn"
 significant_drop_tightening = "warn"
+
+# Thin LTO + cu=16 keeps most of fat LTO's runtime gain at roughly a third of
+# the link time — the right default for everyday `cargo build --release`.
+[profile.release]
+strip = "debuginfo"
+lto = "thin"
+codegen-units = 16
+
+# Distribution profile: fat LTO + single codegen unit. Squeezes out the last
+# few percent of runtime at the cost of multi-minute link times. release.yml
+# builds every shipped binary with this.
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 
 [patch.crates-io]
 # Mirrors cleave's patch section — patches only apply at the workspace root,
