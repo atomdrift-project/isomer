@@ -9,13 +9,19 @@
 
 use crate::Severity;
 
-/// A parsed `major.minor.patch` version. Pre-release / build metadata is kept
-/// in `raw` for display but does not affect bump classification.
+/// A parsed dotted-numeric version. Pre-release / build metadata is kept in
+/// `raw` for display but does not affect bump classification.
+///
+/// The first three components retain their usual major/minor/patch meaning.
+/// Additional numeric components are preserved because WordPress and Windows
+/// packages commonly use four-part versions (`4.4.6.4`, `10.0.19045.4046`).
+/// For release-tolerance purposes those deeper components are patch-level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Version {
     pub major: u64,
     pub minor: u64,
     pub patch: u64,
+    extra: Vec<u64>,
     /// The version in normalized dotted form: `parse` keeps its input verbatim
     /// (so a `-rc2` or `+build` suffix survives), while `detect` and
     /// `from_claim` rewrite their separators — `4_3_0` and `4, 3, 0, 0` both
@@ -25,20 +31,39 @@ pub(crate) struct Version {
 }
 
 impl Version {
-    /// Parse a bare version token (`5.6.0`, `1.2`, `3.0.1-rc2`). Requires at
-    /// least `major.minor`; a missing patch defaults to 0.
+    /// Parse a bare version token (`5.6.0`, `1.2`, `4.4.6.4`,
+    /// `3.0.1-rc2`). Requires at least `major.minor`; a missing patch defaults
+    /// to 0 and every numeric component is retained.
     pub(crate) fn parse(s: &str) -> Option<Self> {
         let core = s.split(['-', '+']).next().unwrap_or(s);
-        let mut it = core.split('.');
-        let major = it.next()?.parse().ok()?;
-        let minor = it.next()?.parse().ok()?;
-        let patch = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let parts = core
+            .split('.')
+            .map(str::parse)
+            .collect::<Result<Vec<u64>, _>>()
+            .ok()?;
+        if parts.len() < 2 {
+            return None;
+        }
         Some(Self {
-            major,
-            minor,
-            patch,
+            major: parts[0],
+            minor: parts[1],
+            patch: parts.get(2).copied().unwrap_or(0),
+            extra: parts.get(3..).unwrap_or_default().to_vec(),
             raw: s.to_string(),
         })
+    }
+
+    fn component(&self, index: usize) -> u64 {
+        match index {
+            0 => self.major,
+            1 => self.minor,
+            2 => self.patch,
+            _ => self.extra.get(index - 3).copied().unwrap_or(0),
+        }
+    }
+
+    fn component_count(&self) -> usize {
+        3 + self.extra.len()
     }
 
     /// Extract the most complete version-like token from a filename, e.g.
@@ -111,22 +136,31 @@ pub(crate) struct Bump {
 
 impl Bump {
     pub(crate) fn classify(old: &Version, new: &Version) -> Bump {
-        use std::cmp::Ordering::{Equal, Greater, Less};
-        let (kind, steps) = match (
-            new.major.cmp(&old.major),
-            new.minor.cmp(&old.minor),
-            new.patch.cmp(&old.patch),
-        ) {
-            (Greater, _, _) => (BumpKind::Major, new.major - old.major),
-            (Equal, Greater, _) => (BumpKind::Minor, new.minor - old.minor),
-            (Equal, Equal, Greater) => (BumpKind::Patch, new.patch - old.patch),
-            (Equal, Equal, Equal) => (BumpKind::Same, 0),
-            // Whichever component moved backwards, the release went backwards;
-            // the depth it happened at carries no extra signal. The arms above
-            // are mutually exclusive with these, so order is not load-bearing.
-            (Less, _, _) | (Equal, Less, _) | (Equal, Equal, Less) => (BumpKind::Downgrade, 0),
-        };
-        Bump { kind, steps }
+        let width = old.component_count().max(new.component_count());
+        for index in 0..width {
+            let old_part = old.component(index);
+            let new_part = new.component(index);
+            if new_part < old_part {
+                return Bump {
+                    kind: BumpKind::Downgrade,
+                    steps: 0,
+                };
+            }
+            if new_part > old_part {
+                return Bump {
+                    kind: match index {
+                        0 => BumpKind::Major,
+                        1 => BumpKind::Minor,
+                        _ => BumpKind::Patch,
+                    },
+                    steps: new_part - old_part,
+                };
+            }
+        }
+        Bump {
+            kind: BumpKind::Same,
+            steps: 0,
+        }
     }
 
     pub(crate) fn label(self) -> &'static str {
@@ -212,6 +246,14 @@ mod tests {
         assert_eq!(
             Bump::classify(&v("2.0.0").unwrap(), &v("1.9.9").unwrap()).kind,
             BumpKind::Downgrade
+        );
+
+        let wordpress = Bump::classify(&v("4.4.6.3").unwrap(), &v("4.4.6.4").unwrap());
+        assert_eq!(wordpress.kind, BumpKind::Patch);
+        assert_eq!(wordpress.describe(), "patch release");
+        assert_eq!(
+            Bump::classify(&v("4.3.0.0").unwrap(), &v("4.3.0").unwrap()).kind,
+            BumpKind::Same
         );
     }
 
