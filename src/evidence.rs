@@ -389,6 +389,10 @@ fn file_hunks(
         // member is not evidence for a composite that fired here.
         let promotions = composite_promotions(fa, gained_ids);
         let keep = |id: &str| gained_ids.contains(id) || promotions.contains_key(id);
+        let site = Site {
+            file: pair.label.as_str(),
+            member: member.as_deref(),
+        };
         // Source-additions path: when both sides' text is in reach, the change
         // *is* the added lines — show them whole (matched or not), so an attack
         // whose payload sits a few lines from the trait hit (unrealircd's
@@ -400,16 +404,7 @@ fn file_hunks(
         ) && !new_src.is_empty()
             && !looks_binary(&new_src)
         {
-            addition_hunks(
-                &new_src,
-                &old_src,
-                fa,
-                &keep,
-                &promotions,
-                &pair.label,
-                member.as_deref(),
-                all,
-            );
+            addition_hunks(&new_src, &old_src, fa, &keep, &promotions, site, all);
             continue;
         }
 
@@ -431,7 +426,6 @@ fn file_hunks(
             if chunk.line.is_none() && ((container && member.is_none()) || top.off == 0) {
                 continue;
             }
-            let label = pair.label.as_str();
             all.push(match chunk.line {
                 Some(first) => text_hunk(
                     chunk,
@@ -439,11 +433,10 @@ fn file_hunks(
                     &kept,
                     top,
                     &promotions,
-                    label,
-                    member.as_deref(),
+                    site,
                     old_lines.as_ref(),
                 ),
-                None => binary_hunk(chunk, top, &promotions, label, member.as_deref()),
+                None => binary_hunk(chunk, top, &promotions, site),
             });
         }
     }
@@ -459,6 +452,21 @@ fn member_source(archive_or_file: Option<&Path>, member: Option<&str>) -> Option
     match member {
         None => std::fs::read(p).ok(),
         Some(m) => cleave::extract_member(p, m).ok().flatten(),
+    }
+}
+
+/// Where a hunk was found: the compared file, and the member inside it when
+/// that file is an archive. Every hunk builder needs both, and every one of
+/// them names the hunk by the member when there is one.
+#[derive(Debug, Clone, Copy)]
+struct Site<'a> {
+    file: &'a str,
+    member: Option<&'a str>,
+}
+
+impl<'a> Site<'a> {
+    fn name(self) -> &'a str {
+        self.member.unwrap_or(self.file)
     }
 }
 
@@ -485,8 +493,7 @@ fn addition_hunks(
     fa: &cleave::types::FileAnalysis,
     keep: &impl Fn(&str) -> bool,
     promotions: &HashMap<&str, Attribution>,
-    file: &str,
-    member: Option<&str>,
+    site: Site<'_>,
     all: &mut Vec<Hunk>,
 ) {
     // Lines only on the new side (set-based, matching `analysis::line_diff` so
@@ -530,9 +537,7 @@ fn addition_hunks(
         if (start..i).all(|k| new_lines[k].trim().is_empty()) {
             continue;
         }
-        all.push(addition_run(
-            &new_lines, start, i, &hit, promotions, file, member,
-        ));
+        all.push(addition_run(&new_lines, start, i, &hit, promotions, site));
     }
 }
 
@@ -545,8 +550,7 @@ fn addition_run(
     end: usize,
     hit: &std::collections::HashMap<usize, &cleave::types::Note>,
     promotions: &HashMap<&str, Attribution>,
-    file: &str,
-    member: Option<&str>,
+    site: Site<'_>,
 ) -> Hunk {
     /// Lines shown before the run is summarized — a per-run twin of
     /// [`MAX_HUNKS`], generous enough for a whole small payload.
@@ -591,11 +595,11 @@ fn addition_run(
         None => (Severity::None, 0.0, String::new(), String::new()),
     };
     Hunk {
-        file: file.to_string(),
-        member: member.map(str::to_string),
+        file: site.file.to_string(),
+        member: site.member.map(str::to_string),
         line: Some(first_line as u64),
         loc: first_line as u64,
-        location: format!("{}:{first_line}", member.unwrap_or(file)),
+        location: format!("{}:{first_line}", site.name()),
         id,
         desc,
         severity,
@@ -712,8 +716,7 @@ fn text_hunk(
     kept: &[&cleave::types::Note],
     top: &cleave::types::Note,
     promotions: &HashMap<&str, Attribution>,
-    file: &str,
-    member: Option<&str>,
+    site: Site<'_>,
     old: Option<&HashSet<String>>,
 ) -> Hunk {
     let attribution = attribution(top, promotions);
@@ -756,11 +759,11 @@ fn text_hunk(
         });
     }
     Hunk {
-        file: file.to_string(),
-        member: member.map(str::to_string),
+        file: site.file.to_string(),
+        member: site.member.map(str::to_string),
         line: Some(first_line + top_idx as u64),
         loc: top.off,
-        location: format!("{}:{}", member.unwrap_or(file), first_line + top_idx as u64),
+        location: format!("{}:{}", site.name(), first_line + top_idx as u64),
         id: attribution.id,
         desc: attribution.desc,
         severity: attribution.severity,
@@ -780,8 +783,7 @@ fn binary_hunk(
     chunk: &cleave::types::ContextLine,
     top: &cleave::types::Note,
     promotions: &HashMap<&str, Attribution>,
-    file: &str,
-    member: Option<&str>,
+    site: Site<'_>,
 ) -> Hunk {
     let attribution = attribution(top, promotions);
     const STRIDE: usize = 16;
@@ -801,11 +803,11 @@ fn binary_hunk(
         })
         .collect();
     Hunk {
-        file: file.to_string(),
-        member: member.map(str::to_string),
+        file: site.file.to_string(),
+        member: site.member.map(str::to_string),
         line: None,
         loc: top.off,
-        location: member.unwrap_or(file).to_string(),
+        location: site.name().to_string(),
         id: attribution.id,
         desc: attribution.desc,
         severity: attribution.severity,
@@ -1327,7 +1329,7 @@ mod tests {
                     id: "objectives/impact/destroy::late".into(),
                     desc: "late destructive behavior".into(),
                     off,
-                    len: target.len() as u32,
+                    len: u32::try_from(target.len()).unwrap(),
                     conf: 1.0,
                 }],
             }],
@@ -1340,8 +1342,10 @@ mod tests {
             &file,
             &|_| true,
             &HashMap::new(),
-            "generated.js",
-            None,
+            Site {
+                file: "generated.js",
+                member: None,
+            },
             &mut hunks,
         );
 

@@ -123,6 +123,16 @@ fn existing(p: std::path::PathBuf) -> Option<std::path::PathBuf> {
     p.is_file().then_some(p)
 }
 
+/// Whether the file's trait scope moved at all — the test for "this file
+/// changed behavior", regardless of how small the change was judged.
+fn traits_moved(entry: &FileDiffEntry) -> bool {
+    entry
+        .scopes
+        .traits
+        .as_ref()
+        .is_some_and(|traits| !traits.added.is_empty() || !traits.removed.is_empty())
+}
+
 /// Trait atoms that moved on one file, worst criticality first. Added and
 /// removed together — a reviewer wants both directions of a source change.
 fn trait_atoms(entry: &FileDiffEntry) -> Vec<Atom> {
@@ -657,14 +667,17 @@ impl<'a> Analysis<'a> {
         // the basename, so it can't be matched to the pair by path — but there
         // is only one pair, so the lone changed entry is unambiguously its.
         let single = self.pairs.len() == 1;
-        if single
+        // An archive comparison is one pair — the container — while the files
+        // that changed are members inside it (`container!!member`). Their text
+        // has to come back out of the archive, so they get their own walk.
+        if let [container] = self.pairs.as_slice()
             && self
                 .judged_diff
                 .files
                 .iter()
                 .any(|file| file.path.contains("!!"))
         {
-            return self.collect_archive_source_changes(&self.pairs[0]);
+            return self.collect_archive_source_changes(container);
         }
         let mut out = Vec::new();
         for pair in &self.pairs {
@@ -674,10 +687,7 @@ impl<'a> Analysis<'a> {
             let Some(entry) = self.diff.files.iter().find(|f| {
                 !matches!(f.status, FileStatus::Unchanged)
                     && (single || f.path == pair.label)
-                    && f.scopes
-                        .traits
-                        .as_ref()
-                        .is_some_and(|t| !t.added.is_empty() || !t.removed.is_empty())
+                    && traits_moved(f)
             }) else {
                 continue;
             };
@@ -712,48 +722,31 @@ impl<'a> Analysis<'a> {
         out
     }
 
-    fn collect_archive_source_changes(&self, pair: &Pair) -> Vec<SourceChange> {
-        let (Some(old_archive), Some(new_archive)) = (pair.old.as_deref(), pair.new.as_deref())
+    /// The archive counterpart of [`collect_source_changes`](Self::collect_source_changes):
+    /// every changed source member of the container, each side extracted so the
+    /// member gets the same whole line diff a plain file would.
+    fn collect_archive_source_changes(&self, container: &Pair) -> Vec<SourceChange> {
+        let (Some(old_archive), Some(new_archive)) =
+            (container.old.as_deref(), container.new.as_deref())
         else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for entry in
-            self.judged_diff.files.iter().filter(|entry| {
-                matches!(entry.status, FileStatus::Changed)
-                    && member_type(entry).is_some_and(|file_type| file_type.is_source_code())
-                    && entry.scopes.traits.as_ref().is_some_and(|traits| {
-                        !traits.added.is_empty() || !traits.removed.is_empty()
-                    })
-            })
-        {
-            let Some(old_member) = archive_member_for_side(self.diff, entry, true) else {
+        for entry in &self.judged_diff.files {
+            if !matches!(entry.status, FileStatus::Changed)
+                || !traits_moved(entry)
+                || !member_type(entry).is_some_and(|file_type| file_type.is_source_code())
+            {
+                continue;
+            }
+            let Some((old_member, new_member)) = archive_member_pair(self.diff, entry) else {
                 continue;
             };
-            let Some(new_member) = archive_member_for_side(self.diff, entry, false) else {
+            let (Some(old_bytes), Some(new_bytes)) = (
+                archive_member_bytes(old_archive, old_member),
+                archive_member_bytes(new_archive, new_member),
+            ) else {
                 continue;
-            };
-            let old_bytes = match extract_archive_member(old_archive, old_member) {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => continue,
-                Err(error) => {
-                    eprintln!(
-                        "isomer: could not extract {old_member} from {}: {error:#}",
-                        old_archive.display()
-                    );
-                    continue;
-                }
-            };
-            let new_bytes = match extract_archive_member(new_archive, new_member) {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => continue,
-                Err(error) => {
-                    eprintln!(
-                        "isomer: could not extract {new_member} from {}: {error:#}",
-                        new_archive.display()
-                    );
-                    continue;
-                }
             };
             out.push(SourceChange {
                 label: display_member_path(&entry.path).to_string(),
@@ -832,14 +825,13 @@ impl<'a> Analysis<'a> {
                 expansion.dependency
             );
         }
-        if let Some(chain) = source_download_write_execute_anomaly(
+        if let Some(member) = source_download_write_execute_anomaly(
             self.display_diff(),
             self.naming.bump,
             &self.survey.runtime_entrypoints,
         ) {
             return format!(
-                "auto-loaded source downloads, writes, and executes a payload in {}",
-                display_member_path(&chain.file)
+                "auto-loaded source downloads, writes, and executes a payload in {member}"
             );
         }
         if obfuscated_remote_script_loader(self.display_diff()) {
@@ -1003,14 +995,13 @@ impl<'a> Analysis<'a> {
                 expansion.spec,
             ));
         }
-        if let Some(chain) = source_download_write_execute_anomaly(
+        if let Some(member) = source_download_write_execute_anomaly(
             d,
             self.naming.bump,
             &self.survey.runtime_entrypoints,
         ) {
             lines.push(format!(
-                "source execution chain: {} gained platform-gated HTTP download → file write → process launch",
-                display_member_path(&chain.file),
+                "source execution chain: {member} gained platform-gated HTTP download → file write → process launch",
             ));
         }
         for dependency in &self.deps {
@@ -1680,48 +1671,47 @@ impl<'a> Analysis<'a> {
     }
 }
 
-/// Resolve a normalized changed member back to the raw archive path for one
-/// side. Version-root normalization can merge a raw Removed+Added pair into a
+/// Resolve a normalized changed member back to the raw archive paths of its two
+/// sides. Version-root normalization can merge a raw Removed+Added pair into a
 /// Changed entry, so extraction must recover each side's literal member name.
-fn archive_member_for_side<'a>(
+fn archive_member_pair<'a>(
     raw: &'a DiffReportV1,
     normalized: &FileDiffEntry,
-    old: bool,
-) -> Option<&'a str> {
+) -> Option<(&'a str, &'a str)> {
     let key = normalized_member_path(&normalized.path);
-    let candidates: Vec<&str> = raw
-        .files
-        .iter()
-        .filter(|entry| normalized_member_path(&entry.path) == key)
-        .filter(|entry| {
-            if old {
-                matches!(
-                    entry.status,
-                    FileStatus::Removed | FileStatus::Changed | FileStatus::Unchanged
-                )
-            } else {
-                matches!(
-                    entry.status,
-                    FileStatus::Added | FileStatus::Changed | FileStatus::Unchanged
-                )
-            }
-        })
-        .filter_map(|entry| entry.path.split_once("!!").map(|(_, member)| member))
-        .filter(|member| !member.contains('!'))
-        .collect();
-    match candidates.as_slice() {
-        [member] => Some(*member),
-        _ => None,
-    }
+    // The literal name this member goes by on the side it is not `absent` from
+    // — `Added` is the status missing from the old side, `Removed` from the
+    // new. Only a lone candidate names a side; several would be a guess.
+    let side = |absent: FileStatus| {
+        let mut members = raw
+            .files
+            .iter()
+            .filter(|entry| entry.status != absent && normalized_member_path(&entry.path) == key)
+            .filter_map(|entry| entry.path.split_once("!!").map(|(_, member)| member))
+            .filter(|member| !member.contains('!'));
+        let member = members.next()?;
+        members.next().is_none().then_some(member)
+    };
+    Some((side(FileStatus::Added)?, side(FileStatus::Removed)?))
 }
 
-fn extract_archive_member(archive: &Path, canonical_member: &str) -> Result<Option<Vec<u8>>> {
+/// The bytes of one archive member, or `None` when it cannot be read — an
+/// absence is ordinary, a failure is worth a word on stderr.
+fn archive_member_bytes(archive: &Path, canonical_member: &str) -> Option<Vec<u8>> {
     for candidate in archive_member_candidates(archive, canonical_member) {
-        if let Some(bytes) = cleave::extract_member(archive, &candidate)? {
-            return Ok(Some(bytes));
+        match cleave::extract_member(archive, &candidate) {
+            Ok(Some(bytes)) => return Some(bytes),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "isomer: could not extract {canonical_member} from {}: {error:#}",
+                    archive.display()
+                );
+                return None;
+            }
         }
     }
-    Ok(None)
+    None
 }
 
 /// Candidate literal member paths for Cleave's canonicalized archive path.
@@ -2838,6 +2828,19 @@ fn compact_change(s: &DiffSummary) -> bool {
     s.files_changed + s.files_added + s.files_removed <= 16
 }
 
+/// A release that claims to carry nothing new: the same version republished, a
+/// patch, or a prerelease. A major bump can legitimately arrive with new
+/// behavior, so the shape rules below spend their suspicion here, where the
+/// version number promises there is almost nothing to see.
+fn routine_release(bump: Option<Bump>) -> bool {
+    bump.is_some_and(|b| {
+        matches!(
+            b.kind,
+            BumpKind::Same | BumpKind::Patch | BumpKind::Prerelease
+        )
+    })
+}
+
 /// Whether the change introduced a capability class it did not have before —
 /// the probe the shape rules below are built from. An escalation of a class
 /// that already existed does not count: these rules are about new behavior.
@@ -2919,12 +2922,8 @@ fn change_shape_escalation(
     // pressure evidence only for same/patch releases: a major browser
     // framework can legitimately add a loader, but a patch has almost no
     // budget for a new remote-code path.
-    let remote_script_loader = bump.is_some_and(|b| {
-        matches!(
-            b.kind,
-            BumpKind::Same | BumpKind::Patch | BumpKind::Prerelease
-        ) && (obfuscated_remote_script_loader(diff) || external_remote_script_loader(diff))
-    });
+    let remote_script_loader = routine_release(bump)
+        && (obfuscated_remote_script_loader(diff) || external_remote_script_loader(diff));
     // A newly added encrypted ZIP disguised as another resource format is a
     // compact payload-delivery clue. Keep the differential rule narrow: it
     // must contain many encrypted entries and an executable member, so a
@@ -3231,12 +3230,8 @@ fn opaque_runtime_payload_anomaly(
     bump: Option<Bump>,
     runtime_entrypoints: &HashSet<String>,
 ) -> Option<OpaqueRuntimePayloadAnomaly> {
-    if !bump.is_some_and(|b| {
-        matches!(
-            b.kind,
-            BumpKind::Same | BumpKind::Patch | BumpKind::Prerelease
-        )
-    }) || !compact_change(&diff.summary)
+    if !routine_release(bump)
+        || !compact_change(&diff.summary)
         || diff.summary.overall_roc < 0.30
         || root_size_growth(diff).is_none_or(|growth| growth < 0.50)
     {
@@ -3395,14 +3390,7 @@ fn runtime_graft_anomaly(
     bump: Option<Bump>,
     runtime_entrypoints: &HashSet<String>,
 ) -> Option<RuntimeGraftAnomaly> {
-    if !bump.is_some_and(|b| {
-        matches!(
-            b.kind,
-            BumpKind::Same | BumpKind::Patch | BumpKind::Prerelease
-        )
-    }) || !compact_change(&diff.summary)
-        || diff.summary.overall_roc < 0.30
-    {
+    if !routine_release(bump) || !compact_change(&diff.summary) || diff.summary.overall_roc < 0.30 {
         return None;
     }
     let timestamp_spread = archive_timestamp_spread(diff)?;
@@ -3555,13 +3543,7 @@ fn dependency_backed_public_api_anomaly(
     bump: Option<Bump>,
     runtime_entrypoints: &HashSet<String>,
 ) -> Option<DependencyApiExpansion> {
-    if !bump.is_some_and(|b| {
-        matches!(
-            b.kind,
-            BumpKind::Same | BumpKind::Patch | BumpKind::Prerelease
-        )
-    }) || !compact_change(&diff.summary)
-    {
+    if !routine_release(bump) || !compact_change(&diff.summary) {
         return None;
     }
 
@@ -3635,7 +3617,7 @@ fn dependency_backed_public_api_anomaly(
 
 fn normalize_api_name(name: &str) -> String {
     name.chars()
-        .filter(|character| character.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect()
 }
@@ -3657,56 +3639,49 @@ fn floating_pre_one_spec(spec: &str) -> bool {
         || spec.eq_ignore_ascii_case("latest")
 }
 
-#[derive(Debug)]
-struct SourceExecutionChain {
-    file: String,
-}
-
 /// A package initializer or declared runtime entrypoint that newly downloads
 /// bytes, writes them to disk, and launches a process is a complete delivery
 /// chain even when the package already used HTTP and subprocesses elsewhere.
 /// Keep every leg file-local and require platform gating to avoid summing
-/// unrelated application behavior into a false payload.
-fn source_download_write_execute_anomaly(
-    diff: &DiffReportV1,
+/// unrelated application behavior into a false payload. Returns the member path
+/// carrying the chain.
+fn source_download_write_execute_anomaly<'a>(
+    diff: &'a DiffReportV1,
     bump: Option<Bump>,
     runtime_entrypoints: &HashSet<String>,
-) -> Option<SourceExecutionChain> {
-    if !bump.is_some_and(|b| {
-        matches!(
-            b.kind,
-            BumpKind::Same | BumpKind::Patch | BumpKind::Prerelease
-        )
-    }) || !compact_change(&diff.summary)
-    {
+) -> Option<&'a str> {
+    if !routine_release(bump) || !compact_change(&diff.summary) {
         return None;
     }
 
     diff.files.iter().find_map(|file| {
-        if !matches!(file.status, FileStatus::Added | FileStatus::Changed)
-            || !member_type(file).is_some_and(|file_type| file_type.is_source_code())
-        {
+        if !matches!(file.status, FileStatus::Added | FileStatus::Changed) {
             return None;
         }
+        let file_type = member_type(file).filter(filefacts::FileType::is_source_code)?;
+        // A Python package initializer runs on import, so it is an entrypoint
+        // whether or not the manifest ever names one.
         let path = display_member_path(&file.path);
-        let package_initializer = matches!(member_type(file), Some(filefacts::FileType::Python))
-            && path.rsplit('/').next() == Some("__init__.py");
-        if !package_initializer && !runtime_entrypoints.contains(path) {
+        let auto_loaded = (file_type == filefacts::FileType::Python
+            && path.rsplit('/').next() == Some("__init__.py"))
+            || runtime_entrypoints.contains(path);
+        if !auto_loaded {
             return None;
         }
         let traits = file.scopes.traits.as_ref()?;
-        let ids: Vec<&str> = traits
-            .added
-            .iter()
-            .map(|change| change.id.as_str())
-            .chain(traits.changed.iter().map(|change| change.new.id.as_str()))
-            .collect();
-        let classes: HashSet<String> = ids
-            .iter()
-            .filter_map(|id| crate::rubric::capability_class(id))
-            .collect();
-        let has_class = |prefix: &str| classes.iter().any(|class| class.starts_with(prefix));
-        let fetches_response = ids.iter().any(|id| {
+        let ids = || {
+            traits
+                .added
+                .iter()
+                .map(|change| change.id.as_str())
+                .chain(traits.changed.iter().map(|change| change.new.id.as_str()))
+        };
+        let has_class = |prefix: &str| {
+            ids()
+                .filter_map(crate::rubric::capability_class)
+                .any(|class| class.starts_with(prefix))
+        };
+        let fetches_response = ids().any(|id| {
             let id = id.to_ascii_lowercase();
             id.contains("download")
                 || id.contains("response-body-read")
@@ -3717,9 +3692,7 @@ fn source_download_write_execute_anomaly(
             && has_class("process/create")
             && (has_class("fs/write") || has_class("fs/file"))
             && has_class("os/sysinfo"))
-        .then(|| SourceExecutionChain {
-            file: file.path.clone(),
-        })
+        .then_some(path)
     })
 }
 
@@ -4217,7 +4190,7 @@ fn normalized_member_path(path: &str) -> String {
 /// commits; version-bearing roots are handled separately above.
 fn git_snapshot_root(root: &str) -> Option<&str> {
     let (name, commit) = root.rsplit_once('-')?;
-    (name.len() > 0
+    (!name.is_empty()
         && (7..=40).contains(&commit.len())
         && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
         && commit
@@ -4708,7 +4681,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_loaded_source_download_write_execute_chain_is_file_local() {
+    fn auto_loaded_source_or_script_download_write_execute_chain_is_file_local() {
         let gained = |id: &str| TraitChange {
             id: id.to_string(),
             trait_section: "micro-behaviors".to_string(),
@@ -4776,11 +4749,23 @@ mod tests {
             .is_none()
         );
 
-        let mut ordinary_helper = initializer;
+        let mut ordinary_helper = initializer.clone();
         ordinary_helper.path = "<root>!!pkg/pkg/updater.py".to_string();
         assert!(
             source_download_write_execute_anomaly(&report(ordinary_helper), patch, &HashSet::new())
                 .is_none()
+        );
+
+        let mut shell_entrypoint = initializer;
+        shell_entrypoint.path = "<root>!!pkg/install.sh".to_string();
+        shell_entrypoint.file_type = Some("shell".to_string());
+        assert!(
+            source_download_write_execute_anomaly(
+                &report(shell_entrypoint),
+                patch,
+                &HashSet::from(["pkg/install.sh".to_string()]),
+            )
+            .is_some()
         );
     }
 
