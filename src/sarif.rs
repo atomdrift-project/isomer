@@ -62,7 +62,7 @@ pub(crate) fn report(a: &Analysis<'_>) -> Result<String> {
     let mut results: Vec<Value> = Vec::new();
     for f in &findings {
         // One rule per distinct id; results carry the index back to it.
-        let index = match rules.iter().position(|r| r["id"] == json!(f.rule)) {
+        let index = match rules.iter().position(|r| r["id"].as_str() == Some(&f.rule)) {
             Some(i) => i,
             None => {
                 rules.push(json!({
@@ -74,7 +74,13 @@ pub(crate) fn report(a: &Analysis<'_>) -> Result<String> {
                     "defaultConfiguration": {"level": level(f.severity)},
                     "properties": {
                         "tags": f.tags,
-                        "problem.severity": problem_severity(f.severity),
+                        // GitHub's own vocabulary: the same three tiers as
+                        // `level`, except that its lowest is a recommendation.
+                        "problem.severity": match f.severity {
+                            Severity::Critical | Severity::High => "error",
+                            Severity::Medium => "warning",
+                            Severity::Low | Severity::None => "recommendation",
+                        },
                         "security-severity": security_severity(f.severity),
                     },
                 }));
@@ -137,9 +143,8 @@ fn findings(a: &Analysis<'_>) -> Vec<Finding> {
                 c.label,
                 c.namespaces.join(", "),
                 a.prop
-                    .note
-                    .as_ref()
-                    .filter(|_| a.prop.disproportionate)
+                    .drift
+                    .escalation_note()
                     .map(|n| format!(". {n}"))
                     .unwrap_or_default(),
             ),
@@ -192,8 +197,7 @@ fn findings(a: &Analysis<'_>) -> Vec<Finding> {
     }
 
     for ch in &assessment.identity.changes {
-        let old = if ch.old.is_empty() { "none" } else { &ch.old };
-        let new = if ch.new.is_empty() { "none" } else { &ch.new };
+        let (old, new) = ch.shown();
         out.push(Finding {
             rule: "isomer/identity".into(),
             name: "Publisher identity drift".into(),
@@ -247,21 +251,21 @@ fn findings(a: &Analysis<'_>) -> Vec<Finding> {
 /// of the change rather than of a line, so it lands on the first changed file
 /// with no region — better an imprecise location than a precise fiction.
 fn locate(a: &Analysis<'_>, hunks: &[&crate::evidence::Hunk], f: &Finding) -> Value {
-    let anchor = (!f.ids.is_empty() || !f.hints.is_empty())
-        .then(|| {
-            hunks
-                .iter()
-                .find(|h| f.ids.iter().any(|id| id == &h.id))
-                .or_else(|| {
-                    hunks
-                        .iter()
-                        .find(|h| f.hints.iter().any(|ns| h.id.contains(ns.as_str())))
-                })
-                // Still nothing: the strongest evidence in the change is a
-                // better pointer than an arbitrary file.
-                .or_else(|| hunks.first())
-        })
-        .flatten();
+    let anchor = if f.ids.is_empty() && f.hints.is_empty() {
+        None
+    } else {
+        hunks
+            .iter()
+            .find(|h| f.ids.iter().any(|id| id == &h.id))
+            .or_else(|| {
+                hunks
+                    .iter()
+                    .find(|h| f.hints.iter().any(|ns| h.id.contains(ns.as_str())))
+            })
+            // Still nothing: the strongest evidence in the change is a better
+            // pointer than an arbitrary file.
+            .or_else(|| hunks.first())
+    };
     if let Some(h) = anchor {
         let mut physical = json!({
             "artifactLocation": {"uri": uri(&h.file)},
@@ -299,14 +303,6 @@ fn level(sev: Severity) -> &'static str {
         Severity::Critical | Severity::High => "error",
         Severity::Medium => "warning",
         Severity::Low | Severity::None => "note",
-    }
-}
-
-fn problem_severity(sev: Severity) -> &'static str {
-    match sev {
-        Severity::Critical | Severity::High => "error",
-        Severity::Medium => "warning",
-        Severity::Low | Severity::None => "recommendation",
     }
 }
 

@@ -154,6 +154,15 @@ enum Gate {
     Any,
 }
 
+impl Cli {
+    /// Whether a long network step should draw a spinner: only when a human is
+    /// watching *and* reading the terminal report. A piped or JSON run stays
+    /// quiet so its output is exactly the report.
+    fn progress(&self) -> bool {
+        self.format == Format::Terminal && std::io::IsTerminal::is_terminal(&std::io::stderr())
+    }
+}
+
 impl Color {
     /// Apply the choice to the process-global colorize state that cleave's
     /// theme paints through. `auto` leaves the `colored` crate's own TTY and
@@ -333,6 +342,7 @@ pub(crate) fn write_stdout(s: &str) -> anyhow::Result<()> {
 
 /// Runs the selected verb; returns whether the delta is clean at `--fail-on`.
 fn run(cli: &Cli) -> anyhow::Result<bool> {
+    refresh_rules(cli);
     match &cli.command {
         Command::Ci {
             base,
@@ -361,6 +371,27 @@ fn run(cli: &Cli) -> anyhow::Result<bool> {
             fetch::compare("oci", &fetch::oci_purl(old), &fetch::oci_purl(new), cli)
         }
     }
+}
+
+/// Bring cleave's trait bundle current before the first comparison, exactly the
+/// way scan does: adopt an existing traits checkout if one is present, otherwise
+/// install from the update bucket, then refresh once a day.
+///
+/// Every isomer command analyzes both sides of a diff, so there is no command
+/// that wants stale rules. Without this the first run on a fresh machine has no
+/// traits at all and fails on rule resolution rather than on the artifact —
+/// which is precisely how it failed in CI. `--offline` opts out, as does
+/// scan's own `SCAN_NO_UPDATE`; a refresh that cannot reach the bucket stamps
+/// the attempt and moves on, so an offline host degrades to whatever it has
+/// rather than blocking.
+fn refresh_rules(cli: &Cli) {
+    scan::traits_repo::prepare_runtime_env();
+    scan::auto_update::refresh_if_stale(
+        false,
+        cli.offline,
+        scan::Mode::default(),
+        cli.format == Format::Terminal,
+    );
 }
 
 #[cfg(test)]

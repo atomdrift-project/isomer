@@ -75,9 +75,12 @@ env:
   CARGO_INCREMENTAL: "0"
   CROSS_REV: 55f847251389c5406df85579191c0eac412fab3a
   RUST_BACKTRACE: "1"
-  # isomer links scan's model loader and cleave's rule updater; keep both
-  # from reaching for the network during builds and smoke tests.
-  SCAN_NO_UPDATE: "1"
+  # Silence the "a newer version exists" notices, which are noise in CI.
+  #
+  # Deliberately *not* SCAN_NO_UPDATE: that switch disables the rules refresh
+  # itself, and the smoke test below needs real traits — installing and
+  # compiling them is what drives the wasmtime/cranelift JIT, which is the
+  # whole reason the smoke test exists. It costs one bucket fetch per job.
   SCAN_NO_UPDATE_CHECK: "1"
   CLEAVE_NO_UPDATE_CHECK: "1"
 
@@ -452,7 +455,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/smoke/old" "$RUNNER_TEMP/smoke/new"
           printf '#!/bin/sh\necho hello\n' > "$RUNNER_TEMP/smoke/old/run.sh"
           printf '#!/bin/sh\necho hello there\n' > "$RUNNER_TEMP/smoke/new/run.sh"
-          "./target/$TARGET/$PROFILE/isomer" --offline \
+          # No --offline: that also switches off the rules refresh, and the
+          # refresh is what puts traits on a fresh runner in the first place.
+          "./target/$TARGET/$PROFILE/isomer" \
             fs "$RUNNER_TEMP/smoke/old" "$RUNNER_TEMP/smoke/new"
 
       - name: Package
@@ -508,7 +513,7 @@ jobs:
           # step for a binary this size is the memory high-water mark.
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
           # cmake is for aws-lc-sys, which has no prebuilt path off the tier-1
           # platforms and falls back to a CMake build.
           prepare: |
@@ -591,7 +596,7 @@ jobs:
           arch: aarch64
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
           prepare: |
             pkg install -y rust cmake pkgconf git
           run: |
@@ -609,7 +614,7 @@ jobs:
             mkdir -p /tmp/smoke/old /tmp/smoke/new
             printf '#!/bin/sh\necho hello\n' > /tmp/smoke/old/run.sh
             printf '#!/bin/sh\necho hello there\n' > /tmp/smoke/new/run.sh
-            "/tmp/target/$BUILD_PROFILE/isomer" --offline fs /tmp/smoke/old /tmp/smoke/new
+            "/tmp/target/$BUILD_PROFILE/isomer" fs /tmp/smoke/old /tmp/smoke/new
             cp "/tmp/target/$BUILD_PROFILE/isomer" ./isomer
         env:
           BUILD_PROFILE: ${{ inputs.profile }}
@@ -662,7 +667,7 @@ jobs:
           release: "7.9"
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
           prepare: |
             pkg_add -I rust cmake git
           run: |
@@ -731,7 +736,7 @@ jobs:
           release: "11.0"
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
           prepare: |
             /usr/sbin/pkg_add rust cmake git pkg-config
           run: |
@@ -785,7 +790,7 @@ jobs:
           release: "6.4.2"
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
           prepare: |
             pkg install -y rust cmake pkgconf git
           run: |
@@ -837,7 +842,7 @@ jobs:
           cpu: "4"
           mem: "12288"
           usesh: true
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
           prepare: |
             # R1/beta5 ships OpenSSL 3.0, while Cargo in rust_bin 1.94.1 was
             # linked against SSL_get0_group_name@OPENSSL_3.2.0. rust_bin's
@@ -892,7 +897,7 @@ jobs:
           # Keep Cargo's registry and fat-LTO output on the host-backed mount;
           # the Hurd guest image does not have enough disk for both.
           sync: nfs
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
           prepare: |
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -953,7 +958,7 @@ jobs:
           release: "11.4-gcc"
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
           prepare: |
             set -eux
             # Confirmed by the enumeration in run 30598384692: Oracle's IPS
@@ -1036,7 +1041,7 @@ jobs:
           release: "r151058"
           cpu: "4"
           mem: "12288"
-          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
+          envs: "CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE SCAN_NO_UPDATE_CHECK CLEAVE_NO_UPDATE_CHECK BUILD_PROFILE"
           prepare: |
             pkg publisher
             # Names resolved against r151058: rust and cmake live under the

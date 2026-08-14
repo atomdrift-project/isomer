@@ -12,7 +12,6 @@
 use std::fmt::Write as _;
 
 use crate::analysis::Analysis;
-use crate::evidence::Hunk;
 use crate::{Cli, Severity};
 
 /// Hidden HTML comment identifying an isomer report, so the posting step can
@@ -61,7 +60,15 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
     let _ = write!(s, "\n---\n{}\n", footer(a, cli));
 
     if s.len() > MAX_BODY {
-        s.truncate(floor_char_boundary(&s, MAX_BODY));
+        // Cut on a line boundary within the char boundary. A mid-line cut can
+        // land inside an evidence fence marker, which leaves the comment's
+        // markup malformed; dropping the partial line costs nothing, since the
+        // note below already says the report was cut.
+        let cut = s.floor_char_boundary(MAX_BODY);
+        s.truncate(cut);
+        if let Some(line_end) = s.rfind('\n') {
+            s.truncate(line_end + 1);
+        }
         let _ = write!(
             s,
             "\n\n_Report truncated to fit GitHub's comment limit. \
@@ -174,18 +181,24 @@ fn behavioral(s: &mut String, a: &Analysis<'_>) {
     let _ = writeln!(s, "|---|---|---|---|");
     for c in cats {
         let fresh = a.assessment.behavioral.is_new_category(c);
-        let count = match (fresh, c.new_ids.len(), c.escalated_ids.len()) {
-            (_, 0, e) => format!("{e} escalated"),
-            (true, n, _) => format!("{n} new"),
-            (false, n, _) => format!("+{n}"),
+        // Both halves, when both moved: a category with new *and* escalated
+        // traits used to report only the new ones, hiding the escalations the
+        // terminal's tree shows.
+        let count = match (c.new_ids.len(), c.escalated_ids.len()) {
+            (0, e) => format!("{e} escalated"),
+            (n, 0) if fresh => format!("{n} new"),
+            (n, 0) => format!("+{n}"),
+            (n, e) if fresh => format!("{n} new · {e} escalated"),
+            (n, e) => format!("+{n} · {e} escalated"),
         };
+        let namespaces: Vec<String> = c.namespaces.iter().map(|n| code(n)).collect();
         let _ = writeln!(
             s,
             "| {} **{}** | {} | {} | {count} |",
             dots(c.severity),
             if fresh { "new" } else { "expanded" },
             cell(&c.label),
-            code_list(&c.namespaces),
+            namespaces.join(" · "),
         );
     }
     let _ = writeln!(s);
@@ -226,8 +239,7 @@ fn identity(s: &mut String, a: &Analysis<'_>) {
     }
     let _ = writeln!(s, "#### Publisher\n");
     for ch in changes {
-        let old = if ch.old.is_empty() { "none" } else { &ch.old };
-        let new = if ch.new.is_empty() { "none" } else { &ch.new };
+        let (old, new) = ch.shown();
         let _ = writeln!(s, "- **{}**: {} → {}", ch.label, cell(old), cell(new));
     }
     let _ = writeln!(s);
@@ -322,40 +334,30 @@ fn evidence(s: &mut String, a: &Analysis<'_>) {
         "<sub>{}</sub>\n",
         crate::terminal::evidence_note_text(&hunks)
     );
-    let file_of = |h: &Hunk| h.member.as_deref().unwrap_or(h.file.as_str()).to_string();
     let mut i = 0;
     while i < hunks.len() {
         if hunks[i].additions {
             // One heading per changed file — captioned with its strongest rule
             // — then a single fenced diff of its added lines, an ellipsis at
             // each gap, mirroring the terminal's grouped view.
-            let name = file_of(hunks[i]);
-            let mut j = i;
-            while j < hunks.len() && hunks[j].additions && file_of(hunks[j]) == name {
-                j += 1;
-            }
-            let group = &hunks[i..j];
-            let sev = group
-                .iter()
-                .map(|h| h.severity)
-                .max()
-                .unwrap_or(crate::Severity::None);
-            let title = group
-                .iter()
-                .filter(|h| !h.desc.is_empty())
-                .max_by(|a, b| {
-                    a.severity
-                        .cmp(&b.severity)
-                        .then(a.score.total_cmp(&b.score))
-                })
+            let run = crate::evidence::additions_at(&hunks, i);
+            let name = run.name;
+            let title = run
+                .top
                 .map(|h| format!(" — {}", cell(&h.desc)))
                 .unwrap_or_default();
-            let _ = writeln!(s, "{} {}{} — added lines\n", dots(sev), code(&name), title);
-            if let Some(ms) = crate::terminal::file_metrics_summary(a.display_diff(), &name) {
+            let _ = writeln!(
+                s,
+                "{} {}{} — added lines\n",
+                dots(run.severity),
+                code(name),
+                title
+            );
+            if let Some(ms) = crate::terminal::file_metrics_summary(a.display_diff(), name) {
                 let _ = writeln!(s, "<sub>{}</sub>\n", cell(&ms));
             }
             let mut body = String::new();
-            for (k, h) in group.iter().enumerate() {
+            for (k, h) in hunks[i..run.end].iter().enumerate() {
                 if k > 0 {
                     body.push_str("  ⋯\n");
                 }
@@ -364,7 +366,7 @@ fn evidence(s: &mut String, a: &Analysis<'_>) {
                 }
             }
             let _ = writeln!(s, "{}", fence(&body));
-            i = j;
+            i = run.end;
         } else {
             let where_ = match &hunks[i].member {
                 Some(m) => format!("{} → {}", code(&hunks[i].file), code(m)),
@@ -430,7 +432,7 @@ fn cell(s: &str) -> String {
 /// An inline code span whose delimiter outgrows any backtick run inside it, so
 /// attacker-controlled text — an archive member name, a rule id, a path from a
 /// fork's pull request — cannot close the span and inject markup after it. The
-/// inline twin of [`fence_lang`], and the reason nothing here interpolates into
+/// inline twin of [`fence`], and the reason nothing here interpolates into
 /// a bare `` `…` ``.
 ///
 /// A span's content is literal, so only the table-breaking characters need
@@ -449,35 +451,13 @@ fn code(s: &str) -> String {
     format!("{ticks}{pad}{text}{pad}{ticks}")
 }
 
-fn code_list(items: &[String]) -> String {
-    items
-        .iter()
-        .map(|i| code(i))
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
 /// A fenced block whose fence is longer than any backtick run inside it, so
 /// attacker-controlled evidence cannot break out of the fence and inject
 /// markup into the comment.
 fn fence(body: &str) -> String {
-    fence_lang(body, "")
-}
-
-fn fence_lang(body: &str, lang: &str) -> String {
     let longest = body.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let ticks = "`".repeat(longest.max(2) + 1);
-    format!("{ticks}{lang}\n{}\n{ticks}\n", body.trim_end())
-}
-
-/// Largest index ≤ `max` that lands on a `char` boundary, so truncation never
-/// splits a multi-byte character.
-fn floor_char_boundary(s: &str, max: usize) -> usize {
-    let mut i = max.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
+    format!("{ticks}\n{}\n{ticks}\n", body.trim_end())
 }
 
 #[cfg(test)]
@@ -533,7 +513,7 @@ mod tests {
     fn truncation_respects_char_boundaries() {
         let s = "aé";
         // Byte 2 splits the 'é'; the floor must step back to 1.
-        assert_eq!(floor_char_boundary(s, 2), 1);
-        assert!(s.is_char_boundary(floor_char_boundary(s, 2)));
+        assert_eq!(s.floor_char_boundary(2), 1);
+        assert!(s.is_char_boundary(s.floor_char_boundary(2)));
     }
 }

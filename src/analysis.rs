@@ -9,6 +9,7 @@
 //! Running it once is the whole point: `isomer ci` emits four sinks from a
 //! single scan, and analysis is the expensive part.
 
+use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -104,7 +105,7 @@ impl Pair {
         }
         diff.files
             .iter()
-            .filter(|f| !matches!(f.status, cleave::types::FileStatus::Unchanged))
+            .filter(|f| !matches!(f.status, FileStatus::Unchanged))
             // Archive members are decomposed by the analysis of their
             // container, which has its own pair; pairing them again would
             // double-count and point at paths that don't exist on disk.
@@ -124,7 +125,7 @@ fn existing(p: std::path::PathBuf) -> Option<std::path::PathBuf> {
 
 /// Trait atoms that moved on one file, worst criticality first. Added and
 /// removed together — a reviewer wants both directions of a source change.
-fn trait_atoms(entry: &cleave::types::FileDiffEntry) -> Vec<Atom> {
+fn trait_atoms(entry: &FileDiffEntry) -> Vec<Atom> {
     let Some(traits) = entry.scopes.traits.as_ref() else {
         return Vec::new();
     };
@@ -155,7 +156,6 @@ fn trait_atoms(entry: &cleave::types::FileDiffEntry) -> Vec<Atom> {
 /// left. Control chars are neutralized; the total is line-capped so one large
 /// file can't blow the context budget.
 fn line_diff(old: &[u8], new: &[u8]) -> String {
-    use std::collections::HashSet;
     use std::fmt::Write as _;
     const MAX_LINES: usize = 400;
 
@@ -165,8 +165,8 @@ fn line_diff(old: &[u8], new: &[u8]) -> String {
     let new_set: HashSet<&str> = new_text.lines().map(str::trim_end).collect();
 
     let mut s = String::new();
-    let new_lines: Vec<&str> = new_text.lines().collect();
-    for line in new_lines.iter().take(MAX_LINES) {
+    let mut new_lines = new_text.lines();
+    for line in new_lines.by_ref().take(MAX_LINES) {
         let mark = if old_set.contains(line.trim_end()) {
             ' '
         } else {
@@ -174,7 +174,7 @@ fn line_diff(old: &[u8], new: &[u8]) -> String {
         };
         let _ = writeln!(s, "{mark} {}", crate::printable(line));
     }
-    if new_lines.len() > MAX_LINES {
+    if new_lines.next().is_some() {
         let _ = writeln!(s, "  … (diff truncated)");
     }
     for line in old_text
@@ -199,7 +199,7 @@ pub(crate) struct Analysis<'a> {
     /// Raw cleave diff, retained for byte/evidence lookup using original paths.
     pub diff: &'a DiffReportV1,
     /// Version-root-normalized member diff used for judgement and display.
-    pub judged_diff: DiffReportV1,
+    pub judged_diff: Cow<'a, DiffReportV1>,
     /// The changed files, each with both sides — what deep analysis runs over.
     pub pairs: Vec<Pair>,
     /// What each side exhibits: base capability classes, and the ATT&CK / MBC
@@ -314,13 +314,14 @@ impl<'a> Analysis<'a> {
         // and the ATT&CK / MBC annotations each side carries.
         let survey = crate::evidence::survey(&pairs, options);
         let assessment = crate::rubric::assess(&judged_diff, &survey.base_classes);
-        let naming = Naming::resolve(old, new, cli);
+        let naming = Naming::resolve(old, new, cli, &judged_diff);
         let prop = Proportionality::eval(
             &assessment,
             &naming,
             &judged_diff,
             source_archive,
             source_build_anomaly,
+            &survey.runtime_entrypoints,
         );
 
         // Azoth ML risk is the *primary* detector: a jump into a worse band
@@ -329,11 +330,8 @@ impl<'a> Analysis<'a> {
         // rubric stands alone.
         let risk = crate::risk::score(&pairs);
         let risk_jump = risk.map_or(Severity::None, |r| {
-            if risk_band(r.new) > risk_band(r.old) {
-                risk_band(r.new)
-            } else {
-                Severity::None
-            }
+            let (old, new) = (risk_band(r.old), risk_band(r.new));
+            if new > old { new } else { Severity::None }
         });
 
         // A few attacks are composed of individually medium traits, so the
@@ -347,6 +345,7 @@ impl<'a> Analysis<'a> {
             naming.bump,
             source_archive,
             source_build_anomaly,
+            &survey.runtime_entrypoints,
         );
         let remediation =
             remediation_cleanup_context(old, new, &assessment, &judged_diff, diff, risk);
@@ -361,7 +360,7 @@ impl<'a> Analysis<'a> {
         // (repack) release that has no business gaining behavior at all
         // (unrealircd: a same-version repack that gained byte-comparison and
         // privilege-escalation traits, medium each, under the high gate).
-        let escalation = if prop.disproportionate && !is_remediation {
+        let escalation = if prop.drift.is_disproportionate() && !is_remediation {
             Severity::High
         } else {
             Severity::None
@@ -412,10 +411,10 @@ impl<'a> Analysis<'a> {
         };
         let gated = match cli.gate {
             Gate::New => new_verdict,
-            Gate::Any => verdict.max(escalation),
+            Gate::Any => verdict,
         };
 
-        let mut a = Self {
+        let a = Self {
             verb,
             options,
             report,
@@ -442,14 +441,52 @@ impl<'a> Analysis<'a> {
             hunks: OnceCell::new(),
             source_changes: OnceCell::new(),
         };
-        // The LLM read is asked for only when there is a change worth
-        // describing — a silent diff has nothing to interpret, and the call
-        // costs a round trip. Failures log and never block the verdict.
+        Ok(a)
+    }
+
+    /// The network half of an analysis, and the last thing every verb does
+    /// before rendering: fetch the added dependencies when `--deps` asks for
+    /// them, fold what they can do into the verdict, and only then take the
+    /// model's read — so the LLM is shown the same case the terminal and the
+    /// gate are.
+    ///
+    /// This is one method rather than two because the order matters and the
+    /// ordering used to live as an unwritten rule across three call sites:
+    /// `ci` never folded the profiles in, so `isomer ci --deps` silently
+    /// skipped interpretation altogether.
+    pub(crate) fn finish(&mut self, cli: &Cli) {
+        if cli.deps && !cli.offline {
+            let profiles = crate::deps::profiles(self.diff, self.options, cli.progress());
+            self.apply_dependency_profiles(profiles, cli);
+        }
+        self.interpret(cli);
+    }
+
+    /// Fold fetched added-dependency profiles into the deterministic verdict.
+    /// A newly declared dependency is wholly new code from this artifact's
+    /// perspective; when `--deps` finds High/Critical behavior in it, merely
+    /// printing that profile while returning a passing gate would be a false
+    /// negative. Fetch failures remain visible notes and contribute no score.
+    fn apply_dependency_profiles(&mut self, profiles: Vec<crate::deps::DepProfile>, cli: &Cli) {
+        let severity = crate::deps::severity(&profiles);
+        self.deps = profiles;
+        self.deterministic_verdict = self.deterministic_verdict.max(severity);
+        self.verdict = self.verdict.max(severity);
+        self.new_verdict = self.new_verdict.max(severity);
+        self.gated = match cli.gate {
+            Gate::New => self.new_verdict,
+            Gate::Any => self.verdict,
+        };
+        self.clean = !self.gated.fails(cli.fail_on);
+    }
+
+    fn interpret(&mut self, cli: &Cli) {
         if cli.format != Format::Interpret
-            && a.speaks(cli)
+            && crate::llm::requested(cli)
+            && self.speaks(cli)
             && let Some(cfg) = crate::llm::config(cli)
         {
-            a.interp = match crate::llm::interpret(&cfg, &a.llm_context()) {
+            self.interp = match crate::llm::interpret(&cfg, &self.llm_context()) {
                 Ok(i) => Some(i),
                 Err(e) => {
                     eprintln!("isomer: llm interpretation failed: {e:#}");
@@ -467,22 +504,24 @@ impl<'a> Analysis<'a> {
         // deterministic: a model hallucination must not fail someone's build.
         // So the LLM sharpens the human-facing verdict without making CI
         // non-reproducible.
-        if let Some(sev) = a.interp.as_ref().map(crate::llm::Interpretation::severity)
+        if let Some(sev) = self
+            .interp
+            .as_ref()
+            .map(crate::llm::Interpretation::severity)
             && sev > Severity::None
         {
-            a.verdict = a.verdict.max(sev);
-            if let Some(r) = a.risk.as_mut() {
-                let floor = a
+            self.verdict = self.verdict.max(sev);
+            if let Some(r) = self.risk.as_mut() {
+                let floor = self
                     .interp
                     .as_ref()
                     .map_or(0.0, crate::llm::Interpretation::risk_floor);
                 if r.new < floor {
                     r.new = floor;
-                    a.risk_llm_raised = true;
+                    self.risk_llm_raised = true;
                 }
             }
         }
-        Ok(a)
     }
 
     /// Render one output format.
@@ -520,7 +559,7 @@ impl<'a> Analysis<'a> {
             // and unremarkable observations (see `rubric::is_finding`).
             || self.assessment.severity >= Severity::Medium
             || self.risk_band_moved()
-            || self.prop.disproportionate
+            || self.prop.drift.is_disproportionate()
             // Removing attack behavior is itself a notable change. The
             // remediation floor lives above `assessment.severity` because the
             // rubric scores gains; do not let a successful cleanup fall into
@@ -574,11 +613,7 @@ impl<'a> Analysis<'a> {
         if self.remediation.is_some() {
             return self.headline_facts();
         }
-        let noted = self.assessment.behavioral.categories.len()
-            + self.assessment.signature.ids.len()
-            + self.assessment.identity.changes.len()
-            + self.assessment.structure.facts.len();
-        match (noted, self.risk_band_moved()) {
+        match (self.assessment.finding_count(), self.risk_band_moved()) {
             (0, false) => "no behavioral change".to_string(),
             (0, true) => "no new capabilities, but the model reads this differently".to_string(),
             (n, _) => format!(
@@ -618,7 +653,6 @@ impl<'a> Analysis<'a> {
     /// Walk the pairs, keeping the source-language files whose trait scope
     /// changed, and pair each with the atoms that moved and a line diff.
     fn collect_source_changes(&self) -> Vec<SourceChange> {
-        use cleave::types::FileStatus;
         // A single-file `fs` comparison names its one diff entry `<root>`, not
         // the basename, so it can't be matched to the pair by path — but there
         // is only one pair, so the lone changed entry is unambiguously its.
@@ -650,7 +684,16 @@ impl<'a> Analysis<'a> {
             {
                 continue;
             }
-            let old_bytes = std::fs::read(old).unwrap_or_default();
+            // An unreadable base is not an empty base. Defaulting to empty would
+            // render every line of the new file as an addition and hand both the
+            // reader and the LLM a whole-file rewrite that never happened.
+            let old_bytes = match std::fs::read(old) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("isomer: could not read base {}: {e:#}", old.display());
+                    continue;
+                }
+            };
             out.push(SourceChange {
                 label: pair.label.clone(),
                 atoms: trait_atoms(entry),
@@ -703,6 +746,18 @@ impl<'a> Analysis<'a> {
             }
             None => {}
         }
+        if let Some(dependency) = self
+            .deps
+            .iter()
+            .filter(|dependency| dependency.severity >= Severity::High)
+            .max_by_key(|dependency| dependency.severity)
+        {
+            return format!(
+                "new dependency {} contains {}-severity behavior",
+                dependency.coord,
+                dependency.severity.as_str()
+            );
+        }
         if dependency_with_fallback_load(&self.assessment, &self.judged_diff) {
             return "added dependency alongside fallback module load".to_string();
         }
@@ -712,13 +767,29 @@ impl<'a> Analysis<'a> {
         if external_remote_script_loader(self.display_diff()) {
             return "gained external browser script loader".to_string();
         }
-        if let Some(note) = self
-            .prop
-            .note
-            .as_ref()
-            .filter(|_| self.prop.disproportionate)
+        if binary_replacement_anomaly(self.display_diff(), self.naming.bump).is_some() {
+            return "same-version compiled binary was structurally replaced".to_string();
+        }
+        if runtime_graft_anomaly(
+            self.display_diff(),
+            self.naming.bump,
+            &self.survey.runtime_entrypoints,
+        )
+        .is_some()
         {
-            return note.clone();
+            return "runtime entrypoint gained a timestamp-clustered external payload".to_string();
+        }
+        if opaque_runtime_payload_anomaly(
+            self.display_diff(),
+            self.naming.bump,
+            &self.survey.runtime_entrypoints,
+        )
+        .is_some()
+        {
+            return "runtime entrypoint gained an opaque encoded payload".to_string();
+        }
+        if let Some(note) = self.prop.drift.escalation_note() {
+            return note.to_string();
         }
         if let Some(skew) = &self.prop.skew {
             return skew.clone();
@@ -766,17 +837,16 @@ impl<'a> Analysis<'a> {
     /// cleave report into either audience's primary view.
     pub(crate) fn differential_summary(&self) -> Vec<String> {
         let d = self.display_diff();
-        let nested = d.files.iter().any(|f| f.path.contains("!!"));
         let added = d.summary.files_added as usize;
         let removed = d.summary.files_removed as usize;
         let mut changed = d.summary.files_changed as usize;
         let unchanged = d.summary.files_unchanged as usize;
-        if nested {
-            // The container itself is a synthetic root entry; the member
-            // topology is what an analyst means by the package change.
-            if d.files.iter().any(|f| f.path == "<root>") {
-                changed = changed.saturating_sub(1);
-            }
+        // In a nested diff the container itself is a synthetic root entry; the
+        // member topology is what an analyst means by the package change.
+        if d.files.iter().any(|f| f.path.contains("!!"))
+            && d.files.iter().any(|f| f.path == "<root>")
+        {
+            changed = changed.saturating_sub(1);
         }
         let total = added + removed + changed + unchanged;
         let mut lines = vec![format!(
@@ -796,6 +866,67 @@ impl<'a> Analysis<'a> {
         ));
         if let Some(size) = root_size_delta(d) {
             lines.push(format!("package size: {size}"));
+        }
+        // A package-wide top six is meaningful for a compact implant, but in
+        // a thousand-file framework release it merely selects unrelated local
+        // extrema from arbitrary files. Large releases retain their complete
+        // metrics in JSON and their per-file ranked summaries in human views.
+        if compact_change(&d.summary) {
+            let metric_changes = strongest_metric_changes(d, 6);
+            if !metric_changes.is_empty() {
+                lines.push(format!(
+                    "largest metric changes: {}",
+                    metric_changes.join(" · ")
+                ));
+            }
+        }
+        if let Some(replacement) = binary_replacement_anomaly(d, self.naming.bump) {
+            lines.push(format!(
+                "binary replacement: same-version compiled binary has {} large metric movements across {} independent families",
+                replacement.large_moves, replacement.metric_families,
+            ));
+        }
+        if let Some(payload) =
+            opaque_runtime_payload_anomaly(d, self.naming.bump, &self.survey.runtime_entrypoints)
+        {
+            lines.push(format!(
+                "runtime payload: {} newly references {} ({:.0} bytes on {:.0} line{}, {:.0}% encoded strings, longest string {:.0} bytes)",
+                display_member_path(&payload.entrypoint),
+                display_member_path(&payload.payload),
+                payload.size,
+                payload.lines,
+                if payload.lines == 1.0 { "" } else { "s" },
+                payload.encoded_ratio * 100.0,
+                payload.max_string,
+            ));
+        }
+        if let Some(graft) =
+            runtime_graft_anomaly(d, self.naming.bump, &self.survey.runtime_entrypoints)
+        {
+            lines.push(format!(
+                "runtime graft: {} newly references {} alongside an external URL and absolute host path; both are timestamp outliers within a {:.0}-second archive window",
+                display_member_path(&graft.entrypoint),
+                display_member_path(&graft.payload),
+                graft.timestamp_spread,
+            ));
+        }
+        for dependency in &self.deps {
+            let detail = dependency.note.as_ref().map_or_else(
+                || {
+                    if dependency.highlights.is_empty() {
+                        "no notable behavior found".to_string()
+                    } else {
+                        dependency.highlights.join("; ")
+                    }
+                },
+                Clone::clone,
+            );
+            lines.push(format!(
+                "added dependency profile: {} · {} · {}",
+                dependency.coord,
+                dependency.severity.as_str(),
+                detail
+            ));
         }
         if restored_endgame_package_shape(d) {
             lines.push(
@@ -872,22 +1003,23 @@ impl<'a> Analysis<'a> {
                     continue;
                 }
                 let short = crate::rubric::short_name(&t.id);
-                let detail = if t.desc.is_empty() {
-                    short.to_string()
-                } else {
-                    format!("{short}: {}", t.desc)
-                };
-                let detail = if t.count > 1 {
-                    format!("{detail} (count {})", t.count)
-                } else {
-                    detail
-                };
-                if !indicators.iter().any(|v: &String| v == &detail) {
-                    indicators.push(detail);
-                }
+                indicators.push(format!(
+                    "{short}{}{}",
+                    if t.desc.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", t.desc)
+                    },
+                    if t.count > 1 {
+                        format!(" (count {})", t.count)
+                    } else {
+                        String::new()
+                    },
+                ));
             }
         }
         indicators.sort();
+        indicators.dedup();
         indicators.truncate(8);
         if !indicators.is_empty() {
             lines.push(format!("payload indicators: {}", indicators.join(" · ")));
@@ -908,20 +1040,25 @@ impl<'a> Analysis<'a> {
             if !file.path.contains("!!") {
                 continue;
             }
-            let detected_type = self.member_file_type(&file.path, file.status);
+            // cleave usually already typed the member from its content; only
+            // fall back to extracting it ourselves when it did not. Each
+            // extraction re-reads and re-decompresses the whole archive, and
+            // this loop runs once per member.
+            let detected_type =
+                member_type(file).or_else(|| self.member_file_type(&file.path, file.status));
             let is_payload = detected_type.is_some_and(is_compiled_binary_file_type)
                 || (detected_type.is_none() && executable_member_layout(&file.path));
             if !is_payload {
                 continue;
             }
             match file.status {
-                cleave::types::FileStatus::Added => added_binaries.push(file.path.clone()),
-                cleave::types::FileStatus::Removed => removed_binaries.push(file.path.clone()),
-                cleave::types::FileStatus::Changed => {
+                FileStatus::Added => added_binaries.push(file.path.clone()),
+                FileStatus::Removed => removed_binaries.push(file.path.clone()),
+                FileStatus::Changed => {
                     added_binaries.push(file.path.clone());
                     removed_binaries.push(file.path.clone());
                 }
-                cleave::types::FileStatus::Unchanged => {}
+                FileStatus::Unchanged => {}
             }
         }
         added_binaries.sort();
@@ -955,20 +1092,9 @@ impl<'a> Analysis<'a> {
     pub(crate) fn identity_summary(&self) -> Vec<String> {
         let mut entries: Vec<(usize, String)> = Vec::new();
         for file in &self.judged_diff.files {
-            let Some(identity) = file.identity.as_ref() else {
+            let Some(identity) = meaningful_identity(file) else {
                 continue;
             };
-            if identity
-                .old
-                .as_ref()
-                .is_some_and(crate::rubric::filename_only_identity)
-                || identity
-                    .new
-                    .as_ref()
-                    .is_some_and(crate::rubric::filename_only_identity)
-            {
-                continue;
-            }
             let old = identity
                 .old
                 .as_ref()
@@ -1002,12 +1128,9 @@ impl<'a> Analysis<'a> {
             }
             // The root describes the artifact; member claims provide useful
             // attribution (e.g. a library inside a package) but rank behind it.
-            let priority = if file.path == "<root>" { 0 } else { 1 };
-            entries.push((priority, text));
+            entries.push((usize::from(file.path != "<root>"), text));
         }
-        entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        entries.truncate(6);
-        entries.into_iter().map(|(_, text)| text).collect()
+        ranked(entries, 6)
     }
 
     /// Identity claims that actually changed, for the compact terminal view.
@@ -1017,20 +1140,9 @@ impl<'a> Analysis<'a> {
     pub(crate) fn identity_change_summary(&self) -> Vec<String> {
         let mut entries: Vec<(usize, String)> = Vec::new();
         for file in &self.judged_diff.files {
-            let Some(identity) = file.identity.as_ref() else {
+            let Some(identity) = meaningful_identity(file) else {
                 continue;
             };
-            if identity
-                .old
-                .as_ref()
-                .is_some_and(crate::rubric::filename_only_identity)
-                || identity
-                    .new
-                    .as_ref()
-                    .is_some_and(crate::rubric::filename_only_identity)
-            {
-                continue;
-            }
             let include_version = file.path != "<root>";
             let old = identity
                 .old
@@ -1044,14 +1156,12 @@ impl<'a> Analysis<'a> {
                 .unwrap_or_default();
             let priority = usize::from(file.path != "<root>");
             entries.extend(
-                changed_identity_claims(&display_member_path(&file.path), &old, &new)
+                changed_identity_claims(display_member_path(&file.path), &old, &new)
                     .into_iter()
                     .map(|line| (priority, line)),
             );
         }
-        entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        entries.truncate(8);
-        entries.into_iter().map(|(_, text)| text).collect()
+        ranked(entries, 8)
     }
 
     /// Identify an archive member from its bytes, using the same content-first
@@ -1059,23 +1169,19 @@ impl<'a> Analysis<'a> {
     /// member bytes, so recover them from the root archive when this is a local
     /// comparison. `None` means extraction was unavailable; callers may then
     /// use only a conservative package-layout hint.
-    fn member_file_type(
-        &self,
-        path: &str,
-        status: cleave::types::FileStatus,
-    ) -> Option<filefacts::FileType> {
+    fn member_file_type(&self, path: &str, status: FileStatus) -> Option<filefacts::FileType> {
         let (root, member) = path.split_once("!!")?;
-        let pair = self
-            .pairs
-            .iter()
-            .find(|p| p.label == root)
-            .or_else(|| (self.pairs.len() == 1).then(|| &self.pairs[0]))?;
+        // A single-file comparison names its one diff entry `<root>`, so it
+        // never matches by path — but the lone pair is unambiguously its.
+        let sole = match self.pairs.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        };
+        let pair = self.pairs.iter().find(|p| p.label == root).or(sole)?;
         let archive = match status {
-            cleave::types::FileStatus::Added | cleave::types::FileStatus::Changed => {
-                pair.new.as_deref().or(pair.old.as_deref())
-            }
-            cleave::types::FileStatus::Removed => pair.old.as_deref().or(pair.new.as_deref()),
-            cleave::types::FileStatus::Unchanged => None,
+            FileStatus::Added | FileStatus::Changed => pair.new.as_deref().or(pair.old.as_deref()),
+            FileStatus::Removed => pair.old.as_deref().or(pair.new.as_deref()),
+            FileStatus::Unchanged => None,
         }?;
         let bytes = cleave::extract_member(archive, member).ok().flatten()?;
         Some(filefacts::FileId::from_bytes(&bytes).file_type())
@@ -1099,7 +1205,7 @@ impl<'a> Analysis<'a> {
         if let Some(r) = self.risk {
             let _ = writeln!(s, "ml_malware_probability: {:.2} -> {:.2}", r.old, r.new);
         }
-        if let Some(n) = &prop.note {
+        if let Some(n) = prop.drift.note() {
             let _ = writeln!(s, "proportionality: {n}");
         }
         if let Some(n) = &prop.skew {
@@ -1202,8 +1308,7 @@ impl<'a> Analysis<'a> {
         if !a.identity.changes.is_empty() {
             let _ = writeln!(s, "\nidentity changes (publisher/signer):");
             for ch in &a.identity.changes {
-                let old = if ch.old.is_empty() { "none" } else { &ch.old };
-                let new = if ch.new.is_empty() { "none" } else { &ch.new };
+                let (old, new) = ch.shown();
                 let _ = writeln!(s, "- {}: {} -> {}", ch.label, old, new);
             }
         }
@@ -1399,8 +1504,8 @@ impl<'a> Analysis<'a> {
                     },
                 }),
                 proportionality: j::Prop {
-                    disproportionate: self.prop.disproportionate,
-                    note: self.prop.note.as_deref(),
+                    disproportionate: self.prop.drift.is_disproportionate(),
+                    note: self.prop.drift.note(),
                     skew: self.prop.skew.as_deref(),
                 },
                 behavioral: j::Behavioral {
@@ -1755,19 +1860,54 @@ pub(crate) struct Naming {
 }
 
 impl Naming {
-    fn resolve(old: &Path, new: &Path, cli: &Cli) -> Self {
+    fn resolve(old: &Path, new: &Path, cli: &Cli, diff: &DiffReportV1) -> Self {
         let ob = basename(old);
         let nb = basename(new);
+        // The artifact's own claimed version, when the filename carries none.
+        //
+        // Two orderings matter here. The root entry describes the artifact
+        // itself, so it is asked first — otherwise a vendored library's
+        // `package.json` inside the package could name the *package's* version.
+        // And an entry that parses both sides is preferred over one that parses
+        // only one: a half-parsed claim leaves `bump` as `None`, which switches
+        // off every release-pressure detector at once, so a later member that
+        // could have answered must not be skipped.
+        let claims = |want_both: bool| {
+            let mut entries: Vec<&FileDiffEntry> = diff.files.iter().collect();
+            entries.sort_by_key(|f| f.path != "<root>");
+            entries
+                .into_iter()
+                .filter_map(|file| file.identity.as_ref())
+                .find_map(|identity| {
+                    let claimed = |side: &Option<filefacts::Identity>| {
+                        side.as_ref()
+                            .and_then(|id| id.version.as_ref())
+                            .and_then(|claim| Version::from_claim(&claim.value))
+                    };
+                    let (old, new) = (claimed(&identity.old), claimed(&identity.new));
+                    let enough = if want_both {
+                        old.is_some() && new.is_some()
+                    } else {
+                        old.is_some() || new.is_some()
+                    };
+                    enough.then_some((old, new))
+                })
+        };
+        let (old_claim, new_claim) = claims(true)
+            .or_else(|| claims(false))
+            .unwrap_or((None, None));
         let ov = cli
             .base_version
             .as_deref()
             .and_then(Version::parse)
-            .or_else(|| Version::detect(&ob));
+            .or_else(|| Version::detect(&ob))
+            .or(old_claim);
         let nv = cli
             .head_version
             .as_deref()
             .and_then(Version::parse)
-            .or_else(|| Version::detect(&nb));
+            .or_else(|| Version::detect(&nb))
+            .or(new_claim);
         let bump = match (&ov, &nv) {
             (Some(o), Some(n)) => Some(Bump::classify(o, n)),
             _ => None,
@@ -1819,6 +1959,10 @@ fn clean_name(base: &str, ver: Option<&Version>) -> String {
     let mut s = base.to_string();
     if let Some(v) = ver {
         s = s.replace(&v.raw, "");
+        // Windows installers commonly encode dotted versions with
+        // underscores. `Version::detect` normalizes those for display, so
+        // remove the source spelling too when deriving the artifact name.
+        s = s.replace(&v.raw.replace('.', "_"), "");
     }
     // A long leading digit run is a quarantine/timestamp prefix, not a name.
     if let Some((head, rest)) = s.split_once('-')
@@ -1842,6 +1986,9 @@ fn clean_name(base: &str, ver: Option<&Version>) -> String {
     while s.contains("--") {
         s = s.replace("--", "-");
     }
+    while s.contains("_.") || s.contains("-.") {
+        s = s.replace("_.", ".").replace("-.", ".");
+    }
     s.trim_matches(['-', '.', '_', ' ']).to_string()
 }
 
@@ -1852,8 +1999,8 @@ fn clean_name(base: &str, ver: Option<&Version>) -> String {
 /// name cleaning as the report's filename logic so
 /// `pkg-1.0/bin/x` and `pkg-1.1/bin/x` are judged as one file. The raw report
 /// remains untouched for evidence and auditing.
-fn normalized_archive_diff(diff: &DiffReportV1) -> DiffReportV1 {
-    use std::collections::{BTreeMap, BTreeSet};
+fn normalized_archive_diff(diff: &DiffReportV1) -> Cow<'_, DiffReportV1> {
+    use std::collections::BTreeSet;
 
     let mut groups: BTreeMap<String, (Option<&FileDiffEntry>, Option<&FileDiffEntry>)> =
         BTreeMap::new();
@@ -1913,16 +2060,16 @@ fn normalized_archive_diff(diff: &DiffReportV1) -> DiffReportV1 {
             .iter()
             .filter(|(file, _)| file.status == FileStatus::Added)
             .collect();
-        if removed.len() == 1 && added.len() == 1 {
-            let (old, old_package) = *removed[0];
-            let (new, new_package) = *added[0];
-            if old_package != new_package {
-                aliases.push((old, new));
-            }
+        // Exactly one removed and one added member under the same suffix is an
+        // unambiguous rename; anything else is a genuine add or delete.
+        if let ([(old, old_package)], [(new, new_package)]) = (removed.as_slice(), added.as_slice())
+            && old_package != new_package
+        {
+            aliases.push((*old, *new));
         }
     }
     if aliases.is_empty() {
-        return diff.clone();
+        return Cow::Borrowed(diff);
     }
     let mut alias_by_path = BTreeMap::new();
     for (index, (old, new)) in aliases.iter().enumerate() {
@@ -1930,7 +2077,6 @@ fn normalized_archive_diff(diff: &DiffReportV1) -> DiffReportV1 {
         alias_by_path.insert(new.path.as_str(), index);
     }
 
-    let mut out = diff.clone();
     let mut files = Vec::with_capacity(diff.files.len());
     for file in &diff.files {
         let Some(&alias_index) = alias_by_path.get(file.path.as_str()) else {
@@ -1959,9 +2105,16 @@ fn normalized_archive_diff(diff: &DiffReportV1) -> DiffReportV1 {
             new_formula: new.new_formula.clone(),
         });
     }
-    out.files = files;
-    out.summary = normalized_summary(&out.files);
-    out
+    // Built field by field rather than cloned-then-overwritten: `files` is the
+    // expensive field (every changed member's strings, symbols, and trait rows
+    // are owned), and cloning it only to replace it doubled the cost.
+    Cow::Owned(DiffReportV1 {
+        summary: normalized_summary(&files),
+        files,
+        old_root: diff.old_root.clone(),
+        new_root: diff.new_root.clone(),
+        scopes: diff.scopes.clone(),
+    })
 }
 
 /// Return the path below an npm/source-snapshot archive root and whether the
@@ -1975,13 +2128,13 @@ fn npm_snapshot_member_key(path: &str) -> Option<(bool, String)> {
     Version::detect(root).map(|_| (false, suffix.to_ascii_lowercase()))
 }
 
+/// Whether any of the six scopes recorded an addition, removal, or change.
+/// cleave's own erased per-scope view answers this, so the fan-out over the six
+/// scopes stays where the scopes are defined.
 fn scope_diffs_changed(scopes: &ScopeDiffs) -> bool {
-    scopes.traits.as_ref().is_some_and(scope_changed)
-        || scopes.metrics.as_ref().is_some_and(scope_changed)
-        || scopes.kv.as_ref().is_some_and(scope_changed)
-        || scopes.symbols.as_ref().is_some_and(scope_changed)
-        || scopes.strings.as_ref().is_some_and(scope_changed)
-        || scopes.sections.as_ref().is_some_and(scope_changed)
+    cleave::types::Scope::ALL
+        .iter()
+        .any(|s| scopes.view(*s).has_changes)
 }
 
 pub(crate) fn is_source_archive(path: &Path) -> bool {
@@ -2000,7 +2153,7 @@ pub(crate) fn is_source_archive(path: &Path) -> bool {
 fn source_build_macro_anomaly(new_root: &Path, diff: &DiffReportV1) -> bool {
     diff.files.iter().any(|file| {
         if !matches!(file.status, FileStatus::Added | FileStatus::Changed)
-            || !scope_changes_present(file)
+            || !scope_diffs_changed(&file.scopes)
         {
             return false;
         }
@@ -2034,13 +2187,13 @@ fn stable_source_loader_payload_refresh(
     if !diff.files.iter().any(changed_test_carrier) {
         return false;
     }
-    use std::collections::BTreeMap;
     let mut candidates: BTreeMap<String, (Option<&str>, Option<&str>)> = BTreeMap::new();
     for file in &diff.files {
         let Some((_, member)) = file.path.split_once("!!") else {
             continue;
         };
-        if !m4_member_path(member) {
+        let lower = member.to_ascii_lowercase();
+        if !(lower.ends_with(".m4") && (lower.contains("/m4/") || lower.starts_with("m4/"))) {
             continue;
         }
         let pair = candidates
@@ -2082,24 +2235,6 @@ fn changed_test_carrier(file: &FileDiffEntry) -> bool {
         && [".xz", ".lzma", ".gz", ".bz2", ".zst"]
             .iter()
             .any(|suffix| lower.ends_with(suffix))
-}
-
-fn m4_member_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.ends_with(".m4") && (lower.contains("/m4/") || lower.starts_with("m4/"))
-}
-
-fn scope_changes_present(file: &FileDiffEntry) -> bool {
-    file.scopes.traits.as_ref().is_some_and(scope_changed)
-        || file.scopes.metrics.as_ref().is_some_and(scope_changed)
-        || file.scopes.kv.as_ref().is_some_and(scope_changed)
-        || file.scopes.symbols.as_ref().is_some_and(scope_changed)
-        || file.scopes.strings.as_ref().is_some_and(scope_changed)
-        || file.scopes.sections.as_ref().is_some_and(scope_changed)
-}
-
-fn scope_changed<T>(scope: &ScopeDiff<T>) -> bool {
-    !scope.added.is_empty() || !scope.removed.is_empty() || !scope.changed.is_empty()
 }
 
 fn source_build_macro_score(bytes: &[u8]) -> bool {
@@ -2198,7 +2333,7 @@ fn merge_scope<T: Clone>(
     let (Some(old), Some(new)) = (old, new) else {
         return old.cloned().or_else(|| new.cloned());
     };
-    let mut old_items = std::collections::BTreeMap::new();
+    let mut old_items = BTreeMap::new();
     for item in old
         .removed
         .iter()
@@ -2206,7 +2341,7 @@ fn merge_scope<T: Clone>(
     {
         old_items.insert(key(item), item.clone());
     }
-    let mut new_items = std::collections::BTreeMap::new();
+    let mut new_items = BTreeMap::new();
     for item in new
         .added
         .iter()
@@ -2247,6 +2382,20 @@ fn normalized_summary(files: &[FileDiffEntry]) -> DiffSummary {
             FileStatus::Unchanged => summary.files_unchanged += 1,
         }
     }
+    // The six scopes, in the order the per-file weight array below lists them.
+    // Named here rather than reusing cleave's `Scope::ALL` positionally: this
+    // function reads the six `ScopeDiffs` fields by hand, so the pairing has to
+    // be stated where those fields are, not inferred from a foreign constant
+    // whose order could change without a compile error here.
+    use cleave::types::Scope;
+    const ORDER: [Scope; 6] = [
+        Scope::Traits,
+        Scope::Metrics,
+        Scope::Kv,
+        Scope::Symbols,
+        Scope::Strings,
+        Scope::Sections,
+    ];
     let mut present = [false; 6];
     let mut old_weight = [0.0_f32; 6];
     let mut new_weight = [0.0_f32; 6];
@@ -2292,13 +2441,14 @@ fn normalized_summary(files: &[FileDiffEntry]) -> DiffSummary {
     let mut rocs = ScopeRocs::default();
     let mut total = 0.0;
     let mut count = 0;
-    for index in 0..6 {
-        let roc = if old_weight[index].max(new_weight[index]) > 0.0 {
-            (change_weight[index] / old_weight[index].max(new_weight[index])).min(1.0)
+    for (index, scope) in ORDER.into_iter().enumerate() {
+        let denominator = old_weight[index].max(new_weight[index]);
+        let roc = if denominator > 0.0 {
+            (change_weight[index] / denominator).min(1.0)
         } else {
             0.0
         };
-        rocs.set(cleave::types::Scope::ALL[index], roc);
+        rocs.set(scope, roc);
         if present[index] && (old_weight[index] > 0.0 || new_weight[index] > 0.0) {
             total += roc;
             count += 1;
@@ -2315,12 +2465,50 @@ fn normalized_summary(files: &[FileDiffEntry]) -> DiffSummary {
 
 // ── proportionality ─────────────────────────────────────────────────────────
 
-/// The two change-shape reads: behavioral drift vs the version bump's promise
-/// (`disproportionate`/`note`), and behavioral drift vs content drift (`skew`).
+/// Behavioral drift weighed against the version bump's promise.
+///
+/// One value rather than a `bool` beside an `Option<String>`: those encode three
+/// real states in six, and every consumer had to re-join them by hand to know
+/// which of the two very different sentences it was about to print.
+#[derive(Debug)]
+pub(crate) enum Drift {
+    /// No bump to weigh against, or no capability gained to weigh.
+    Unjudged,
+    WithinTolerance(String),
+    Disproportionate(String),
+}
+
+impl Drift {
+    /// Whether the gain outran what the bump promised — the escalation signal.
+    pub(crate) fn is_disproportionate(&self) -> bool {
+        matches!(self, Self::Disproportionate(_))
+    }
+
+    /// The phrasing for either judgement. Both are worth telling a reader and
+    /// the model: "within tolerance for a patch release" is release-pressure
+    /// context, not merely the absence of a finding.
+    pub(crate) fn note(&self) -> Option<&str> {
+        match self {
+            Self::Unjudged => None,
+            Self::WithinTolerance(note) | Self::Disproportionate(note) => Some(note),
+        }
+    }
+
+    /// The note *only* when it is the escalating one, for the surfaces that
+    /// report findings rather than context.
+    pub(crate) fn escalation_note(&self) -> Option<&str> {
+        match self {
+            Self::Disproportionate(note) => Some(note),
+            _ => None,
+        }
+    }
+}
+
+/// The two change-shape reads: behavioral drift vs the version bump's promise,
+/// and behavioral drift vs content drift (`skew`).
 #[derive(Debug)]
 pub(crate) struct Proportionality {
-    pub disproportionate: bool,
-    pub note: Option<String>,
+    pub drift: Drift,
     /// Behavioral change far outpacing content change — the implant tell. A
     /// rewrite moves both together; a surgical backdoor moves behavior on a
     /// small edit (xz: 99% of behavior on a ~20% content change).
@@ -2334,6 +2522,7 @@ impl Proportionality {
         diff: &DiffReportV1,
         source_archive: bool,
         source_build_anomaly: bool,
+        runtime_entrypoints: &HashSet<String>,
     ) -> Self {
         let skew = skew_note(a, diff);
         // Proportionality needs both halves of the comparison: a version bump
@@ -2343,8 +2532,7 @@ impl Proportionality {
             .filter(|_| a.behavioral.severity != Severity::None)
         else {
             return Self {
-                disproportionate: false,
-                note: None,
+                drift: Drift::Unjudged,
                 skew,
             };
         };
@@ -2353,23 +2541,24 @@ impl Proportionality {
         // change-shape signal as well (focused multi-capability edit,
         // endgame deletion, or the existing behavior/content skew read).
         let shape_signal = skew.is_some()
-            || change_shape_escalation(a, diff, naming.bump, source_archive, source_build_anomaly)
-                >= Severity::High;
-        let disproportionate = a.behavioral.severity > bump.tolerance() && shape_signal;
-        let note = if disproportionate {
-            format!(
-                "disproportionate — a {} bump gained a {}-severity capability",
-                bump.label(),
+            || change_shape_escalation(
+                a,
+                diff,
+                naming.bump,
+                source_archive,
+                source_build_anomaly,
+                runtime_entrypoints,
+            ) >= Severity::High;
+        let drift = if a.behavioral.severity > bump.tolerance() && shape_signal {
+            Drift::Disproportionate(format!(
+                "disproportionate — {} gained a {}-severity capability",
+                bump.describe(),
                 a.behavioral.severity.as_str()
-            )
+            ))
         } else {
-            format!("within tolerance for a {} bump", bump.label())
+            Drift::WithinTolerance(format!("within tolerance for {}", bump.describe()))
         };
-        Self {
-            disproportionate,
-            note: Some(note),
-            skew,
-        }
+        Self { drift, skew }
     }
 }
 
@@ -2384,9 +2573,7 @@ fn skew_note(a: &Assessment, diff: &DiffReportV1) -> Option<String> {
     // scopes stay relatively quiet (especially source-heavy packages). The
     // surgical signal is for a small focused edit; archive-root churn is
     // normalized before this point, so this is now a meaningful guard.
-    let changed_files =
-        diff.summary.files_changed + diff.summary.files_added + diff.summary.files_removed;
-    if changed_files > 16 {
+    if !compact_change(&diff.summary) {
         return None;
     }
     let s = &diff.summary.scope_roc;
@@ -2407,6 +2594,25 @@ fn skew_note(a: &Assessment, diff: &DiffReportV1) -> Option<String> {
     })
 }
 
+/// A change small enough for the shape rules below to mean anything. They look
+/// for a payload concentrated in a few files; across a thousand-file framework
+/// release the same signals are just unrelated local extrema, so every one of
+/// them bounds itself here — on the same count of touched files, at the same
+/// number.
+fn compact_change(s: &DiffSummary) -> bool {
+    s.files_changed + s.files_added + s.files_removed <= 16
+}
+
+/// Whether the change introduced a capability class it did not have before —
+/// the probe the shape rules below are built from. An escalation of a class
+/// that already existed does not count: these rules are about new behavior.
+fn has_new_class(a: &Assessment, class: &str) -> bool {
+    a.behavioral
+        .categories
+        .iter()
+        .any(|c| c.class == class && !c.new_ids.is_empty())
+}
+
 /// Raise a gate when the *shape* of the change is itself implant-like.
 ///
 /// The first branch catches a focused source-file implant: several wholly new
@@ -2421,9 +2627,13 @@ fn change_shape_escalation(
     bump: Option<Bump>,
     source_archive: bool,
     source_build_anomaly: bool,
+    runtime_entrypoints: &HashSet<String>,
 ) -> Severity {
     let s = &diff.summary;
     let same_version = bump.is_some_and(|b| matches!(b.kind, BumpKind::Same));
+    // The shared size bound: a small, focused change. Several branches below
+    // are meaningful only within one, and a large release trips none of them.
+    let compact = compact_change(s);
     let new_classes = a
         .behavioral
         .categories
@@ -2450,18 +2660,13 @@ fn change_shape_escalation(
     // in a small patch is a common dormant-loader shape. The class count and
     // movement floors keep ordinary single-purpose WordPress changes below
     // this branch.
-    let cross_domain_cluster = s.files_changed + s.files_added + s.files_removed <= 16
+    let cross_domain_cluster = compact
         && s.overall_roc >= 0.05
         && s.scope_roc.traits >= 0.15
         && new_classes >= 6
         && ["communications/http", "time/schedule", "data/serialize"]
             .iter()
-            .all(|class| {
-                a.behavioral
-                    .categories
-                    .iter()
-                    .any(|c| c.class == *class && !c.new_ids.is_empty())
-            });
+            .all(|class| has_new_class(a, class));
     let endgame = endgame_package_shape(s);
     // A dependency addition paired with a new fallback module load is a
     // compact supply-chain shape: the release pulls in new code and changes
@@ -2485,7 +2690,7 @@ fn change_shape_escalation(
     // routine password-protected source archive does not fail a release.
     let added_encrypted_payload_archive = same_version
         && diff.files.iter().any(|file| {
-            matches!(file.status, cleave::types::FileStatus::Added)
+            matches!(file.status, FileStatus::Added)
                 && file.scopes.traits.as_ref().is_some_and(|traits| {
                     let has = |id: &str| {
                         traits
@@ -2513,99 +2718,89 @@ fn change_shape_escalation(
         && s.overall_roc >= 0.75
         && s.scope_roc.traits >= 0.20
         && new_classes >= 2
-        && a.behavioral
-            .categories
-            .iter()
-            .any(|c| c.class == "data/archive" && !c.new_ids.is_empty())
-        && a.behavioral
-            .categories
-            .iter()
-            .any(|c| c.class == "anti-analysis" && !c.new_ids.is_empty());
+        && has_new_class(a, "data/archive")
+        && has_new_class(a, "anti-analysis");
     // A payload can be hidden one archive layer below the package and look
     // like a harmless resource (OpenX's PHP-in-JavaScript case is the model).
     // Keep this content-agnostic: require the same nested member to gain all
     // three independent signals — concealment/encoding, execution, and a
     // delivery or filesystem effect.
-    let nested_payload_cluster = diff.files.iter().any(|file| {
-        if s.files_changed + s.files_added + s.files_removed > 16 {
-            return false;
-        }
-        if file.path.matches("!!").count() < 2 {
-            return false;
-        }
-        let Some(traits) = file.scopes.traits.as_ref() else {
-            return false;
-        };
-        let text = traits
-            .added
+    let nested_payload_cluster = compact
+        && diff.files.iter().any(|file| {
+            if file.path.matches("!!").count() < 2 {
+                return false;
+            }
+            let Some(traits) = file.scopes.traits.as_ref() else {
+                return false;
+            };
+            let text = traits
+                .added
+                .iter()
+                .map(|t| format!("{} {}", t.id, t.desc))
+                .chain(
+                    traits
+                        .changed
+                        .iter()
+                        .map(|change| format!("{} {}", change.new.id, change.new.desc)),
+                )
+                .map(|text| text.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            let has = |needles: &[&str]| {
+                text.iter()
+                    .any(|value| needles.iter().any(|needle| value.contains(needle)))
+            };
+            has(&[
+                "anti-static",
+                "obfuscat",
+                "encoded",
+                "base64",
+                "rot13",
+                "decode",
+            ]) && has(&[
+                "process/interpreter",
+                "eval",
+                "include",
+                "require",
+                "exec",
+                "shell",
+            ]) && has(&[
+                "communications/http",
+                "fs/",
+                "file/write",
+                "file_get_contents",
+                "network",
+            ])
+        });
+    let nested_capability_cluster = compact
+        && diff.files.iter().any(|file| {
+            if file.path.matches("!!").count() < 2 {
+                return false;
+            }
+            let Some(traits) = file.scopes.traits.as_ref() else {
+                return false;
+            };
+            let classes = traits
+                .added
+                .iter()
+                .map(|t| crate::rubric::capability_class(&t.id))
+                .chain(
+                    traits
+                        .changed
+                        .iter()
+                        .map(|c| crate::rubric::capability_class(&c.new.id)),
+                )
+                .flatten()
+                .collect::<HashSet<_>>();
+            [
+                "anti-static",
+                "process/interpreter",
+                "communications/http",
+                "fs/file",
+            ]
             .iter()
-            .map(|t| format!("{} {}", t.id, t.desc))
-            .chain(
-                traits
-                    .changed
-                    .iter()
-                    .map(|change| format!("{} {}", change.new.id, change.new.desc)),
-            )
-            .map(|text| text.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-        let has = |needles: &[&str]| {
-            text.iter()
-                .any(|value| needles.iter().any(|needle| value.contains(needle)))
-        };
-        has(&[
-            "anti-static",
-            "obfuscat",
-            "encoded",
-            "base64",
-            "rot13",
-            "decode",
-        ]) && has(&[
-            "process/interpreter",
-            "eval",
-            "include",
-            "require",
-            "exec",
-            "shell",
-        ]) && has(&[
-            "communications/http",
-            "fs/",
-            "file/write",
-            "file_get_contents",
-            "network",
-        ])
-    });
-    let nested_capability_cluster = diff.files.iter().any(|file| {
-        if s.files_changed + s.files_added + s.files_removed > 16 {
-            return false;
-        }
-        if file.path.matches("!!").count() < 2 {
-            return false;
-        }
-        let Some(traits) = file.scopes.traits.as_ref() else {
-            return false;
-        };
-        let classes = traits
-            .added
-            .iter()
-            .map(|t| crate::rubric::capability_class(&t.id))
-            .chain(
-                traits
-                    .changed
-                    .iter()
-                    .map(|c| crate::rubric::capability_class(&c.new.id)),
-            )
-            .flatten()
-            .collect::<HashSet<_>>();
-        [
-            "anti-static",
-            "process/interpreter",
-            "communications/http",
-            "fs/file",
-        ]
-        .iter()
-        .all(|class| classes.iter().any(|got| got == class))
-    });
-    let encoded_payload_cluster = [
+            .all(|class| classes.iter().any(|got| got == class))
+        });
+    let encoded_payload_classes = [
         "file/encoded",
         "anti-static",
         "process/interpreter",
@@ -2613,27 +2808,16 @@ fn change_shape_escalation(
         "fs/file",
     ]
     .iter()
-    .filter(|class| {
-        a.behavioral
-            .categories
-            .iter()
-            .any(|category| category.class == **class && !category.new_ids.is_empty())
-    })
+    .filter(|class| has_new_class(a, class))
     .count();
     // A newly encoded/obfuscated file plus execution and an external or file
     // effect is a compact payload shape even when normal package files moved
     // around it. This is deliberately a class-level combination, not a
     // filename or campaign signature.
-    let encoded_payload_cluster = encoded_payload_cluster >= 3
-        && diff.summary.files_changed + diff.summary.files_added + diff.summary.files_removed <= 16
-        && a.behavioral
-            .categories
-            .iter()
-            .any(|category| category.class == "anti-static" && !category.new_ids.is_empty())
-        && a.behavioral
-            .categories
-            .iter()
-            .any(|category| category.class == "file/encoded" && !category.new_ids.is_empty());
+    let encoded_payload_cluster = encoded_payload_classes >= 3
+        && compact
+        && has_new_class(a, "anti-static")
+        && has_new_class(a, "file/encoded");
 
     // Two platform-neutral release shapes deserve a high review signal even
     // when each individual trait is only medium:
@@ -2676,6 +2860,10 @@ fn change_shape_escalation(
         && new_id_contains(&["private-key", "mnemonic", "wallet", "seed"])
         && new_id_contains(&["external-url", "remote-host-url", "tld-"]);
     let executable_capability_bundle = executable_capability_escalation(diff, bump);
+    let binary_replacement = binary_replacement_anomaly(diff, bump).is_some();
+    let opaque_runtime_payload =
+        opaque_runtime_payload_anomaly(diff, bump, runtime_entrypoints).is_some();
+    let runtime_graft = runtime_graft_anomaly(diff, bump, runtime_entrypoints).is_some();
     if focused_source
         || focused_source_with_cleanup
         || source_build_anomaly
@@ -2691,12 +2879,387 @@ fn change_shape_escalation(
         || native_hook_cluster
         || native_build_hook_cluster
         || secret_egress_cluster
+        || binary_replacement
+        || opaque_runtime_payload
+        || runtime_graft
         || executable_capability_bundle >= Severity::High
     {
         Severity::High
     } else {
         Severity::None
     }
+}
+
+#[derive(Debug)]
+struct BinaryReplacementAnomaly {
+    large_moves: usize,
+    metric_families: usize,
+}
+
+/// Detect a rebuilt compiled artifact from content facts alone. This is the
+/// trait-independent fallback for an unknown supply-chain payload: a repack of
+/// the *same* version changed most scopes and radically altered several
+/// independent metric families in one native/bytecode member.
+///
+/// The conjunction is intentionally strict. Reproducible-build noise can move
+/// a timestamp or a handful of layout values, while an ordinary new release is
+/// licensed by its version bump. Neither should become a hostile verdict.
+fn binary_replacement_anomaly(
+    diff: &DiffReportV1,
+    bump: Option<Bump>,
+) -> Option<BinaryReplacementAnomaly> {
+    if !bump.is_some_and(|b| matches!(b.kind, BumpKind::Same))
+        || !compact_change(&diff.summary)
+        || diff.summary.overall_roc < 0.50
+        || diff.summary.scope_roc.metrics < 0.30
+    {
+        return None;
+    }
+
+    diff.files
+        .iter()
+        .filter(|file| matches!(file.status, FileStatus::Changed))
+        .filter(|file| member_type(file).is_some_and(|t| t.is_binary()))
+        .filter_map(|file| {
+            use cleave::types::Scope;
+
+            // Require corroboration outside scalar metrics: a replacement
+            // changes binary topology and at least one semantic fact surface.
+            if !file.scopes.view(Scope::Sections).has_changes
+                || !(file.scopes.view(Scope::Symbols).has_changes
+                    || file.scopes.view(Scope::Kv).has_changes)
+            {
+                return None;
+            }
+
+            let metrics = file.scopes.metrics.as_ref()?;
+            let mut families = HashSet::new();
+            let mut large_moves = 0usize;
+            for change in &metrics.changed {
+                let path = change.new.path.as_str();
+                if path.contains("mtime") || path.contains("timing") {
+                    continue;
+                }
+                let (Some(old), Some(new)) = (change.old.value.as_f64(), change.new.value.as_f64())
+                else {
+                    continue;
+                };
+                let large = if old == 0.0 {
+                    new.abs() >= 2.0
+                } else {
+                    (new - old).abs() / old.abs() >= 0.65
+                };
+                if !large {
+                    continue;
+                }
+                large_moves += 1;
+                families.insert(path.split(['.', '/']).next().unwrap_or(path));
+            }
+
+            (large_moves >= 4 && families.len() >= 3).then_some(BinaryReplacementAnomaly {
+                large_moves,
+                metric_families: families.len(),
+            })
+        })
+        .max_by_key(|anomaly| (anomaly.metric_families, anomaly.large_moves))
+}
+
+#[derive(Debug)]
+struct OpaqueRuntimePayloadAnomaly {
+    entrypoint: String,
+    payload: String,
+    size: f64,
+    lines: f64,
+    encoded_ratio: f64,
+    max_string: f64,
+}
+
+/// Detect a compact release that wires a highly opaque new source member into
+/// an existing package runtime entrypoint. This deliberately uses graph,
+/// topology, and numeric facts only: it remains useful when no trait knows the
+/// decoder, cipher, VM, or platform API used by a future implant.
+///
+/// Every leg is needed. A minified bundle alone is ordinary; a large test
+/// fixture alone is ordinary; and a package growing in a major release is
+/// ordinary. A same/patch release nearly doubling while a declared entrypoint
+/// starts naming a new, one-line, mostly-encoded source member is not.
+fn opaque_runtime_payload_anomaly(
+    diff: &DiffReportV1,
+    bump: Option<Bump>,
+    runtime_entrypoints: &HashSet<String>,
+) -> Option<OpaqueRuntimePayloadAnomaly> {
+    if !bump.is_some_and(|b| matches!(b.kind, BumpKind::Same | BumpKind::Patch))
+        || !compact_change(&diff.summary)
+        || diff.summary.overall_roc < 0.30
+        || root_size_growth(diff).is_none_or(|growth| growth < 0.50)
+    {
+        return None;
+    }
+
+    let opaque_members = diff
+        .files
+        .iter()
+        .filter(|file| matches!(file.status, FileStatus::Added))
+        .filter(|file| member_type(file).is_some_and(|t| t.is_source_code()))
+        .filter_map(|file| {
+            let size = new_metric_value(file, "file.size")?;
+            let lines = new_metric_value(file, "text.total_lines")?;
+            let max_line = new_metric_value(file, "text.max_line_length")?;
+            let encoded_ratio = new_metric_value(file, "text.encoded_string_ratio")?;
+            let max_string = new_metric_value(file, "strings.max_length")?;
+            let digit_ratio = new_metric_value(file, "text.digit_ratio").unwrap_or(0.0);
+            let hex_strings = new_metric_value(file, "strings.hex_strings").unwrap_or(0.0);
+            (size >= 1_024.0
+                && lines <= 4.0
+                && max_line >= 1_000.0
+                && encoded_ratio >= 0.50
+                && max_string >= 1_000.0
+                && (digit_ratio >= 0.30 || hex_strings >= 4.0))
+                .then_some((file, size, lines, encoded_ratio, max_string))
+        });
+
+    for (payload, size, lines, encoded_ratio, max_string) in opaque_members {
+        let payload_path = display_member_path(&payload.path);
+        for entrypoint in diff.files.iter().filter(|file| {
+            matches!(file.status, FileStatus::Added | FileStatus::Changed)
+                && runtime_entrypoints.contains(display_member_path(&file.path))
+        }) {
+            let Some(facts) = entrypoint.scopes.kv.as_ref() else {
+                continue;
+            };
+            let gained_values = facts
+                .added
+                .iter()
+                .map(|fact| &fact.value)
+                .chain(facts.changed.iter().map(|change| &change.new.value));
+            if gained_values
+                .filter_map(serde_json::Value::as_str)
+                .any(|value| {
+                    local_reference_matches(
+                        display_member_path(&entrypoint.path),
+                        value,
+                        payload_path,
+                    )
+                })
+            {
+                return Some(OpaqueRuntimePayloadAnomaly {
+                    entrypoint: entrypoint.path.clone(),
+                    payload: payload.path.clone(),
+                    size,
+                    lines,
+                    encoded_ratio,
+                    max_string,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The current numeric value of a metric on an added or changed file.
+fn new_metric_value(file: &FileDiffEntry, path: &str) -> Option<f64> {
+    let metrics = file.scopes.metrics.as_ref()?;
+    metrics
+        .added
+        .iter()
+        .find(|metric| metric.path == path)
+        .map(|metric| &metric.value)
+        .or_else(|| {
+            metrics
+                .changed
+                .iter()
+                .find(|change| change.new.path == path)
+                .map(|change| &change.new.value)
+        })?
+        .as_f64()
+}
+
+fn root_size_growth(diff: &DiffReportV1) -> Option<f64> {
+    let root = diff.files.iter().find(|file| file.path == "<root>")?;
+    let metrics = root.scopes.metrics.as_ref()?;
+    let change = metrics
+        .changed
+        .iter()
+        .find(|change| matches!(change.new.path.as_str(), "file.size" | "file.size_bytes"))?;
+    let old = change.old.value.as_f64()?;
+    let new = change.new.value.as_f64()?;
+    (old > 0.0).then_some((new - old) / old)
+}
+
+/// Source extensions a module reference may leave off. Also the set that makes
+/// a bare `payload.php` recognizable as a sibling file rather than a package
+/// name — `include 'payload.php'` is the ordinary same-directory spelling in
+/// the ecosystems this detector targets.
+const SOURCE_EXTENSIONS: [&str; 8] = [".js", ".cjs", ".mjs", ".json", ".ts", ".py", ".rb", ".php"];
+
+/// Resolve a path-looking source fact relative to its referrer and compare it
+/// with an archive member. Relative paths, sibling filenames, and extensionless
+/// module imports are accepted; URLs, bare package names, host-absolute paths,
+/// and anything escaping the package root are rejected.
+fn local_reference_matches(referrer: &str, reference: &str, target: &str) -> bool {
+    let reference = reference.split(['?', '#']).next().unwrap_or(reference);
+    // These are string *literals* lifted from source, not resolved paths, so a
+    // leading `/` is almost always the tail of a concatenation — PHP's
+    // `require __DIR__ . '/payload.php'` extracts as `/payload.php`. Reading it
+    // as referrer-relative is therefore the right call, not host-absolute.
+    let sibling = SOURCE_EXTENSIONS.iter().any(|ext| reference.ends_with(ext));
+    if reference.is_empty()
+        || reference.contains("://")
+        || !(reference.starts_with('.') || reference.contains('/') || sibling)
+    {
+        return false;
+    }
+
+    let mut parts: Vec<&str> = referrer.split('/').collect();
+    parts.pop();
+    for part in reference.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return false;
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let resolved = parts.join("/");
+    // Either the reference named the member outright, or it left off an
+    // extension the member carries.
+    target
+        .strip_prefix(resolved.as_str())
+        .is_some_and(|rest| rest.is_empty() || SOURCE_EXTENSIONS.contains(&rest))
+}
+
+#[derive(Debug)]
+struct RuntimeGraftAnomaly {
+    entrypoint: String,
+    payload: String,
+    timestamp_spread: f64,
+}
+
+/// Detect a focused package repack that grafts a new externally-facing source
+/// member onto the package's identity-bearing runtime entrypoint. Unlike the
+/// opaque-payload branch, this catches readable implants. The archive timing
+/// cluster is essential corroboration: both touched members must be singled
+/// out as timestamp outliers inside a very narrow build window.
+fn runtime_graft_anomaly(
+    diff: &DiffReportV1,
+    bump: Option<Bump>,
+    runtime_entrypoints: &HashSet<String>,
+) -> Option<RuntimeGraftAnomaly> {
+    if !bump.is_some_and(|b| matches!(b.kind, BumpKind::Same | BumpKind::Patch))
+        || !compact_change(&diff.summary)
+        || diff.summary.overall_roc < 0.30
+    {
+        return None;
+    }
+    let timestamp_spread = archive_timestamp_spread(diff)?;
+    if timestamp_spread > 300.0 {
+        return None;
+    }
+    // Gathered once, ahead of the loops: the alternative is re-scanning every
+    // file for `<root>` on each payload *and* each entrypoint candidate.
+    let outliers = timestamp_outlier_members(diff);
+
+    for payload in diff.files.iter().filter(|file| {
+        matches!(file.status, FileStatus::Added)
+            && member_type(file).is_some_and(|t| t.is_source_code())
+            && new_metric_value(file, "file.size").is_some_and(|size| size >= 512.0)
+    }) {
+        let payload_path = display_member_path(&payload.path);
+        // Cheapest discriminator first — it rejects nearly every candidate, and
+        // the string scan below is the expensive part.
+        if !outliers.contains(payload_path) {
+            continue;
+        }
+        let Some(payload_facts) = payload.scopes.kv.as_ref() else {
+            continue;
+        };
+        let payload_values = payload_facts
+            .added
+            .iter()
+            .map(|fact| &fact.value)
+            .chain(payload_facts.changed.iter().map(|change| &change.new.value))
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        let external_url = payload_values
+            .iter()
+            .any(|value| value.contains("http://") || value.contains("https://"));
+        let absolute_host_path = payload_values.iter().any(|value| {
+            value.starts_with('/')
+                && !value.starts_with("//")
+                && value.trim_start_matches('/').contains('/')
+        });
+        if !external_url || !absolute_host_path {
+            continue;
+        }
+
+        for entrypoint in diff.files.iter().filter(|file| {
+            matches!(file.status, FileStatus::Added | FileStatus::Changed)
+                && runtime_entrypoints.contains(display_member_path(&file.path))
+        }) {
+            let entrypoint_path = display_member_path(&entrypoint.path);
+            if !outliers.contains(entrypoint_path) {
+                continue;
+            }
+            let Some(facts) = entrypoint.scopes.kv.as_ref() else {
+                continue;
+            };
+            let gained_reference = facts
+                .added
+                .iter()
+                .map(|fact| &fact.value)
+                .chain(facts.changed.iter().map(|change| &change.new.value))
+                .filter_map(serde_json::Value::as_str)
+                .any(|value| local_reference_matches(entrypoint_path, value, payload_path));
+            if gained_reference {
+                return Some(RuntimeGraftAnomaly {
+                    entrypoint: entrypoint.path.clone(),
+                    payload: payload.path.clone(),
+                    timestamp_spread,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The new side's archive-wide mtime spread, in seconds.
+///
+/// Read from `added` as well as `changed`: a kv diff omits unchanged entries, so
+/// a repack that preserves the bulk mtimes and smears only the two touched
+/// members — the shape this corroborates — leaves the spread in neither bucket
+/// if only `changed` is consulted, and an old side with no mtimes at all puts it
+/// in `added`.
+fn archive_timestamp_spread(diff: &DiffReportV1) -> Option<f64> {
+    let root = diff.files.iter().find(|file| file.path == "<root>")?;
+    let facts = root.scopes.kv.as_ref()?;
+    facts
+        .added
+        .iter()
+        .chain(facts.changed.iter().map(|change| &change.new))
+        .find(|fact| fact.path == "archive.timing.mtime_spread_seconds")?
+        .value
+        .as_f64()
+}
+
+/// The members the archive singled out as mtime outliers — the narrow build
+/// window a graft leaves behind. cleave flattens the leaf array value-keyed, so
+/// membership really does arrive as `added` entries.
+fn timestamp_outlier_members(diff: &DiffReportV1) -> HashSet<&str> {
+    diff.files
+        .iter()
+        .find(|file| file.path == "<root>")
+        .and_then(|root| root.scopes.kv.as_ref())
+        .into_iter()
+        .flat_map(|facts| facts.added.iter())
+        .filter(|fact| {
+            fact.path
+                .starts_with("archive.timing.mtime_outlier_members[]")
+        })
+        .filter_map(|fact| fact.value.as_str())
+        .collect()
 }
 
 /// A package that retains only a tiny shell after deleting nearly all of its
@@ -2716,24 +3279,19 @@ fn endgame_package_shape(summary: &DiffSummary) -> bool {
 /// count and overall movement bounds keep ordinary framework rewrites out.
 fn dependency_with_fallback_load(a: &Assessment, diff: &DiffReportV1) -> bool {
     let summary = &diff.summary;
-    summary.files_changed + summary.files_added + summary.files_removed <= 16
+    compact_change(summary)
         && a.structure
             .facts
             .iter()
             .any(|fact| fact.label == "dependency")
-        && a.behavioral
-            .categories
-            .iter()
-            .any(|category| category.class == "os/module" && !category.new_ids.is_empty())
+        && has_new_class(a, "os/module")
         && summary.overall_roc <= 0.25
 }
 
-/// A single changed file gained all parts of a concealed browser-side remote
-/// loader: a long numeric character array, conversion through
-/// `String.fromCharCode`, creation of a script element, and dynamic loading of
-/// that script. Keeping the join file-local avoids combining unrelated helpers
-/// spread throughout a normal web application.
-fn obfuscated_remote_script_loader(diff: &DiffReportV1) -> bool {
+/// Whether one added-or-changed file gained *every* one of `suffixes` as a new
+/// trait. Keeping the join file-local is the point: unrelated helpers scattered
+/// across a normal web application must not add up to a loader.
+fn file_gained_all_traits(diff: &DiffReportV1, suffixes: &[&str]) -> bool {
     diff.files.iter().any(|file| {
         if !matches!(file.status, FileStatus::Added | FileStatus::Changed) {
             return false;
@@ -2741,17 +3299,29 @@ fn obfuscated_remote_script_loader(diff: &DiffReportV1) -> bool {
         let Some(traits) = file.scopes.traits.as_ref() else {
             return false;
         };
-        let has = |suffix: &str| {
+        suffixes.iter().all(|suffix| {
             traits
                 .added
                 .iter()
                 .any(|trait_change| trait_change.id.ends_with(suffix))
-        };
-        has("::long-numeric-array-literal")
-            && has("::fromcharcode-call")
-            && has("::browser-create-script-element")
-            && has("::dynamic-script-element-load")
+        })
     })
+}
+
+/// A single changed file gained all parts of a concealed browser-side remote
+/// loader: a long numeric character array, conversion through
+/// `String.fromCharCode`, creation of a script element, and dynamic loading of
+/// that script.
+fn obfuscated_remote_script_loader(diff: &DiffReportV1) -> bool {
+    file_gained_all_traits(
+        diff,
+        &[
+            "::long-numeric-array-literal",
+            "::fromcharcode-call",
+            "::browser-create-script-element",
+            "::dynamic-script-element-load",
+        ],
+    )
 }
 
 /// The non-obfuscated sibling of [`obfuscated_remote_script_loader`]: one file
@@ -2759,23 +3329,14 @@ fn obfuscated_remote_script_loader(diff: &DiffReportV1) -> bool {
 /// This catches a payload appended plainly to a distributed browser bundle;
 /// the modest-release guard belongs to [`change_shape_escalation`].
 fn external_remote_script_loader(diff: &DiffReportV1) -> bool {
-    diff.files.iter().any(|file| {
-        if !matches!(file.status, FileStatus::Added | FileStatus::Changed) {
-            return false;
-        }
-        let Some(traits) = file.scopes.traits.as_ref() else {
-            return false;
-        };
-        let has = |suffix: &str| {
-            traits
-                .added
-                .iter()
-                .any(|trait_change| trait_change.id.ends_with(suffix))
-        };
-        has("::js-remote-host-url")
-            && has("::browser-create-script-element")
-            && has("::dynamic-script-element-load")
-    })
+    file_gained_all_traits(
+        diff,
+        &[
+            "::js-remote-host-url",
+            "::browser-create-script-element",
+            "::dynamic-script-element-load",
+        ],
+    )
 }
 
 /// The inverse of [`endgame_package_shape`], strengthened with direct evidence
@@ -2811,9 +3372,7 @@ fn executable_capability_escalation(diff: &DiffReportV1, bump: Option<Bump>) -> 
     // This heuristic is intentionally about a compact payload replacement.
     // A normal archive release can replace many compiled members at once; its
     // ordinary binary capabilities must not be treated as a single implant.
-    let changed_files =
-        diff.summary.files_changed + diff.summary.files_added + diff.summary.files_removed;
-    if changed_files > 16 {
+    if !compact_change(&diff.summary) {
         return Severity::None;
     }
     let package_context = package_payload_context(diff);
@@ -2825,21 +3384,22 @@ fn executable_capability_escalation(diff: &DiffReportV1, bump: Option<Bump>) -> 
     let mut best = 0u32;
 
     for file in &diff.files {
-        if !matches!(
-            file.status,
-            cleave::types::FileStatus::Added | cleave::types::FileStatus::Changed
-        ) {
+        if !matches!(file.status, FileStatus::Added | FileStatus::Changed) {
             continue;
         }
         let profile = capability_shape(file);
         if !profile.executable {
             continue;
         }
-        let replacement = matches!(file.status, cleave::types::FileStatus::Added)
-            && diff.files.iter().any(|other| {
-                matches!(other.status, cleave::types::FileStatus::Removed)
-                    && normalized_member_path(&other.path) == normalized_member_path(&file.path)
-            });
+        // Normalized once: it runs `Version::detect` and `clean_name`, and the
+        // left-hand side does not vary across the candidates being scanned.
+        let replacement = matches!(file.status, FileStatus::Added) && {
+            let normalized = normalized_member_path(&file.path);
+            diff.files.iter().any(|other| {
+                matches!(other.status, FileStatus::Removed)
+                    && normalized_member_path(&other.path) == normalized
+            })
+        };
         let score = capability_shape_score(&profile, package_context, replacement);
         best = best.max(score);
     }
@@ -2870,26 +3430,28 @@ struct CapabilityShape {
     archive_member: bool,
 }
 
+/// Directories that hold programs on the platforms isomer sees. Path shape is
+/// the only executable evidence available when a member cannot be extracted, so
+/// both the capability profile and the extraction fallback read the same list.
+/// `/usr/bin/` and `/usr/local/bin/` need no entry — `/bin/` already covers them.
+const EXEC_PATH_MARKERS: [&str; 5] = [
+    "/contents/macos/",
+    "/bin/",
+    "/sbin/",
+    "/libexec/",
+    "\\system32\\",
+];
+
 /// Build a compact, explainable profile from the diff scopes. It deliberately
 /// consumes the facts already emitted by cleave instead of requiring a new
 /// platform-specific trait for every API spelling.
-fn capability_shape(file: &cleave::types::FileDiffEntry) -> CapabilityShape {
+fn capability_shape(file: &FileDiffEntry) -> CapabilityShape {
     use cleave::types::Scope;
 
     let lower_path = file.path.to_ascii_lowercase();
     let mut shape = CapabilityShape {
-        executable: lower_path.ends_with(".exe")
-            || lower_path.ends_with(".dll")
-            || lower_path.ends_with(".so")
-            || lower_path.ends_with(".dylib")
-            || lower_path.ends_with(".bin")
-            || lower_path.contains("/contents/macos/")
-            || lower_path.contains("/bin/")
-            || lower_path.contains("/usr/bin/")
-            || lower_path.contains("/usr/local/bin/")
-            || lower_path.contains("/sbin/")
-            || lower_path.contains("/libexec/")
-            || lower_path.contains("\\system32\\"),
+        executable: member_type(file).is_some_and(|t| t.is_binary())
+            || EXEC_PATH_MARKERS.iter().any(|m| lower_path.contains(m)),
         resource_path: [
             "/resources/",
             "/plugins/",
@@ -2977,7 +3539,6 @@ fn trait_is_executable(id: &str) -> bool {
     let lower = id.to_ascii_lowercase();
     lower.contains("metadata/lang/compiled")
         || lower.contains("metadata/binary/")
-        || lower.contains("metadata/binary/section")
         || lower.contains("macho")
         || lower.contains("elf")
         || lower.contains("pe-")
@@ -2996,14 +3557,7 @@ fn is_compiled_binary_file_type(file_type: filefacts::FileType) -> bool {
 /// cache or resource files must not become “payloads” merely by naming.
 fn executable_member_layout(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    if lower.contains("/contents/macos/")
-        || lower.contains("/bin/")
-        || lower.contains("/usr/bin/")
-        || lower.contains("/usr/local/bin/")
-        || lower.contains("/sbin/")
-        || lower.contains("/libexec/")
-        || lower.contains("\\system32\\")
-    {
+    if EXEC_PATH_MARKERS.iter().any(|m| lower.contains(m)) {
         return true;
     }
     // Mach-O framework binaries conventionally live at Versions/A/<name>;
@@ -3103,6 +3657,95 @@ fn root_size_delta(diff: &DiffReportV1) -> Option<String> {
     Some(format!("{old:.0} -> {new:.0} bytes ({delta})"))
 }
 
+/// Rank numeric metric changes globally by absolute relative movement. This is
+/// shared differential context for humans and the LLM: structural replacement
+/// clues such as a 90% code-size collapse should not be hidden behind a single
+/// aggregate metric ROC.
+fn strongest_metric_changes(diff: &DiffReportV1, limit: usize) -> Vec<String> {
+    let qualify_path = |path: &str| {
+        !path.contains("mtime")
+            && !path.contains("timing")
+            && !path.contains("dependencies")
+            && !path.contains("has_direct_loader_dep")
+            && !path.contains("load_segment")
+            && !path.ends_with("size_bytes")
+    };
+    let show_file = diff.files.len() > 1;
+    let mut movers = Vec::new();
+    for file in &diff.files {
+        let Some(metrics) = file.scopes.metrics.as_ref() else {
+            continue;
+        };
+        for change in &metrics.changed {
+            let path = change.new.path.as_str();
+            if !qualify_path(path) {
+                continue;
+            }
+            let (Some(old), Some(new)) = (change.old.value.as_f64(), change.new.value.as_f64())
+            else {
+                continue;
+            };
+            if old == new {
+                continue;
+            }
+            let importance = metric_change_importance(old, new);
+            let delta = if old == 0.0 {
+                "new".to_string()
+            } else {
+                format!("{:+.0}%", (new - old) / old.abs() * 100.0)
+            };
+            let label = if show_file {
+                format!("{}:{path}", display_member_path(&file.path))
+            } else {
+                path.to_string()
+            };
+            let rendered = format!(
+                "{label} {}→{} ({delta})",
+                compact_metric_number(old),
+                compact_metric_number(new)
+            );
+            movers.push((importance, label, rendered));
+        }
+    }
+    // One row per label, keeping its strongest movement. `dedup_by` only drops
+    // *adjacent* equals, so the labels have to be brought together first —
+    // sorting by importance alone would leave two rows for the same label
+    // (`a.tgz!!pkg/x.js` and `b.zip!!pkg/x.js` share one) sitting apart and both
+    // would survive into the top `limit`.
+    movers.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.total_cmp(&a.0)));
+    movers.dedup_by(|a, b| a.1 == b.1);
+    movers.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    movers
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, rendered)| rendered)
+        .collect()
+}
+
+/// Rank a numeric metric movement without letting every `0 -> 1` counter beat
+/// a large proportional change. With a non-zero baseline, relative movement is
+/// the useful comparison. At zero, gradually admit magnitude up to ten units:
+/// a newly observed section count of six matters more than one incidental AST
+/// call, while neither receives an artificial infinity.
+pub(crate) fn metric_change_importance(old: f64, new: f64) -> f64 {
+    if old == 0.0 {
+        new.abs().min(10.0) / 10.0
+    } else {
+        (new - old).abs() / old.abs()
+    }
+}
+
+/// Whole numbers plain, fractional ones with two decimals — so a ratio like
+/// `0.28 → 0.05` never rounds to the meaningless `0→0`. Shared with the terminal
+/// so a metric reads the same in every view.
+pub(crate) fn compact_metric_number(value: f64) -> String {
+    if value == value.trunc() {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
 /// Normalize only a version-bearing archive/package root for matching. A
 /// literal `foo/bin/x` stays distinct from `bar/bin/x`; `foo-1.0/bin/x` and
 /// `foo-1.1/bin/x` both become `foo/bin/x`. This is the same conservative
@@ -3130,63 +3773,57 @@ fn normalized_member_path(path: &str) -> String {
         .join("!!")
 }
 
-fn display_member_path(path: &str) -> String {
-    path.split_once("!!")
-        .map_or_else(|| path.to_string(), |(_, member)| member.to_string())
+/// A diff path as the reader sees it: the archive member alone, with the
+/// container prefix dropped. Borrowed, not copied — this sits inside per-file
+/// and per-payload loops.
+fn display_member_path(path: &str) -> &str {
+    path.split_once("!!").map_or(path, |(_, member)| member)
 }
 
-fn identity_claims(identity: &filefacts::Identity) -> Vec<String> {
-    let mut claims = Vec::new();
-    let mut add = |label: &str, claim: Option<&filefacts::Claim>| {
-        let Some(claim) = claim else {
-            return;
-        };
-        let value = crate::printable(&claim.value);
-        if value.is_empty() {
-            return;
-        }
-        let provenance = if claim.verified {
-            "verified"
-        } else {
-            "claimed"
-        };
-        claims.push(format!("{label}={value} [{provenance}]"));
+/// The type cleave detected for a diff entry. `None` when the entry carries no
+/// label or the label is one filefacts does not know — an unknown type is never
+/// treated as evidence either way.
+fn member_type(file: &FileDiffEntry) -> Option<filefacts::FileType> {
+    file.file_type
+        .as_deref()
+        .and_then(filefacts::FileType::from_label)
+}
+
+/// The identity a changed file carries, unless it is filename-only. A name
+/// merely derived from the path is not a publisher claim, and reading it as one
+/// would turn every rename into identity drift.
+fn meaningful_identity(file: &FileDiffEntry) -> Option<&cleave::types::IdentityDiff> {
+    let identity = file.identity.as_ref()?;
+    let filename_only = |side: &Option<filefacts::Identity>| {
+        side.as_ref()
+            .is_some_and(crate::rubric::filename_only_identity)
     };
-    add("name", identity.name.as_ref());
-    add("title", identity.title.as_ref());
-    add("project", identity.project.as_ref());
-    add("identifier", identity.identifier.as_ref());
-    add("version", identity.version.as_ref());
-    add("organization", identity.organization.as_ref());
-    add("producer", identity.producer.as_ref());
-    add("team", identity.team_id.as_ref());
-    if let Some(signer) = &identity.signer {
-        let signer_name = signer
-            .organization
-            .as_deref()
-            .or(signer.common_name.as_deref())
-            .unwrap_or_default();
-        if !signer_name.is_empty() {
-            claims.push(format!(
-                "signer={} [parsed, {}]",
-                crate::printable(signer_name),
-                trust_label(identity.trust)
-            ));
-        }
-    } else if identity.trust != filefacts::Trust::Unsigned {
-        claims.push(format!("trust={}", trust_label(identity.trust)));
-    }
-    claims
+    (!filename_only(&identity.old) && !filename_only(&identity.new)).then_some(identity)
 }
 
-/// Flatten claims for a field-level terminal diff. Values retain their trust
-/// marker so a claim becoming verified (or losing verification) is visible
-/// even when its text did not change.
-fn identity_claim_fields(
+/// Root claims first, then members alphabetically, capped at `cap` — a large
+/// package must not drown out the artifact's own identity.
+fn ranked(mut entries: Vec<(usize, String)>, cap: usize) -> Vec<String> {
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    entries.truncate(cap);
+    entries.into_iter().map(|(_, text)| text).collect()
+}
+
+/// Every identity claim an artifact carries, in a fixed field order, each value
+/// tagged with how it was established — `verified` when a signature backs it,
+/// `claimed` when only the metadata asserts it. The signer's own name rides
+/// along with the trust verdict; an unsigned-but-trusted artifact reports the
+/// verdict alone.
+///
+/// `include_version` is the only axis of variation between the two readings
+/// below: a version bump is not identity drift, so the field-level diff drops
+/// it, while the LLM payload — which describes an artifact rather than
+/// comparing two — keeps it.
+fn identity_claim_list(
     identity: &filefacts::Identity,
     include_version: bool,
-) -> BTreeMap<&'static str, String> {
-    let mut claims = BTreeMap::new();
+) -> Vec<(&'static str, String)> {
+    let mut claims = Vec::new();
     let mut add = |label: &'static str, claim: Option<&filefacts::Claim>| {
         let Some(claim) = claim else {
             return;
@@ -3200,7 +3837,7 @@ fn identity_claim_fields(
         } else {
             "claimed"
         };
-        claims.insert(label, format!("{value} [{provenance}]"));
+        claims.push((label, format!("{value} [{provenance}]")));
     };
     add("name", identity.name.as_ref());
     add("title", identity.title.as_ref());
@@ -3219,19 +3856,39 @@ fn identity_claim_fields(
             .or(signer.common_name.as_deref())
             .unwrap_or_default();
         if !signer_name.is_empty() {
-            claims.insert(
+            claims.push((
                 "signer",
                 format!(
                     "{} [parsed, {}]",
                     crate::printable(signer_name),
                     trust_label(identity.trust)
                 ),
-            );
+            ));
         }
     } else if identity.trust != filefacts::Trust::Unsigned {
-        claims.insert("trust", trust_label(identity.trust));
+        claims.push(("trust", trust_label(identity.trust)));
     }
     claims
+}
+
+/// The claims as `field=value [provenance]` lines, for the LLM payload.
+fn identity_claims(identity: &filefacts::Identity) -> Vec<String> {
+    identity_claim_list(identity, true)
+        .into_iter()
+        .map(|(label, value)| format!("{label}={value}"))
+        .collect()
+}
+
+/// The claims keyed by field, for a field-level terminal diff. Values retain
+/// their trust marker so a claim becoming verified (or losing verification) is
+/// visible even when its text did not change.
+fn identity_claim_fields(
+    identity: &filefacts::Identity,
+    include_version: bool,
+) -> BTreeMap<&'static str, String> {
+    identity_claim_list(identity, include_version)
+        .into_iter()
+        .collect()
 }
 
 fn changed_identity_claims(
@@ -3239,13 +3896,8 @@ fn changed_identity_claims(
     old: &BTreeMap<&'static str, String>,
     new: &BTreeMap<&'static str, String>,
 ) -> Vec<String> {
-    let fields = old
-        .keys()
-        .chain(new.keys())
-        .copied()
-        .collect::<HashSet<_>>();
-    let mut fields = fields.into_iter().collect::<Vec<_>>();
-    fields.sort_unstable();
+    let fields: std::collections::BTreeSet<&'static str> =
+        old.keys().chain(new.keys()).copied().collect();
     fields
         .into_iter()
         .filter_map(|field| match (old.get(field), new.get(field)) {
@@ -3407,17 +4059,14 @@ fn remediation_cleanup_context(
                 })
         })
     });
-    let deletes_file = a
-        .behavioral
-        .categories
-        .iter()
-        .any(|c| c.class == "fs/delete" && !c.new_ids.is_empty());
-    let disabled_functions = newly_disabled_source_functions(old_root, new_root, raw_diff);
+    // Last in the chain on purpose: it extracts every added or changed member
+    // from *both* roots, and the cheap predicates ahead of it are false on
+    // essentially every run.
     let compact_cleanup = known_indicator
-        && deletes_file
-        && disabled_functions >= 2
+        && has_new_class(a, "fs/delete")
         && judged_diff.summary.files_changed <= 4
-        && judged_diff.summary.files_added <= 1;
+        && judged_diff.summary.files_added <= 1
+        && newly_disabled_source_functions(old_root, new_root, raw_diff) >= 2;
     // A fixed release often removes the malicious code instead of adding a
     // recognizable signature. A large same-package model-risk drop is strong
     // evidence of that remediation transition; the clean baseline→fixed
@@ -3482,15 +4131,26 @@ fn newly_disabled_source_functions(old_root: &Path, new_root: &Path, diff: &Diff
         .iter()
         .filter(|file| matches!(file.status, FileStatus::Added | FileStatus::Changed))
         .map(|file| {
+            let Some(new) = diff_source_bytes(new_root, &file.path)
+                .as_deref()
+                .map(immediate_entry_return_count)
+            else {
+                return 0;
+            };
             let old = diff_source_bytes(old_root, &file.path)
                 .as_deref()
-                .map(immediate_entry_return_count)
-                .unwrap_or(0);
-            let new = diff_source_bytes(new_root, &file.path)
-                .as_deref()
-                .map(immediate_entry_return_count)
-                .unwrap_or(0);
-            new.saturating_sub(old)
+                .map(immediate_entry_return_count);
+            match (file.status, old) {
+                // An added file has no base side, so everything it disables is
+                // genuinely new.
+                (FileStatus::Added, _) => new,
+                (_, Some(old)) => new.saturating_sub(old),
+                // A changed file whose base could not be read is *unknown*, not
+                // empty. Counting `new` in full would manufacture the
+                // remediation signal this feeds — and remediation is the
+                // direction that lowers a verdict.
+                (_, None) => 0,
+            }
         })
         .sum()
 }
@@ -3537,19 +4197,21 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     use super::{
-        CapabilityShape, add_capability_text, attack_behavior_removed, capability_shape_score,
-        changed_identity_claims, changed_test_carrier, endgame_package_shape,
-        executable_member_layout, external_remote_script_loader, identity_claim_fields,
-        immediate_entry_return_count, is_compiled_binary_file_type, is_source_archive, line_diff,
-        normalized_archive_diff, normalized_member_path, npm_snapshot_member_key, numeric_delta,
-        obfuscated_remote_script_loader, removed_high_risk_traits, restored_endgame_package_shape,
-        source_build_macro_score,
+        CapabilityShape, add_capability_text, attack_behavior_removed, binary_replacement_anomaly,
+        capability_shape_score, changed_identity_claims, changed_test_carrier, clean_name,
+        endgame_package_shape, executable_member_layout, external_remote_script_loader,
+        identity_claim_fields, immediate_entry_return_count, is_compiled_binary_file_type,
+        is_source_archive, line_diff, metric_change_importance, normalized_archive_diff,
+        normalized_member_path, npm_snapshot_member_key, numeric_delta,
+        obfuscated_remote_script_loader, opaque_runtime_payload_anomaly, removed_high_risk_traits,
+        restored_endgame_package_shape, runtime_graft_anomaly, source_build_macro_score,
     };
     use crate::Severity;
+    use crate::version::{Bump, BumpKind, Version};
     use cleave::Criticality;
     use cleave::types::{
-        DiffReportV1, DiffSummary, FileDiffEntry, FileStatus, ScopeDiff, ScopeDiffs, ScopeRocs,
-        TraitChange,
+        Changed, DiffReportV1, DiffSummary, FileDiffEntry, FileStatus, KvChange, MetricChange,
+        ScopeDiff, ScopeDiffs, ScopeRocs, SectionChange, SymbolChange, TraitChange,
     };
 
     #[test]
@@ -3572,6 +4234,301 @@ mod tests {
     }
 
     #[test]
+    fn underscore_version_is_removed_cleanly_from_executable_name() {
+        let version = Version::detect("ClassicShellSetup_4_3_0.exe").unwrap();
+        assert_eq!(
+            clean_name("ClassicShellSetup_4_3_0.exe", Some(&version)),
+            "ClassicShellSetup.exe"
+        );
+    }
+
+    #[test]
+    fn same_version_binary_replacement_uses_file_type_and_cross_scope_metrics() {
+        let metric = |path: &str, old: f64, new: f64| Changed {
+            old: MetricChange {
+                path: path.to_string(),
+                value: serde_json::json!(old),
+            },
+            new: MetricChange {
+                path: path.to_string(),
+                value: serde_json::json!(new),
+            },
+        };
+        let diff = DiffReportV1 {
+            old_root: "old".to_string(),
+            new_root: "new".to_string(),
+            summary: DiffSummary {
+                files_changed: 1,
+                overall_roc: 0.70,
+                scope_roc: ScopeRocs {
+                    metrics: 0.40,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            scopes: Default::default(),
+            files: vec![FileDiffEntry {
+                path: "payload.without-an-executable-extension".to_string(),
+                file_type: Some("pe".to_string()),
+                status: FileStatus::Changed,
+                identity: None,
+                scopes: ScopeDiffs {
+                    metrics: Some(ScopeDiff {
+                        changed: vec![
+                            metric("binary.overlay_entropy", 7.4, 3.8),
+                            metric("binary.is_pie", 1.0, 0.0),
+                            metric("imports.count", 97.0, 31.0),
+                            metric("sections.code_size", 50_176.0, 3_584.0),
+                            metric("sections.count", 5.0, 13.0),
+                        ],
+                        ..Default::default()
+                    }),
+                    sections: Some(ScopeDiff {
+                        added: vec![SectionChange::default()],
+                        ..Default::default()
+                    }),
+                    symbols: Some(ScopeDiff {
+                        removed: vec![SymbolChange::default()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                old_formula: None,
+                new_formula: None,
+            }],
+        };
+        let same = Some(Bump {
+            kind: BumpKind::Same,
+            steps: 0,
+        });
+        assert!(binary_replacement_anomaly(&diff, same).is_some());
+
+        let patch = Some(Bump {
+            kind: BumpKind::Patch,
+            steps: 1,
+        });
+        assert!(binary_replacement_anomaly(&diff, patch).is_none());
+
+        let mut source = diff;
+        source.files[0].file_type = Some("c".to_string());
+        assert!(binary_replacement_anomaly(&source, same).is_none());
+    }
+
+    #[test]
+    fn patch_runtime_entrypoint_to_opaque_added_source_uses_graph_and_metrics() {
+        let added_metric = |path: &str, value: f64| MetricChange {
+            path: path.to_string(),
+            value: serde_json::json!(value),
+        };
+        let changed_metric = |path: &str, old: f64, new: f64| Changed {
+            old: added_metric(path, old),
+            new: added_metric(path, new),
+        };
+        let diff = DiffReportV1 {
+            old_root: "old.tgz".to_string(),
+            new_root: "new.tgz".to_string(),
+            summary: DiffSummary {
+                files_added: 1,
+                files_changed: 2,
+                overall_roc: 0.72,
+                ..Default::default()
+            },
+            scopes: Default::default(),
+            files: vec![
+                FileDiffEntry {
+                    path: "<root>".to_string(),
+                    file_type: Some("npm".to_string()),
+                    status: FileStatus::Changed,
+                    identity: None,
+                    scopes: ScopeDiffs {
+                        metrics: Some(ScopeDiff {
+                            changed: vec![changed_metric("file.size_bytes", 3_532.0, 6_803.0)],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    old_formula: None,
+                    new_formula: None,
+                },
+                FileDiffEntry {
+                    path: "<root>!!package/index.min.js".to_string(),
+                    file_type: Some("javascript".to_string()),
+                    status: FileStatus::Changed,
+                    identity: None,
+                    scopes: ScopeDiffs {
+                        kv: Some(ScopeDiff {
+                            added: vec![KvChange {
+                                path: "source.strings[0]".to_string(),
+                                namespace: "source".to_string(),
+                                value: serde_json::json!("./test/data"),
+                            }],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    old_formula: None,
+                    new_formula: None,
+                },
+                FileDiffEntry {
+                    path: "<root>!!package/test/data.js".to_string(),
+                    file_type: Some("javascript".to_string()),
+                    status: FileStatus::Added,
+                    identity: None,
+                    scopes: ScopeDiffs {
+                        metrics: Some(ScopeDiff {
+                            added: vec![
+                                added_metric("file.size", 5_781.0),
+                                added_metric("text.total_lines", 1.0),
+                                added_metric("text.max_line_length", 5_781.0),
+                                added_metric("text.encoded_string_ratio", 0.8),
+                                added_metric("strings.max_length", 4_352.0),
+                                added_metric("text.digit_ratio", 0.62),
+                            ],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    old_formula: None,
+                    new_formula: None,
+                },
+            ],
+        };
+        let patch = Some(Bump {
+            kind: BumpKind::Patch,
+            steps: 1,
+        });
+        let entrypoints = HashSet::from(["package/index.min.js".to_string()]);
+        let anomaly = opaque_runtime_payload_anomaly(&diff, patch, &entrypoints).unwrap();
+        assert_eq!(anomaly.payload, "<root>!!package/test/data.js");
+
+        assert!(opaque_runtime_payload_anomaly(&diff, patch, &HashSet::new()).is_none());
+        let minor = Some(Bump {
+            kind: BumpKind::Minor,
+            steps: 1,
+        });
+        assert!(opaque_runtime_payload_anomaly(&diff, minor, &entrypoints).is_none());
+    }
+
+    #[test]
+    fn timestamp_clustered_runtime_graft_uses_identity_graph_and_raw_facts() {
+        let kv = |path: &str, value: serde_json::Value| KvChange {
+            path: path.to_string(),
+            namespace: path.split('.').next().unwrap_or_default().to_string(),
+            value,
+        };
+        let diff = DiffReportV1 {
+            old_root: "old.zip".to_string(),
+            new_root: "new.zip".to_string(),
+            summary: DiffSummary {
+                files_added: 1,
+                files_changed: 2,
+                overall_roc: 0.59,
+                ..Default::default()
+            },
+            scopes: Default::default(),
+            files: vec![
+                FileDiffEntry {
+                    path: "<root>".to_string(),
+                    file_type: Some("zip".to_string()),
+                    status: FileStatus::Changed,
+                    identity: None,
+                    scopes: ScopeDiffs {
+                        kv: Some(ScopeDiff {
+                            added: vec![
+                                kv(
+                                    "archive.timing.mtime_outlier_members[]",
+                                    serde_json::json!("plugin/plugin.php"),
+                                ),
+                                kv(
+                                    "archive.timing.mtime_outlier_members[]",
+                                    serde_json::json!("plugin/payload.php"),
+                                ),
+                            ],
+                            changed: vec![Changed {
+                                old: kv(
+                                    "archive.timing.mtime_spread_seconds",
+                                    serde_json::json!(50_000),
+                                ),
+                                new: kv(
+                                    "archive.timing.mtime_spread_seconds",
+                                    serde_json::json!(100),
+                                ),
+                            }],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    old_formula: None,
+                    new_formula: None,
+                },
+                FileDiffEntry {
+                    path: "<root>!!plugin/plugin.php".to_string(),
+                    file_type: Some("php".to_string()),
+                    status: FileStatus::Changed,
+                    identity: None,
+                    scopes: ScopeDiffs {
+                        kv: Some(ScopeDiff {
+                            added: vec![kv("source.strings[0]", serde_json::json!("/payload.php"))],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    old_formula: None,
+                    new_formula: None,
+                },
+                FileDiffEntry {
+                    path: "<root>!!plugin/payload.php".to_string(),
+                    file_type: Some("php".to_string()),
+                    status: FileStatus::Added,
+                    identity: None,
+                    scopes: ScopeDiffs {
+                        metrics: Some(ScopeDiff {
+                            added: vec![MetricChange {
+                                path: "file.size".to_string(),
+                                value: serde_json::json!(1_518),
+                            }],
+                            ..Default::default()
+                        }),
+                        kv: Some(ScopeDiff {
+                            added: vec![
+                                kv(
+                                    "source.strings[0]",
+                                    serde_json::json!("https://example.invalid/pixel"),
+                                ),
+                                kv(
+                                    "source.strings[1]",
+                                    serde_json::json!("/runtime/system/file.php"),
+                                ),
+                            ],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    old_formula: None,
+                    new_formula: None,
+                },
+            ],
+        };
+        let patch = Some(Bump {
+            kind: BumpKind::Patch,
+            steps: 1,
+        });
+        let entrypoints = HashSet::from(["plugin/plugin.php".to_string()]);
+        assert!(runtime_graft_anomaly(&diff, patch, &entrypoints).is_some());
+
+        let mut broad_timestamps = diff;
+        broad_timestamps.files[0]
+            .scopes
+            .kv
+            .as_mut()
+            .unwrap()
+            .changed[0]
+            .new
+            .value = serde_json::json!(10_000);
+        assert!(runtime_graft_anomaly(&broad_timestamps, patch, &entrypoints).is_none());
+    }
+
+    #[test]
     fn numeric_feature_deltas_are_signed_and_safe_at_zero() {
         assert_eq!(
             numeric_delta(Some(10.0), Some(15.0)),
@@ -3589,6 +4546,12 @@ mod tests {
             numeric_delta(Some(0.0), Some(2.0)),
             (Some(2.0), Some(2.0), None)
         );
+    }
+
+    #[test]
+    fn metric_ranking_does_not_treat_zero_to_one_as_infinite() {
+        assert!(metric_change_importance(0.0, 6.0) > metric_change_importance(0.0, 1.0));
+        assert!(metric_change_importance(100.0, 10.0) > metric_change_importance(0.0, 1.0));
     }
 
     #[test]
@@ -3962,13 +4925,14 @@ mod tests {
             old_formula: None,
             new_formula: None,
         };
-        let judged = normalized_archive_diff(&DiffReportV1 {
+        let raw = DiffReportV1 {
             old_root: "old.zip".to_string(),
             new_root: "new.zip".to_string(),
             summary: Default::default(),
             scopes: Default::default(),
             files: vec![old, new],
-        });
+        };
+        let judged = normalized_archive_diff(&raw);
         assert_eq!(judged.files.len(), 1);
         assert_eq!(judged.files[0].status, FileStatus::Unchanged);
         let traits = judged.files[0].scopes.traits.as_ref().unwrap();
@@ -3997,13 +4961,14 @@ mod tests {
             old_formula: None,
             new_formula: Some("payload".to_string()),
         };
-        let judged = normalized_archive_diff(&DiffReportV1 {
+        let raw = DiffReportV1 {
             old_root: "flatmap-stream-0.1.0-github.tar.gz".to_string(),
             new_root: "flatmap-stream-0.1.1.tgz".to_string(),
             summary: Default::default(),
             scopes: Default::default(),
             files: vec![old, new],
-        });
+        };
+        let judged = normalized_archive_diff(&raw);
         assert_eq!(judged.files.len(), 1);
         assert_eq!(judged.files[0].path, "<root>!!package/index.min.js");
         assert_eq!(judged.files[0].old_formula.as_deref(), Some("clean"));

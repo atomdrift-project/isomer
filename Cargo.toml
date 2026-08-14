@@ -89,6 +89,19 @@ significant_drop_tightening = "warn"
 # profile, so `cargo test` still unwinds and reports failures one at a time.
 [profile.dev]
 panic = "abort"
+# Full DWARF for 500+ dependencies is what made target/debug tens of gigabytes
+# and slowed every link. Line tables still give file:line in backtraces, which
+# is all a `Result`-only codebase ever needs from a debug build.
+debug = "line-tables-only"
+
+# Optimize every dependency in debug builds, isomer's own code excepted. A
+# debug cleave spends ~13s per invocation parsing traits and compiling regexes
+# before it looks at the first byte — 11x the release binary — which makes
+# `cargo run` and the integration tests (they spawn target/debug/isomer)
+# painful. Dependencies compile once and cache, so this is paid on the first
+# build only, while edits to src/ still relink in a second or two.
+[profile.dev.package."*"]
+opt-level = 3
 
 # Thin LTO + cu=16 keeps most of fat LTO's runtime gain at roughly a third of
 # the link time — the right default for everyday `cargo build --release`.
@@ -104,6 +117,18 @@ codegen-units = 16
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+# Release-speed scanning without release-speed linking, for the build-then-run
+# targets (`make demo`, `make validate-samples`). Dropping LTO and widening the
+# codegen split turns a whole-program relink into a per-unit one; the binary
+# scans a few percent slower, which is noise beside the sample corpus's I/O.
+# Nothing ships from this profile — `make release` and release.yml are
+# untouched.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 256
+incremental = true
 
 [patch.crates-io]
 # Mirrors cleave's patch section — patches only apply at the workspace root,

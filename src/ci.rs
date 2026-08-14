@@ -102,6 +102,9 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<bool> {
     } else {
         analysis::Scope::Source
     });
+    // After the naming and scope above, so the model reads the same case the
+    // four sinks below render.
+    a.finish(cli);
 
     emit(&a, cli, args.out_dir.as_deref(), &refs.base)?;
     Ok(a.clean)
@@ -208,23 +211,33 @@ fn overlay_builds(
 }
 
 /// Copy one build output into the tree, bounded the way an extracted blob is.
+///
+/// The bound is enforced on the bytes actually read, not on a stat taken first:
+/// a file that grows between the two — or a FIFO whose length reads as zero —
+/// would otherwise copy without limit.
 fn stage(src: &Path, dest: &Path) -> Result<()> {
-    let size = std::fs::metadata(src)
-        .with_context(|| format!("reading {}", src.display()))?
-        .len();
-    if size > MAX_BLOB {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut input =
+        std::fs::File::open(src).with_context(|| format!("opening {}", src.display()))?;
+    let mut output =
+        std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+    let copied = std::io::copy(
+        &mut std::io::Read::take(&mut input, MAX_BLOB + 1),
+        &mut output,
+    )
+    .with_context(|| format!("copying {}", src.display()))?;
+    if copied > MAX_BLOB {
+        drop(output);
+        discard(dest)?;
         eprintln!(
             "isomer: skipped {} — larger than {} MiB",
             src.display(),
             MAX_BLOB >> 20
         );
-        return Ok(());
     }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::copy(src, dest).with_context(|| format!("copying {}", src.display()))?;
     Ok(())
 }
 
@@ -393,11 +406,16 @@ fn is_null_sha(s: &str) -> bool {
 }
 
 /// One changed path and which sides of the comparison it exists on.
-struct Change {
-    /// Where the file lives in the base commit; `None` when this change adds it.
-    base: Option<PathBuf>,
-    /// Where it lives in the head commit; `None` when this change deletes it.
-    head: Option<PathBuf>,
+///
+/// An enum rather than two `Option`s so "exists on neither side" cannot be
+/// written down. That state is unreachable — git cannot report it — but this is
+/// the type feeding the path-containment boundary below, and an empty staged
+/// path would resolve to the scratch *root*.
+enum Change {
+    Added(PathBuf),
+    Deleted(PathBuf),
+    Modified(PathBuf),
+    Renamed { from: PathBuf, to: PathBuf },
 }
 
 impl Change {
@@ -405,11 +423,28 @@ impl Change {
     /// blob beside its head name, so the comparison sees one file that changed
     /// rather than one that vanished and another that appeared.
     fn staged(&self) -> &Path {
-        // `git diff` never reports a change with neither side.
-        self.head
-            .as_deref()
-            .or(self.base.as_deref())
-            .unwrap_or(Path::new(""))
+        match self {
+            Self::Added(p) | Self::Deleted(p) | Self::Modified(p) => p,
+            Self::Renamed { to, .. } => to,
+        }
+    }
+
+    /// Where the file lives in the base commit; `None` when this change adds it.
+    fn base(&self) -> Option<&Path> {
+        match self {
+            Self::Added(_) => None,
+            Self::Deleted(p) | Self::Modified(p) => Some(p),
+            Self::Renamed { from, .. } => Some(from),
+        }
+    }
+
+    /// Where it lives in the head commit; `None` when this change deletes it.
+    fn head(&self) -> Option<&Path> {
+        match self {
+            Self::Deleted(_) => None,
+            Self::Added(p) | Self::Modified(p) => Some(p),
+            Self::Renamed { to, .. } => Some(to),
+        }
     }
 }
 
@@ -472,9 +507,11 @@ fn parse_name_status(out: &[u8], max: usize) -> Result<Vec<Change>> {
                 );
             }
         }
-        changes.push(Change {
-            base: (kind != b'A').then_some(from),
-            head: (kind != b'D').then_some(to),
+        changes.push(match kind {
+            b'A' => Change::Added(to),
+            b'D' => Change::Deleted(from),
+            b'R' | b'C' => Change::Renamed { from, to },
+            _ => Change::Modified(to),
         });
     }
     if changes.len() > max {
@@ -494,10 +531,10 @@ fn parse_name_status(out: &[u8], max: usize) -> Result<Vec<Change>> {
 fn materialize(repo: &Path, refs: &Refs, changes: &[Change], old: &Path, new: &Path) -> Result<()> {
     for change in changes {
         let staged = change.staged();
-        if let Some(from) = &change.base {
+        if let Some(from) = change.base() {
             extract(repo, &refs.base, from, &old.join(staged))?;
         }
-        if let Some(to) = &change.head {
+        if let Some(to) = change.head() {
             extract(repo, &refs.head, to, &new.join(staged))?;
         }
     }
@@ -540,20 +577,27 @@ fn extract(repo: &Path, commit: &str, path: &Path, dest: &Path) -> Result<()> {
         &mut file,
     )
     .with_context(|| format!("extracting {}", path.display()))?;
-    let status = child.wait().context("waiting for git show")?;
-    if !status.success() {
-        // A blob that cannot be read is not a silent skip: drop the empty file
-        // so the side simply has no content, and say why.
-        let _ = std::fs::remove_file(dest);
+    drop(file);
+    // `wait_with_output` drains the stderr pipe. A plain `wait` would deadlock
+    // against a child blocked writing into a full pipe nobody reads, and it
+    // would throw away git's own account of the failure.
+    let out = child.wait_with_output().context("waiting for git show")?;
+    if !out.status.success() {
+        // A blob that cannot be read is not a silent skip: drop the partial file
+        // so the side simply has no content, and say why. If even that fails,
+        // the run must not continue — a truncated prefix analyzed as a whole
+        // file is a wrong answer, not a missing one.
+        discard(dest)?;
         eprintln!(
-            "isomer: could not read {}@{}",
+            "isomer: could not read {}@{}: {}",
             path.display(),
-            short(commit)
+            short(commit),
+            crate::printable(String::from_utf8_lossy(&out.stderr).trim())
         );
         return Ok(());
     }
     if copied > MAX_BLOB {
-        let _ = std::fs::remove_file(dest);
+        discard(dest)?;
         eprintln!(
             "isomer: skipped {} — larger than {} MiB",
             path.display(),
@@ -561,6 +605,12 @@ fn extract(repo: &Path, commit: &str, path: &Path, dest: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Remove a staged file isomer has decided not to analyze. Failing to remove it
+/// is fatal: what stays behind would be read as the file's real content.
+fn discard(dest: &Path) -> Result<()> {
+    std::fs::remove_file(dest).with_context(|| format!("discarding {}", dest.display()))
 }
 
 // ── sinks ───────────────────────────────────────────────────────────────────
@@ -574,10 +624,12 @@ fn emit(a: &Analysis<'_>, cli: &Cli, out_dir: Option<&Path>, base: &str) -> Resu
     let markdown = a.render(Format::Markdown, cli)?;
     if let Some(dir) = out_dir {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let json = a.render(Format::Json, cli)?;
+        let sarif = a.render(Format::Sarif, cli)?;
         for (name, body) in [
-            ("report.json", a.render(Format::Json, cli)?),
-            ("report.sarif", a.render(Format::Sarif, cli)?),
-            ("report.md", markdown.clone()),
+            ("report.json", &json),
+            ("report.sarif", &sarif),
+            ("report.md", &markdown),
         ] {
             let path = dir.join(name);
             std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
@@ -597,10 +649,7 @@ fn emit(a: &Analysis<'_>, cli: &Cli, out_dir: Option<&Path>, base: &str) -> Resu
     }
 
     let verdict = crate::terminal::verdict_word(a.verdict);
-    let findings = a.assessment.behavioral.categories.len()
-        + a.assessment.signature.ids.len()
-        + a.assessment.identity.changes.len()
-        + a.assessment.structure.facts.len();
+    let findings = a.assessment.finding_count();
     outputs(&[
         ("verdict", verdict),
         ("severity", a.verdict.as_str()),
@@ -614,11 +663,14 @@ fn emit(a: &Analysis<'_>, cli: &Cli, out_dir: Option<&Path>, base: &str) -> Resu
     ]);
 
     // A failing check needs a reason visible in the job log without scrolling.
+    // Workflow commands are read from the step's stdout, so this shares the
+    // report's stream — but it goes through `write_stdout`, since `println!`
+    // panics on a closed pipe and a piped `isomer ci` is ordinary usage.
     if std::env::var_os("GITHUB_ACTIONS").is_some() && !a.clean {
-        println!(
-            "::error title=isomer: {verdict}::{}",
+        crate::write_stdout(&format!(
+            "::error title=isomer: {verdict}::{}\n",
             escape_annotation(&a.headline())
-        );
+        ))?;
     }
     Ok(())
 }
@@ -631,7 +683,12 @@ fn emit(a: &Analysis<'_>, cli: &Cli, out_dir: Option<&Path>, base: &str) -> Resu
 fn warn(message: &str) {
     eprintln!("isomer: {message}");
     if std::env::var_os("GITHUB_ACTIONS").is_some() {
-        println!("::warning title=isomer::{}", escape_annotation(message));
+        // Broken-pipe-safe, and best-effort: a warning that cannot be written
+        // must not take down the run it was only annotating.
+        let _ = crate::write_stdout(&format!(
+            "::warning title=isomer::{}\n",
+            escape_annotation(message)
+        ));
     }
 }
 
@@ -653,7 +710,13 @@ fn outputs(pairs: &[(&str, &str)]) {
     let Some(path) = std::env::var_os("GITHUB_OUTPUT") else {
         return;
     };
-    let body: String = pairs.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+    // `k=v` is line-delimited, so a newline inside a value would forge further
+    // outputs. `base-sha` carries a caller-supplied `--base`, so this is
+    // attacker-reachable; strip the delimiters rather than trust the source.
+    let body: String = pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={}\n", v.replace(['\r', '\n'], " ")))
+        .collect();
     if let Err(e) = append(Path::new(&path), &body) {
         eprintln!("isomer: could not write outputs: {e:#}");
     }
@@ -779,18 +842,18 @@ mod tests {
         let c = parse_name_status(out, 100).expect("parses");
         assert_eq!(c.len(), 4, "a rename must not swallow the entries after it");
 
-        assert_eq!(c[0].base.as_deref(), Some(Path::new("src/a.js")));
-        assert_eq!(c[0].head.as_deref(), Some(Path::new("src/a.js")));
+        assert_eq!(c[0].base(), Some(Path::new("src/a.js")));
+        assert_eq!(c[0].head(), Some(Path::new("src/a.js")));
 
         // The rename: both sides present, under different names, staged as one.
-        assert_eq!(c[1].base.as_deref(), Some(Path::new("vendor/old.js")));
-        assert_eq!(c[1].head.as_deref(), Some(Path::new("vendor/new.js")));
+        assert_eq!(c[1].base(), Some(Path::new("vendor/old.js")));
+        assert_eq!(c[1].head(), Some(Path::new("vendor/new.js")));
         assert_eq!(c[1].staged(), Path::new("vendor/new.js"));
 
         // An addition has no base side, a deletion no head side.
-        assert_eq!(c[2].base, None);
+        assert_eq!(c[2].base(), None);
         assert_eq!(c[2].staged(), Path::new("src/b.js"));
-        assert_eq!(c[3].head, None);
+        assert_eq!(c[3].head(), None);
         assert_eq!(c[3].staged(), Path::new("src/c.js"));
     }
 

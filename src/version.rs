@@ -16,7 +16,11 @@ pub(crate) struct Version {
     pub major: u64,
     pub minor: u64,
     pub patch: u64,
-    /// The token exactly as detected, e.g. `5.6.0` or `12.0.1`.
+    /// The version in normalized dotted form: `parse` keeps its input verbatim
+    /// (so a `-rc2` or `+build` suffix survives), while `detect` and
+    /// `from_claim` rewrite their separators — `4_3_0` and `4, 3, 0, 0` both
+    /// arrive here dotted. `crate::analysis::clean_name` strips both spellings
+    /// from a filename precisely because this is not the source token.
     pub raw: String,
 }
 
@@ -38,26 +42,50 @@ impl Version {
     }
 
     /// Extract the most complete version-like token from a filename, e.g.
-    /// `liblzma.so.5.6.0` → `5.6.0`, `node-ipc-12.0.1.tgz` → `12.0.1`.
-    /// Prefers tokens with more components so `foo-2-1.2.3` picks `1.2.3`.
+    /// `liblzma.so.5.6.0` → `5.6.0`, `ClassicShellSetup_4_3_0.exe` →
+    /// `4.3.0`. Dots and underscores are the two common unambiguous in-token
+    /// separators; hyphens remain token boundaries because they also separate
+    /// nearly every package name from its version.
     pub(crate) fn detect(name: &str) -> Option<Self> {
         let mut best: Option<Version> = None;
         let mut best_parts = 0usize;
-        // Every maximal run of ASCII digits and dots is a candidate token.
-        for run in name.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
-            let tok = run.trim_matches('.');
-            let parts = tok.split('.').count();
-            if parts < 2 {
-                continue;
-            }
-            if parts > best_parts
-                && let Some(v) = Version::parse(tok)
+        // Every maximal run of ASCII digits and version separators is a
+        // candidate. Validate every component before normalizing so malformed
+        // names (`1__2`) do not become plausible versions by accident.
+        for run in name.split(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '_'))) {
+            let tok = run.trim_matches(['.', '_']);
+            let parts: Vec<&str> = tok.split(['.', '_']).collect();
+            if parts.len() > best_parts
+                && let Some(v) = Self::from_numeric_parts(&parts)
             {
-                best_parts = parts;
+                best_parts = parts.len();
                 best = Some(v);
             }
         }
         best
+    }
+
+    /// Parse a version claim extracted from artifact metadata. PE resources
+    /// commonly spell `4.3.0.0` as `4, 3, 0, 0`; normalize that representation
+    /// without accepting arbitrary prose surrounding a number.
+    pub(crate) fn from_claim(claim: &str) -> Option<Self> {
+        let parts: Vec<&str> = claim.split(['.', '_', ',']).map(str::trim).collect();
+        Self::from_numeric_parts(&parts)
+    }
+
+    /// A version from already-split components, in dot form. Every component
+    /// must be a non-empty digit run: validating before normalizing is what
+    /// keeps a malformed `1__2` — or prose around a number — from becoming a
+    /// plausible version by accident.
+    fn from_numeric_parts(parts: &[&str]) -> Option<Self> {
+        if parts.len() < 2
+            || !parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return None;
+        }
+        Self::parse(&parts.join("."))
     }
 }
 
@@ -146,7 +174,18 @@ mod tests {
             Version::detect("node-ipc-12.0.1.tgz").unwrap().raw,
             "12.0.1"
         );
+        let classic = Version::detect("ClassicShellSetup_4_3_0.exe").unwrap();
+        assert_eq!((classic.major, classic.minor, classic.patch), (4, 3, 0));
+        assert_eq!(classic.raw, "4.3.0");
+        assert!(Version::detect("ClassicShellSetup_4__3_0.exe").is_none());
         assert!(Version::detect("index.js").is_none());
+    }
+
+    #[test]
+    fn parses_numeric_identity_claims_without_accepting_prose() {
+        assert_eq!(Version::from_claim("4, 3, 0, 0").unwrap().raw, "4.3.0.0");
+        assert_eq!(Version::from_claim("12_0_1").unwrap().raw, "12.0.1");
+        assert!(Version::from_claim("release 4.3.0").is_none());
     }
 
     #[test]

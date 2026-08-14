@@ -80,6 +80,14 @@ pub(crate) struct Hunk {
     top: usize,
 }
 
+impl Hunk {
+    /// The name a hunk is filed under: the archive member when it is one, else
+    /// the pair's own label (a plain file's basename).
+    pub(crate) fn display_name(&self) -> &str {
+        self.member.as_deref().unwrap_or(self.file.as_str())
+    }
+}
+
 /// One rendered line of a hunk.
 #[derive(Debug)]
 pub(crate) struct HunkLine {
@@ -192,6 +200,18 @@ pub(crate) fn hunks(
     all
 }
 
+/// Every finding in a report — the artifact's own, then each archive member's.
+/// A capability is a capability wherever it lives, and no caller here cares
+/// which level of an archive produced it.
+pub(crate) fn all_findings(
+    report: &cleave::AnalysisReport,
+) -> impl Iterator<Item = &cleave::types::Finding> {
+    report
+        .findings
+        .iter()
+        .chain(report.files.iter().flat_map(|f| f.findings.iter()))
+}
+
 /// The strongest `limit` hunks of a ranked set, presented in file order — the
 /// order a reader scans a diff in.
 pub(crate) fn strongest(all: &[Hunk], limit: usize) -> Vec<&Hunk> {
@@ -205,6 +225,61 @@ pub(crate) fn strongest(all: &[Hunk], limit: usize) -> Vec<&Hunk> {
     shown
 }
 
+/// The run of addition hunks starting at `start` that share one file.
+///
+/// Every renderer heads such a run with one filename, one severity, and one
+/// caption, then prints its runs in source order — so the grouping rule lives
+/// here once rather than three times over, and the terminal, the PR comment,
+/// and the LLM payload cannot drift apart on what counts as one file's change.
+pub(crate) struct Additions<'a> {
+    /// The file the whole run belongs to; the header's name.
+    pub name: &'a str,
+    /// Index one past the run's last hunk — where the caller resumes.
+    pub end: usize,
+    /// Worst severity in the run; the header's bar or dots.
+    pub severity: Severity,
+    /// Strongest hunk that named a rule, if any; the header's caption.
+    pub top: Option<&'a Hunk>,
+}
+
+/// Group the addition hunks at `start`. See [`Additions`]. `start` past the end
+/// yields an empty, unnamed run rather than panicking — no caller relies on
+/// that, but a grouping helper should not be the thing that panics.
+pub(crate) fn additions_at<'a>(hunks: &[&'a Hunk], start: usize) -> Additions<'a> {
+    let Some(first) = hunks.get(start) else {
+        return Additions {
+            name: "",
+            end: start,
+            severity: Severity::None,
+            top: None,
+        };
+    };
+    let name = first.display_name();
+    let mut end = start;
+    while end < hunks.len() && hunks[end].additions && hunks[end].display_name() == name {
+        end += 1;
+    }
+    let group = &hunks[start..end];
+    Additions {
+        name,
+        end,
+        severity: group
+            .iter()
+            .map(|h| h.severity)
+            .max()
+            .unwrap_or(Severity::None),
+        top: group
+            .iter()
+            .filter(|h| !h.desc.is_empty())
+            .max_by(|a, b| {
+                a.severity
+                    .cmp(&b.severity)
+                    .then(a.score.total_cmp(&b.score))
+            })
+            .copied(),
+    }
+}
+
 /// The distilled hunks as plain text for the LLM payload — strongest rule
 /// first, one per rule, each a small diff excerpt (`+` new, `>` matched, ` `
 /// context). This replaces the dump-every-match [`render`] on the LLM path:
@@ -212,8 +287,6 @@ pub(crate) fn strongest(all: &[Hunk], limit: usize) -> Vec<&Hunk> {
 /// `substr: SYSTEM`) produced dozens of windows and buried the real change,
 /// which then read to the model as a false positive.
 pub(crate) fn render_hunks(hunks: &[&Hunk]) -> String {
-    use std::fmt::Write as _;
-    let file_of = |h: &Hunk| h.member.as_deref().unwrap_or(h.file.as_str()).to_string();
     let mut s = String::new();
     let mut i = 0;
     while i < hunks.len() {
@@ -222,23 +295,14 @@ pub(crate) fn render_hunks(hunks: &[&Hunk]) -> String {
             // lines run by run (`⋯` at each gap, `>` on matched lines) — the
             // model sees the whole change with the detected lines marked, not
             // scattered windows.
-            let name = file_of(hunks[i]);
-            let mut j = i;
-            while j < hunks.len() && hunks[j].additions && file_of(hunks[j]) == name {
-                j += 1;
-            }
-            let group = &hunks[i..j];
-            let top = group.iter().filter(|h| !h.desc.is_empty()).max_by(|a, b| {
-                a.severity
-                    .cmp(&b.severity)
-                    .then(a.score.total_cmp(&b.score))
-            });
-            let caption = match top {
+            let run = additions_at(hunks, i);
+            let name = run.name;
+            let caption = match run.top {
                 Some(t) => format!(" — {} [{}]", t.desc, t.severity.as_str()),
                 None => String::new(),
             };
             let _ = writeln!(s, "\n{name}{caption}  (added lines):");
-            for (k, h) in group.iter().enumerate() {
+            for (k, h) in hunks[i..run.end].iter().enumerate() {
                 if k > 0 {
                     let _ = writeln!(s, "  ⋯");
                 }
@@ -247,7 +311,7 @@ pub(crate) fn render_hunks(hunks: &[&Hunk]) -> String {
                     let _ = writeln!(s, "  {mark} {}", l.text);
                 }
             }
-            i = j;
+            i = run.end;
         } else {
             let member = hunks[i]
                 .member
@@ -323,8 +387,6 @@ fn file_hunks(
         {
             continue;
         }
-        let shown = member.clone().unwrap_or_else(|| pair.label.clone());
-
         // Source-additions path: when both sides' text is in reach, the change
         // *is* the added lines — show them whole (matched or not), so an attack
         // whose payload sits a few lines from the trait hit (unrealircd's
@@ -333,7 +395,8 @@ fn file_hunks(
         if let (Some(new_src), Some(old_src)) = (
             member_source(pair.new.as_deref(), member.as_deref()),
             member_source(pair.old.as_deref(), member.as_deref()),
-        ) && is_text(&new_src)
+        ) && !new_src.is_empty()
+            && !looks_binary(&new_src)
         {
             addition_hunks(
                 &new_src,
@@ -342,7 +405,6 @@ fn file_hunks(
                 &keep,
                 &pair.label,
                 member.as_deref(),
-                &shown,
                 all,
             );
             if all.len() >= HUNK_BUDGET {
@@ -369,13 +431,19 @@ fn file_hunks(
             if chunk.line.is_none() && ((container && member.is_none()) || top.off == 0) {
                 continue;
             }
-            let mut h = match chunk.line {
-                Some(first) => text_hunk(chunk, first, &kept, top, &shown, old_lines.as_ref()),
-                None => binary_hunk(chunk, top, &shown),
-            };
-            h.member = member.clone();
-            h.file = pair.label.clone();
-            all.push(h);
+            let label = pair.label.as_str();
+            all.push(match chunk.line {
+                Some(first) => text_hunk(
+                    chunk,
+                    first,
+                    &kept,
+                    top,
+                    label,
+                    member.as_deref(),
+                    old_lines.as_ref(),
+                ),
+                None => binary_hunk(chunk, top, label, member.as_deref()),
+            });
             if all.len() >= HUNK_BUDGET {
                 return;
             }
@@ -396,10 +464,10 @@ fn member_source(archive_or_file: Option<&Path>, member: Option<&str>) -> Option
     }
 }
 
-/// Whether bytes read as source text: non-empty and no NUL in the head (the
-/// same binary sniff cleave and `old_line_set` use).
-fn is_text(bytes: &[u8]) -> bool {
-    !bytes.is_empty() && !bytes.iter().take(8192).any(|b| *b == 0)
+/// A NUL byte in the head marks binary content — cleave's own sniff, named
+/// here so the two places that need it cannot drift on the window size.
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8192).any(|b| *b == 0)
 }
 
 /// 1-based line of a byte offset, by counting newlines before it — maps a
@@ -413,7 +481,6 @@ fn line_at(bytes: &[u8], off: u64) -> usize {
 /// A run carrying a gained-trait match takes that rule's tier and headline and
 /// leads the ranking; the rest are shown as plain additions so the whole change
 /// is visible — the point of the differential view.
-#[allow(clippy::too_many_arguments)]
 fn addition_hunks(
     new: &[u8],
     old: &[u8],
@@ -421,7 +488,6 @@ fn addition_hunks(
     keep: &impl Fn(&str) -> bool,
     file: &str,
     member: Option<&str>,
-    shown: &str,
     all: &mut Vec<Hunk>,
 ) {
     // Lines only on the new side (set-based, matching `analysis::line_diff` so
@@ -465,9 +531,7 @@ fn addition_hunks(
         if (start..i).all(|k| new_lines[k].trim().is_empty()) {
             continue;
         }
-        all.push(addition_run(
-            &new_lines, start, i, &hit, file, member, shown,
-        ));
+        all.push(addition_run(&new_lines, start, i, &hit, file, member));
         if all.len() >= HUNK_BUDGET {
             return;
         }
@@ -484,7 +548,6 @@ fn addition_run(
     hit: &std::collections::HashMap<usize, &cleave::types::Note>,
     file: &str,
     member: Option<&str>,
-    shown: &str,
 ) -> Hunk {
     /// Lines shown before the run is summarized — a per-run twin of
     /// [`MAX_HUNKS`], generous enough for a whole small payload.
@@ -531,7 +594,7 @@ fn addition_run(
         member: member.map(str::to_string),
         line: Some(first_line as u64),
         loc: first_line as u64,
-        location: format!("{shown}:{first_line}"),
+        location: format!("{}:{first_line}", member.unwrap_or(file)),
         id,
         desc,
         severity,
@@ -579,7 +642,9 @@ fn old_line_set(old_path: &Path, container: bool) -> Option<HashSet<String>> {
         return None;
     }
     let bytes = std::fs::read(old_path).ok()?;
-    if bytes.iter().take(8192).any(|b| *b == 0) {
+    // An *empty* old side is not rejected here: it means every new line really
+    // is an addition, which is exactly what an empty set renders.
+    if looks_binary(&bytes) {
         return None;
     }
     let text = String::from_utf8_lossy(&bytes);
@@ -587,13 +652,14 @@ fn old_line_set(old_path: &Path, container: bool) -> Option<HashSet<String>> {
 }
 
 /// A text hunk: every line of the chunk, matches marked, the top match's line
-/// windowed around its column. `member` is filled by the caller.
+/// windowed around its column.
 fn text_hunk(
     chunk: &cleave::types::ContextLine,
     first_line: u64,
     kept: &[&cleave::types::Note],
     top: &cleave::types::Note,
     file: &str,
+    member: Option<&str>,
     old: Option<&HashSet<String>>,
 ) -> Hunk {
     let spans = line_spans(&chunk.data);
@@ -635,11 +701,11 @@ fn text_hunk(
         });
     }
     Hunk {
-        file: String::new(),
-        member: None,
+        file: file.to_string(),
+        member: member.map(str::to_string),
         line: Some(first_line + top_idx as u64),
         loc: top.off,
-        location: format!("{file}:{}", first_line + top_idx as u64),
+        location: format!("{}:{}", member.unwrap_or(file), first_line + top_idx as u64),
         id: top.id.as_str().to_string(),
         desc: desc_of(top),
         severity: tier(top.crit),
@@ -655,7 +721,12 @@ fn text_hunk(
 /// A binary hunk: hex|ascii dump rows at the match, cleave's presentation.
 /// The `+` is semantic — the trait is an addition — since binary bytes have
 /// no line diff. The header carries no offset; the rows do.
-fn binary_hunk(chunk: &cleave::types::ContextLine, top: &cleave::types::Note, file: &str) -> Hunk {
+fn binary_hunk(
+    chunk: &cleave::types::ContextLine,
+    top: &cleave::types::Note,
+    file: &str,
+    member: Option<&str>,
+) -> Hunk {
     const STRIDE: usize = 16;
     const ROWS: usize = 2;
     let delta = usize::try_from(top.off.saturating_sub(chunk.loc))
@@ -673,11 +744,11 @@ fn binary_hunk(chunk: &cleave::types::ContextLine, top: &cleave::types::Note, fi
         })
         .collect();
     Hunk {
-        file: String::new(),
-        member: None,
+        file: file.to_string(),
+        member: member.map(str::to_string),
         line: None,
         loc: top.off,
-        location: file.to_string(),
+        location: member.unwrap_or(file).to_string(),
         id: top.id.as_str().to_string(),
         desc: desc_of(top),
         severity: tier(top.crit),
@@ -850,11 +921,7 @@ pub(crate) fn existing_risk(
         let Some(report) = analyze(new_path, options) else {
             continue;
         };
-        let findings = report
-            .findings
-            .iter()
-            .chain(report.files.iter().flat_map(|f| f.findings.iter()));
-        for f in findings {
+        for f in all_findings(&report) {
             if matches!(f.crit, Criticality::Suspicious | Criticality::Hostile) {
                 let slot = worst.entry(namespace_of(&f.id)).or_insert(f.crit);
                 if crit_rank(f.crit) > crit_rank(*slot) {
@@ -907,6 +974,11 @@ pub(crate) struct Survey {
     pub attack: Sides,
     /// MBC behavior ids seen on each side.
     pub mbc: Sides,
+    /// Files declared as local runtime entrypoints by a structured package
+    /// manifest. These are content-derived graph edges (for example,
+    /// `package.json` `main` -> `index.js`), not trait matches. Paths are
+    /// archive-root independent so they can be joined to the normalized diff.
+    pub runtime_entrypoints: HashSet<String>,
 }
 
 /// One framework's ids on either side of the change.
@@ -955,10 +1027,12 @@ pub(crate) fn survey(pairs: &[Pair], options: &cleave::AnalysisOptions) -> Surve
             let Some(report) = analyze(path, options) else {
                 continue;
             };
-            let findings = report
-                .findings
-                .iter()
-                .chain(report.files.iter().flat_map(|f| f.findings.iter()))
+            if !is_base {
+                survey
+                    .runtime_entrypoints
+                    .extend(manifest_runtime_entrypoints(&report));
+            }
+            let findings = all_findings(&report)
                 // Only count what the artifact exhibits *meaningfully*
                 // (notable+), matching the rubric's reporting floor. A
                 // baseline match doesn't mean the base "did C2"; counting it
@@ -986,6 +1060,92 @@ pub(crate) fn survey(pairs: &[Pair], options: &cleave::AnalysisOptions) -> Surve
         }
     }
     survey
+}
+
+/// Resolve local references emitted by structured package manifests to the
+/// members they select. Cleave's compact projection already performs exact
+/// sibling/extension resolution, so Isomer consumes that graph instead of
+/// guessing from filenames. The archive root is discarded because the diff
+/// deliberately normalizes version-bearing roots between releases.
+fn manifest_runtime_entrypoints(report: &cleave::AnalysisReport) -> HashSet<String> {
+    let paths: HashSet<&str> = report.files.iter().map(|file| file.path.as_str()).collect();
+    let mut entrypoints: HashSet<String> = report
+        .files
+        .iter()
+        .filter(|file| {
+            filefacts::FileType::from_label(&file.file_type)
+                .is_some_and(|file_type| file_type.is_structured_data())
+        })
+        .flat_map(|file| {
+            file.filefacts
+                .iter()
+                .flat_map(|facts| facts.references.iter())
+                .filter_map(|reference| match (&reference.kind, &reference.locator) {
+                    (filefacts::RefKind::Local, filefacts::RefLocator::Path(path)) => {
+                        resolve_report_local_target(&file.path, path, &paths)
+                    }
+                    _ => None,
+                })
+        })
+        .map(|path| {
+            path.split_once("!!")
+                .map_or(path, |(_, member)| member)
+                .to_string()
+        })
+        .collect();
+
+    // Some ecosystems declare identity directly in the runtime file instead
+    // of a separate manifest: WordPress plugin headers are the common case,
+    // but this is deliberately format-neutral. A source member that carries
+    // the package's own name/version is a package entrypoint candidate; helper
+    // files normally carry no identity at all.
+    entrypoints.extend(report.files.iter().filter_map(|file| {
+        let source = filefacts::FileType::from_label(&file.file_type)
+            .is_some_and(|file_type| file_type.is_source_code());
+        (source && file.identity.is_some()).then(|| {
+            file.path
+                .split_once("!!")
+                .map_or(file.path.as_str(), |(_, member)| member)
+                .to_string()
+        })
+    }));
+    entrypoints
+}
+
+/// Resolve one manifest-local path against the files Cleave actually emitted.
+/// Package formats routinely omit an extension or name a directory, so mirror
+/// the conservative resolution Filefacts/Cleave use for their reference graph.
+fn resolve_report_local_target<'a>(
+    referrer: &str,
+    spec: &str,
+    paths: &HashSet<&'a str>,
+) -> Option<&'a str> {
+    let mut parts: Vec<&str> = referrer.split('/').collect();
+    parts.pop();
+    for part in spec.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    let base = parts.join("/");
+    let candidates = std::iter::once(base.clone())
+        .chain(
+            [".js", ".cjs", ".mjs", ".json", ".node"]
+                .into_iter()
+                .map(|extension| format!("{base}{extension}")),
+        )
+        .chain(
+            ["/index.js", "/index.cjs", "/index.mjs", "/index.json"]
+                .into_iter()
+                .map(|index| format!("{base}{index}")),
+        );
+    candidates
+        .filter_map(|candidate| paths.get(candidate.as_str()).copied())
+        .next()
 }
 
 /// Split a framework annotation into ids. Traits write these as a free-text

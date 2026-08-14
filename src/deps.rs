@@ -36,6 +36,14 @@ pub(crate) struct DepProfile {
     pub note: Option<String>,
 }
 
+pub(crate) fn severity(profiles: &[DepProfile]) -> Severity {
+    profiles
+        .iter()
+        .map(|profile| profile.severity)
+        .max()
+        .unwrap_or(Severity::None)
+}
+
 /// Fetch and profile every runtime dependency the change added. Empty when the
 /// change added none. `progress` shows the fetch spinner for a human at a
 /// terminal.
@@ -61,12 +69,12 @@ struct Added {
 /// Fetch one added dependency and summarize what it does.
 fn profile(dep: &Added, options: &AnalysisOptions, progress: bool) -> DepProfile {
     let coord = format!("{}@{}", dep.name, dep.spec);
-    // A manifest declares a *range* (`^9.1.3`); the registry serves exact
-    // versions. Without a lockfile the faithful offline choice is the range's
-    // base version — the minimum it allows, always published and the release
-    // the author pinned against. A range with no concrete floor (`*`, a tag, a
-    // git url) falls back to the latest release.
-    let purl = match concrete_version(&dep.spec) {
+    // Exact pins identify one immutable release. A range (`^0.1.0`) does not:
+    // fetching its floor would miss the later compatible release an installer
+    // actually resolves — precisely the event-stream/flatmap-stream failure
+    // mode. Leave ranges unversioned so the registry resolver selects the
+    // current release; lockfiles, when present, contribute exact pins.
+    let purl = match exact_version(&dep.spec) {
         Some(v) => format!("pkg:{}/{}@{}", dep.ecosystem, dep.name, v),
         None => format!("pkg:{}/{}", dep.ecosystem, dep.name),
     };
@@ -85,19 +93,17 @@ fn profile(dep: &Added, options: &AnalysisOptions, progress: bool) -> DepProfile
         }
     };
     match cleave::analyze_bytes_owned(bytes, &purl, options) {
-        Ok(report) => summarize(&mut out, &report),
+        Ok(report) => (out.severity, out.highlights) = summarize(&report),
         Err(e) => out.note = Some(format!("could not analyze: {e:#}")),
     }
     out
 }
 
-/// Fill `out` from a fetched dependency's analysis: its worst severity and the
-/// strongest distinct findings — the capabilities the dependency introduces.
-fn summarize(out: &mut DepProfile, report: &cleave::AnalysisReport) {
-    let mut findings: Vec<(Severity, String)> = report
-        .findings
-        .iter()
-        .chain(report.files.iter().flat_map(|f| &f.findings))
+/// A fetched dependency's analysis, read down to what the profile shows: its
+/// worst severity and the strongest distinct findings — the capabilities the
+/// dependency introduces.
+fn summarize(report: &cleave::AnalysisReport) -> (Severity, Vec<String>) {
+    let mut findings: Vec<(Severity, String)> = crate::evidence::all_findings(report)
         .filter_map(|f| {
             let sev = severity_from_crit(f.crit);
             (sev != Severity::None && !f.desc.is_empty())
@@ -109,32 +115,37 @@ fn summarize(out: &mut DepProfile, report: &cleave::AnalysisReport) {
     findings.sort_by_key(|(sev, _)| std::cmp::Reverse(*sev));
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     findings.retain(|(_, d)| seen.insert(d.clone()));
-    out.severity = findings.first().map_or(Severity::None, |(s, _)| *s);
-    out.highlights = findings
+    let worst = findings.first().map_or(Severity::None, |(s, _)| *s);
+    let highlights = findings
         .into_iter()
         .take(MAX_HIGHLIGHTS)
         .map(|(_, d)| d)
         .collect();
+    (worst, highlights)
 }
 
-/// The concrete version at the base of a manifest version spec — `^9.1.3` →
-/// `9.1.3`, `>=1.2.3 <2` → `1.2.3` — or `None` when the spec names no numeric
-/// floor (`*`, `latest`, `1.x`, a dist-tag, a git url), leaving the fetch to
-/// take the latest release. Only digit-led dotted tokens (with prerelease /
-/// build suffixes) count, so a wildcard or tag never resolves to a bad URL.
-fn concrete_version(spec: &str) -> Option<String> {
-    let stripped = spec
-        .trim()
-        .trim_start_matches(['^', '~', '=', 'v', '>', '<', ' ']);
-    let token = stripped
-        .split(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '|' | ','))
-        .next()
-        .unwrap_or("");
-    let concrete = token.chars().next().is_some_and(|c| c.is_ascii_digit())
+/// An exact manifest version, or `None` for every range/tag/URL. Treating the
+/// floor of a range as the resolved dependency is unsound for security review:
+/// an attacker commonly publishes a later version that still satisfies it.
+fn exact_version(spec: &str) -> Option<String> {
+    let spec = spec.trim();
+    if spec.is_empty()
+        || spec.starts_with(['^', '~', '<', '>'])
+        || spec.contains(|c: char| c.is_whitespace() || matches!(c, '|' | ',' | '*'))
+        || spec.to_ascii_lowercase().contains('x')
+        || spec.contains("://")
+    {
+        return None;
+    }
+    let token = spec
+        .strip_prefix('=')
+        .unwrap_or(spec)
+        .trim_start_matches('v');
+    let exact = token.chars().next().is_some_and(|c| c.is_ascii_digit())
         && token
             .chars()
-            .all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'));
-    concrete.then(|| token.to_string())
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+    exact.then(|| token.to_string())
 }
 
 /// The runtime dependencies a diff added, read from every changed manifest's kv
@@ -181,5 +192,39 @@ fn ecosystem(path: &str) -> Option<&'static str> {
         "Gemfile.lock" => Some("gem"),
         "composer.json" | "composer.lock" => Some("composer"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DepProfile, exact_version, severity};
+    use crate::Severity;
+
+    #[test]
+    fn dependency_fetch_only_pins_exact_versions() {
+        assert_eq!(exact_version("1.2.3").as_deref(), Some("1.2.3"));
+        assert_eq!(
+            exact_version("=v1.2.3-beta.1").as_deref(),
+            Some("1.2.3-beta.1")
+        );
+        for range in ["^0.1.0", "~1.2.3", ">=1.2.3 <2", "1.x", "*", "latest"] {
+            assert_eq!(exact_version(range), None, "{range} is not an exact pin");
+        }
+    }
+
+    #[test]
+    fn added_dependency_profiles_contribute_their_worst_severity() {
+        let profile = |severity| DepProfile {
+            coord: "dep@1".to_string(),
+            ecosystem: "npm",
+            severity,
+            highlights: Vec::new(),
+            note: None,
+        };
+        assert_eq!(
+            severity(&[profile(Severity::Medium), profile(Severity::Critical)]),
+            Severity::Critical
+        );
+        assert_eq!(severity(&[]), Severity::None);
     }
 }

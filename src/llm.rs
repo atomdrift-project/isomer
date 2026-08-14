@@ -69,10 +69,29 @@ impl Interpretation {
     }
 }
 
+/// Whether interpretation was asked for at all — the cheap half of [`config`],
+/// deliberately with no network in it.
+///
+/// Callers test this before the expensive question of whether the diff has
+/// anything worth interpreting, because that question reads both sides of every
+/// changed source file. Splitting it out this way rather than reordering the
+/// checks matters: [`config`] can autodetect the model, which is a round trip,
+/// and a run with nothing to say must not probe the endpoint.
+pub(crate) fn requested(cli: &Cli) -> bool {
+    !cli.offline && (cli.llm.is_some() || std::env::var("ISOMER_LLM").is_ok())
+}
+
 /// Build the LLM config from `--llm` (or `ISOMER_LLM`) and the `--llm-*` flags.
 /// `None` when interpretation was not requested. The model is autodetected from
 /// the endpoint when `--llm-model` is not pinned.
 pub(crate) fn config(cli: &Cli) -> Option<InterpretConfig> {
+    // `--offline` promises no LLM, and it has to be enforced here rather than at
+    // the call site: model autodetection below is itself a network round trip,
+    // and `ISOMER_LLM` in the environment would otherwise reach the endpoint
+    // with no flag on the command line at all.
+    if cli.offline {
+        return None;
+    }
     let target = cli
         .llm
         .clone()

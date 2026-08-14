@@ -33,6 +33,8 @@ import re
 import signal
 import subprocess
 import sys
+import tarfile
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -54,12 +56,18 @@ SEVERITY_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
 @dataclass
+class SampleFile:
+    path: Path
+    logical_name: str
+
+
+@dataclass
 class Artifact:
     name: str
     year: int
-    before: Path
-    during: Path
-    after: Path | None
+    before: SampleFile
+    during: SampleFile
+    after: SampleFile | None
 
 
 @dataclass
@@ -135,7 +143,7 @@ def parse_samples_without_yaml(text: str) -> list[dict]:
             continue
 
         field = re.match(
-            r"^    (artifact_id|phase|classification|path|sha256):(?:\s*(.*))?$",
+            r"^    (artifact_id|phase|classification|version|filename|path|sha256):(?:\s*(.*))?$",
             line,
         )
         if not field or current is None:
@@ -183,8 +191,87 @@ def incident_year(meta: Path) -> int:
     return int(match.group(1)) if match else 9999
 
 
-def extension(path: str | None) -> str:
-    return Path(path).suffix.lower() if path else ""
+def file_form(path: Path) -> str:
+    """Return a cheap content form for comparator selection.
+
+    Recovered archives are often content-addressed as ``*.sample``. Requiring
+    their suffix to match ``*.tgz`` silently drops valid old/new pairs even
+    though both files are gzip streams. Magic is stable across reconstruction
+    and renaming; the suffix remains a conservative fallback for plain source
+    and unknown formats where these few bytes cannot identify a language.
+    """
+    try:
+        with path.open("rb") as stream:
+            head = stream.read(512)
+    except OSError:
+        return path.suffix.lower()
+    signatures = (
+        (b"\x1f\x8b", "gzip"),
+        (b"\xfd7zXZ\x00", "xz"),
+        (b"BZh", "bzip2"),
+        (b"\x28\xb5\x2f\xfd", "zstd"),
+        (b"PK\x03\x04", "zip"),
+        (b"7z\xbc\xaf\x27\x1c", "7z"),
+        (b"Rar!\x1a\x07", "rar"),
+        (b"\x7fELF", "elf"),
+        (b"MZ", "pe"),
+    )
+    for magic, form in signatures:
+        if head.startswith(magic):
+            return form
+    if len(head) >= 262 and head[257:262] == b"ustar":
+        return "tar"
+    if head[:4] in (
+        b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe",
+    ):
+        return "macho"
+    return path.suffix.lower()
+
+
+def sample_logical_name(sample: dict, path: Path) -> str:
+    """Recover a content-appropriate basename for an Isomer comparison.
+
+    A quarantine's SHA-named ``.sample`` is provenance, not file identity.
+    Isomer must still receive a path whose package form can be identified;
+    otherwise an npm tarball is analyzed as generic gzip and produces false
+    identity removal. Prefer the corpus's preserved original name, then infer
+    only the archive suffix needed for content detection.
+    """
+    source = sample.get("source")
+    if isinstance(source, dict):
+        chain = source.get("chain")
+        if isinstance(chain, dict) and chain.get("original_filename"):
+            return Path(str(chain["original_filename"])).name
+
+    declared = Path(str(sample.get("filename") or "")).name
+    if declared and Path(declared).suffix.lower() != ".sample":
+        return declared
+    if path.suffix.lower() != ".sample":
+        return path.name
+
+    artifact = re.sub(r"[^A-Za-z0-9._-]+", "-", str(sample.get("artifact_id") or "sample"))
+    version = re.sub(r"[^A-Za-z0-9._-]+", "-", str(sample.get("version") or "recovered"))
+    stem = f"{artifact}-{version}"
+    form = file_form(path)
+    if form == "gzip":
+        # npm's package/package.json layout is a stronger form signal than the
+        # original extension; generic gzip tarballs keep the wider .tar.gz.
+        try:
+            with tarfile.open(path, "r:gz") as archive:
+                if any(member.name == "package/package.json" for member in archive):
+                    return f"{stem}.tgz"
+        except (OSError, tarfile.TarError):
+            pass
+        return f"{stem}.tar.gz"
+    extensions = {
+        "xz": ".xz", "bzip2": ".bz2", "zstd": ".zst",
+        "zip": ".zip", "7z": ".7z", "rar": ".rar",
+        "elf": ".elf", "pe": ".exe", "macho": ".macho",
+        "tar": ".tar",
+    }
+    return f"{stem}{extensions.get(form, '.sample')}"
 
 
 def version_components(sample: dict | None) -> tuple[int, ...] | None:
@@ -237,8 +324,9 @@ def pick(samples: list[dict], prefer: tuple[str, ...], root: Path,
 
     A preserved incident report or source fragment is evidence, but it is not
     a meaningful old/new comparator for a release archive. Once a reference
-    path exists, require the same suffix before pairing another phase; this
-    still lets a reconstructed ``.tgz`` win over a loose ``.js`` payload.
+    path exists, require the same content form before pairing another phase;
+    this lets a content-addressed ``.sample`` gzip pair with ``.tgz`` while a
+    loose ``.js`` payload or incident report still cannot impersonate it.
     """
     candidates = [
         (i, s) for i, s in enumerate(samples)
@@ -249,9 +337,10 @@ def pick(samples: list[dict], prefer: tuple[str, ...], root: Path,
         return None
 
     if match_path:
+        reference_form = file_form(root / match_path)
         matching = [
             item for item in candidates
-            if extension(item[1].get("path")) == extension(match_path)
+            if file_form(root / item[1]["path"]) == reference_form
         ]
         if not matching:
             return None
@@ -261,9 +350,12 @@ def pick(samples: list[dict], prefer: tuple[str, ...], root: Path,
         i, sample = item
         cls = sample.get("classification")
         class_rank = prefer.index(cls) if cls in prefer else len(prefer)
-        extension_rank = 0 if extension(sample.get("path")) == extension(match_path) else 1
+        form_rank = (
+            0 if match_path and file_form(root / sample["path"])
+            == file_form(root / match_path) else 1
+        )
         version_line, version_distance = version_affinity(sample, match_version)
-        return class_rank, extension_rank, version_line, version_distance, i
+        return class_rank, form_rank, version_line, version_distance, i
 
     return min(candidates, key=rank)[1]
 
@@ -326,13 +418,15 @@ def load_artifacts(corpus: Path) -> list[Artifact]:
             if not (before and during):
                 continue
 
-            def path(sample: dict | None) -> Path | None:
+            def sample_file(sample: dict | None) -> SampleFile | None:
                 if not sample:
                     return None
                 p = base / sample.get("path", "")
-                return p if p.is_file() else None
+                if not p.is_file():
+                    return None
+                return SampleFile(p, sample_logical_name(sample, p))
 
-            bp, dp, ap = path(before), path(during), path(after)
+            bp, dp, ap = sample_file(before), sample_file(during), sample_file(after)
             if bp and dp:
                 out.append(Artifact(f"{attack}/{art}", year, bp, dp, ap))
     out.sort(key=lambda artifact: (artifact.year, artifact.name))
@@ -340,7 +434,8 @@ def load_artifacts(corpus: Path) -> list[Artifact]:
 
 
 def run_transition(isomer: str, traits: str | None, fail_on: str,
-                   old: Path, new: Path, timeout: int | None) -> Transition:
+                   old: SampleFile, new: SampleFile,
+                   timeout: int | None) -> Transition:
     env = dict(os.environ)
     if traits:
         env["CLEAVE_TRAITS_DIR"] = traits
@@ -348,24 +443,35 @@ def run_transition(isomer: str, traits: str | None, fail_on: str,
     # trip, and crucially no LLM verdict escalation, so the pass/fail is
     # reproducible on any machine (an empty ISOMER_LLM still falls back to a
     # localhost endpoint, which --offline hard-disables).
-    cmd = [isomer, "--offline", "fs", str(old), str(new),
-           "--format", "json", "--fail-on", fail_on]
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, env=env, start_new_session=True)
-    try:
-        if timeout is None:
-            stdout, stderr = p.communicate()
-        else:
-            stdout, stderr = p.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # isomer may have parser/build children; kill the whole per-comparison
-        # session so one pathological archive cannot keep a serial audit alive.
+    with tempfile.TemporaryDirectory(prefix="isomer-samples-") as staging:
+        def staged(sample: SampleFile, side: str) -> Path:
+            if sample.path.name == sample.logical_name:
+                return sample.path
+            parent = Path(staging) / side
+            parent.mkdir()
+            alias = parent / Path(sample.logical_name).name
+            alias.symlink_to(sample.path)
+            return alias
+
+        cmd = [isomer, "--offline", "fs", str(staged(old, "old")),
+               str(staged(new, "new")), "--format", "json",
+               "--fail-on", fail_on]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, env=env, start_new_session=True)
         try:
-            os.killpg(p.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        p.communicate()
-        return Transition(None, "?", "timeout")
+            if timeout is None:
+                stdout, stderr = p.communicate()
+            else:
+                stdout, stderr = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # isomer may have parser/build children; kill the whole per-comparison
+            # session so one pathological archive cannot keep a serial audit alive.
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.communicate()
+            return Transition(None, "?", "timeout")
     # isomer exits 0 (clean) or 1 (gate failed); anything else is a real error.
     if p.returncode not in (0, 1):
         return Transition(None, "?", (stderr or "").strip().splitlines()[-1:][0]
@@ -382,7 +488,7 @@ def run_transition(isomer: str, traits: str | None, fail_on: str,
 
 def audit(art: Artifact, isomer: str, traits: str | None, fail_on: str,
           timeout: int) -> Result:
-    def go(old: Path, new: Path) -> Transition:
+    def go(old: SampleFile, new: SampleFile) -> Transition:
         return run_transition(isomer, traits, fail_on, old, new, timeout)
 
     bd = go(art.before, art.during)

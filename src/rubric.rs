@@ -90,6 +90,16 @@ impl Assessment {
             .collect()
     }
 
+    /// How many findings this assessment names, across all four axes. One
+    /// definition of "a finding", so the count the CI action reports and the
+    /// count a clean verdict's prose quotes can never disagree.
+    pub(crate) fn finding_count(&self) -> usize {
+        self.behavioral.categories.len()
+            + self.signature.ids.len()
+            + self.identity.changes.len()
+            + self.structure.facts.len()
+    }
+
     /// Severity considering only *newly-introduced* risk — categories with new
     /// traits, newly-matched signatures, and identity drift (a signer change is
     /// inherently new). This is what a CI gate keyed on new issues (rather than
@@ -171,6 +181,26 @@ pub(crate) struct IdentityChange {
     pub label: &'static str,
     pub old: String,
     pub new: String,
+}
+
+impl IdentityChange {
+    /// The two sides as every renderer shows them: an absent value reads as
+    /// `none`, so a signature that disappeared says "Apple Dev X → none" rather
+    /// than trailing off into an empty gap.
+    pub(crate) fn shown(&self) -> (&str, &str) {
+        (
+            if self.old.is_empty() {
+                "none"
+            } else {
+                &self.old
+            },
+            if self.new.is_empty() {
+                "none"
+            } else {
+                &self.new
+            },
+        )
+    }
 }
 
 /// Structural anomalies read from the binary's kv scope — a new linked
@@ -342,8 +372,6 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &HashSet<String>) -> Ass
     let structure = structural_facts(diff);
     let structure_sev = structure.severity;
 
-    // One line per accepted risk, however many files it covered.
-
     Assessment {
         severity: behavioral_sev
             .max(signature_sev)
@@ -405,9 +433,10 @@ fn structural_facts(diff: &DiffReportV1) -> Structure {
                 } else if p.contains("ifuncs") {
                     push_val(&mut ifuncs, &k.value);
                 } else if p.contains("dynsym")
-                    && let Some(name) = between(p, "name=", "]")
+                    && let Some((_, rest)) = p.split_once("name=")
+                    && let Some((name, _)) = rest.split_once(']')
                 {
-                    dynsyms.push(name);
+                    dynsyms.push(name.to_string());
                 }
             }
             // A moved `@ref` on an existing action — the mutable-tag surface the
@@ -473,9 +502,12 @@ fn structural_facts(diff: &DiffReportV1) -> Structure {
         v.sort();
         v.dedup();
     }
+    // `ifuncs` was just sorted, so a binary search keeps this linear-ish; a
+    // large shared object supplies both lists in the thousands, where the
+    // obvious `Vec::contains` would be quadratic.
     let imports: Vec<String> = dynsyms
         .into_iter()
-        .filter(|d| !ifuncs.contains(d))
+        .filter(|d| ifuncs.binary_search(d).is_err())
         .collect();
 
     use FactKind::{Added, Became};
@@ -599,13 +631,6 @@ fn push_val(out: &mut Vec<String>, v: &serde_json::Value) {
     } else if v.is_number() {
         out.push(v.to_string());
     }
-}
-
-/// The substring of `s` between `open` and the next `close`.
-fn between(s: &str, open: &str, close: &str) -> Option<String> {
-    let (_, rest) = s.split_once(open)?;
-    let (inner, _) = rest.split_once(close)?;
-    Some(inner.to_string())
 }
 
 /// Traits newly present (`true`) or escalated from a lower criticality
@@ -735,16 +760,10 @@ fn meaningful_identity_changes(
     // clean release that restores package metadata look like a publisher
     // takeover (notably on downgrade/remediation comparisons).
     let has_claims = |i: &Identity| {
-        i.signer.as_ref().is_some_and(|s| {
-            s.common_name
-                .as_deref()
-                .or(s.organization.as_deref())
-                .or(s.subject.as_deref())
-                .is_some_and(|v| !v.is_empty())
-        }) || i
-            .authors
-            .iter()
-            .any(|p| p.name.as_deref().is_some_and(|v| !v.is_empty()))
+        !signer(i).is_empty()
+            || i.authors
+                .iter()
+                .any(|p| p.name.as_deref().is_some_and(|v| !v.is_empty()))
             || i.name.as_ref().is_some_and(|c| !c.value.is_empty())
             || i.organization.as_ref().is_some_and(|c| !c.value.is_empty())
             || i.producer.as_ref().is_some_and(|c| !c.value.is_empty())
@@ -835,12 +854,18 @@ pub(crate) fn is_finding(crit: Criticality) -> bool {
     )
 }
 
+/// isomer's severity for one cleave criticality tier. Exhaustive on purpose: a
+/// tier added upstream must fail this build rather than fall through a catch-all
+/// and silently score as no finding at all.
 pub(crate) fn severity_from_crit(crit: Criticality) -> Severity {
     match crit {
         Criticality::Hostile => Severity::Critical,
         Criticality::Suspicious => Severity::High,
         Criticality::Notable => Severity::Medium,
-        _ => Severity::None,
+        Criticality::Baseline
+        | Criticality::Component
+        | Criticality::Exception
+        | Criticality::Filtered => Severity::None,
     }
 }
 
@@ -921,11 +946,6 @@ fn humanize(class: &str) -> String {
 /// This is the SARIF rule id, so a Security-tab alert keeps the same identity
 /// across runs and can be tracked or dismissed there.
 pub(crate) fn structure_id(label: &str) -> String {
-    format!("structure/{}", slug(label))
-}
-
-/// Kebab-case a human label for use inside an id.
-pub(crate) fn slug(label: &str) -> String {
     let kebab: String = label
         .chars()
         .map(|c| {
@@ -936,7 +956,7 @@ pub(crate) fn slug(label: &str) -> String {
             }
         })
         .collect();
-    kebab.trim_matches('-').to_string()
+    format!("structure/{}", kebab.trim_matches('-'))
 }
 
 /// The readable tail of a trait id — the rule name an analyst greps for.

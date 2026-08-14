@@ -8,7 +8,7 @@ BINARY = isomer
 # cleave) don't inherit a malformed MAKEFLAGS. Mirrors scan's Makefile.
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: all build release install lint fix test demo validate-samples install-precommit clean help
+.PHONY: all build release quick install lint fix test demo validate-samples install-precommit clean help
 
 # Trait set the sample audit judges with. Defaults to the working-tree
 # traits-dev beside this repo when present, so the audit tracks trait edits;
@@ -22,6 +22,11 @@ build:
 
 release:
 	$(CARGO) build --release
+
+# Optimized but un-LTO'd, for targets that build then immediately run the
+# binary. See [profile.quick] in Cargo.toml.
+quick:
+	$(CARGO) build --profile quick
 
 install: release
 	$(CARGO) install --path .
@@ -47,19 +52,19 @@ test:
 
 # Run the curated real-world supply-chain attacks — command in, verdict out,
 # nothing else. Doubles as a smoke test: fails if any case drops below notable.
-# Builds once, then hands the release binary to the demo script so the output
-# isn't interleaved with cargo's.
-demo: release
-	@sh scripts/demo.sh "./target/release/$(BINARY)"
+# Builds once, then hands the binary to the demo script so the output isn't
+# interleaved with cargo's.
+demo: quick
+	@sh scripts/demo.sh "./target/quick/$(BINARY)"
 
 # Self-audit against the supply-chain corpus: for every attack, before->during
 # must be detected, and during->after / before->after must not. Prints a
 # violations report and exits non-zero on any miss or false positive. Point at
 # the corpus with ISOMER_SAMPLES_DIR (default ~/src/supplychain-attack-data);
 # it skips cleanly (exit 2) when the corpus is absent.
-validate-samples: release
+validate-samples: quick
 	@CLEAVE_TRAITS_DIR="$(TRAITS_DIR)" \
-		python3 scripts/validate-samples.py --isomer "./target/release/$(BINARY)"
+		python3 scripts/validate-samples.py --isomer "./target/quick/$(BINARY)"
 
 # Install the pre-commit gate (no [patch] path overrides + make lint + make
 # test). Bypass an individual commit with `git commit --no-verify`.
@@ -73,8 +78,9 @@ clean:
 
 help:
 	@echo "isomer targets:"
-	@echo "  build     debug build"
+	@echo "  build     debug build (optimized dependencies)"
 	@echo "  release   optimized build"
+	@echo "  quick     optimized build, no LTO — fast to link, used by demo"
 	@echo "  install   cargo install to ~/.cargo/bin"
 	@echo "  lint      rustfmt --check + clippy with warnings denied"
 	@echo "  fix       auto-fix clippy + rustfmt"

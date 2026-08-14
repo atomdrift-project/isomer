@@ -67,4 +67,7 @@ reason = "vendored socket.io client; reviewed in #482"
 expires = "2026-11-09"   # optional
 ```
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the full design.
+## Warts
+
+Heuristics are all generic, but hardcoded. The plan is to migrate to a new ML model (valence) once
+we prove the ideas behind our heuristics and acquire more supply-chain attack testdata.
