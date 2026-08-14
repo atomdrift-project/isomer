@@ -523,6 +523,11 @@ impl<'a> Analysis<'a> {
             || self.assessment.severity >= Severity::Medium
             || self.risk_band_moved()
             || self.prop.disproportionate
+            // Removing attack behavior is itself a notable change. The
+            // remediation floor lives above `assessment.severity` because the
+            // rubric scores gains; do not let a successful cleanup fall into
+            // the quiet "no behavioral change" path.
+            || self.remediation.is_some()
             // An implant-shaped change always deserves words.
             || self.prop.skew.is_some()
             // Gained external code — a runtime dependency or a new/moved
