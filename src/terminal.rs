@@ -112,6 +112,8 @@ fn render(out: &mut String, a: &Analysis<'_>) {
     push_section(&mut sections, &mut section);
     identity_claims_grid(&mut section, a);
     push_section(&mut sections, &mut section);
+    removed_grid(&mut section, a);
+    push_section(&mut sections, &mut section);
     gained_grid(&mut section, assessment);
     push_section(&mut sections, &mut section);
     structure_grid(&mut section, &assessment.structure);
@@ -403,6 +405,31 @@ fn gained_grid(out: &mut String, a: &Assessment) {
                 "{leaf_indent}{} {}\n",
                 "└─".truecolor(70, 80, 89),
                 leaf.truecolor(76, 178, 255),
+            ));
+        }
+    }
+}
+
+/// High-risk behavior that disappeared. It is remediation evidence, not a
+/// newly gained finding, so keep it visually and semantically separate.
+fn removed_grid(out: &mut String, a: &Analysis<'_>) {
+    let leaf_indent = " ".repeat(PILL_COL + 4);
+    for (i, group) in a.removed_high_risk_behaviors().iter().enumerate() {
+        let cell = if i == 0 {
+            pill_cell("removed", PILL_TEAL)
+        } else {
+            blank_cell()
+        };
+        out.push_str(&grid_line(
+            &cell,
+            &format!("{}  ", "−".truecolor(95, 175, 95)),
+            &group.namespace.as_str().bold().to_string(),
+        ));
+        for leaf in &group.traits {
+            out.push_str(&format!(
+                "{leaf_indent}{} {}\n",
+                "└─".truecolor(70, 80, 89),
+                leaf.truecolor(95, 175, 95),
             ));
         }
     }

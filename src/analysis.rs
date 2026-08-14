@@ -54,6 +54,19 @@ pub(crate) enum Scope {
     SourceAndBuild,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Remediation {
+    FocusedCleanup,
+    ModelRecovery,
+    BehaviorRemoval,
+}
+
+#[derive(Debug)]
+pub(crate) struct RemovedBehavior {
+    pub namespace: String,
+    pub traits: Vec<String>,
+}
+
 impl Scope {
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -205,8 +218,12 @@ pub(crate) struct Analysis<'a> {
     /// compressed test-data carriers changed. This is the two-release xz
     /// shape: stable activation logic with a refreshed hidden stage.
     pub source_payload_refresh: bool,
-    /// Worst of the rubric axes and the *current* ML risk band — "how bad is
-    /// it now".
+    /// Joined evidence that this transition removes or disables attack
+    /// behavior. Shared by the gate, terminal, and LLM.
+    pub remediation: Option<Remediation>,
+    /// Worst differential signal: rubric axes plus any worsening ML risk band.
+    /// Absolute artifact probability remains visible on the risk line, but a
+    /// risky domain baseline does not by itself condemn a benign update.
     pub verdict: Severity,
     /// The verdict before any optional LLM escalation. Terminal and LLM
     /// context use this to distinguish deterministic evidence from the model's
@@ -313,7 +330,6 @@ impl<'a> Analysis<'a> {
         // fired. `None` when no model is available — then the hand-coded
         // rubric stands alone.
         let risk = crate::risk::score(&pairs);
-        let risk_now = risk.map_or(Severity::None, |r| risk_band(r.new));
         let risk_jump = risk.map_or(Severity::None, |r| {
             if risk_band(r.new) > risk_band(r.old) {
                 risk_band(r.new)
@@ -334,7 +350,9 @@ impl<'a> Analysis<'a> {
             source_archive,
             source_build_anomaly,
         );
-        let cleanup_signature = remediation_cleanup_context(&assessment, &judged_diff, risk);
+        let remediation =
+            remediation_cleanup_context(old, new, &assessment, &judged_diff, diff, risk);
+        let is_remediation = remediation.is_some();
 
         // A capability the version bump does not license *is* the supply-chain
         // signal — so a disproportionate gain is escalated to a gate-failing
@@ -345,17 +363,17 @@ impl<'a> Analysis<'a> {
         // (repack) release that has no business gaining behavior at all
         // (unrealircd: a same-version repack that gained byte-comparison and
         // privilege-escalation traits, medium each, under the high gate).
-        let escalation = if prop.disproportionate && !cleanup_signature {
+        let escalation = if prop.disproportionate && !is_remediation {
             Severity::High
         } else {
             Severity::None
         };
-        let rubric_new = if cleanup_signature {
+        let rubric_new = if is_remediation {
             assessment.new_severity_without_signatures()
         } else {
             assessment.new_severity()
         };
-        let shape_new = if cleanup_signature {
+        let shape_new = if is_remediation {
             Severity::None
         } else {
             shape_escalation
@@ -364,14 +382,36 @@ impl<'a> Analysis<'a> {
         // escalation signals as the gate. Otherwise a shape-only attack can
         // fail a High gate while the masthead still says NOTABLE (faker's
         // endgame package deletion was the concrete example). Keep the raw
-        // Azoth probability untouched: a low model score beside a gate-worthy
-        // deterministic verdict honestly shows which detector caught it.
-        let verdict = assessment
-            .severity
-            .max(risk_now)
-            .max(escalation)
-            .max(shape_new);
-        let new_verdict = rubric_new.max(risk_jump).max(escalation).max(shape_new);
+        // Azoth probability visible but use only a worsening band in the
+        // change verdict. A wallet or security package can have a high
+        // absolute score on both sides without this release being an attack.
+        // Static traits in explicitly disabled handlers remain useful audit
+        // evidence, but they no longer describe executable new behavior. Keep
+        // cleanup visible as Notable while preserving independent identity,
+        // structure, known-signature, model, and direct-hostile signals.
+        let remediation_floor = Severity::Medium
+            .max(assessment.identity.severity)
+            .max(assessment.structure.severity)
+            .max(assessment.signature.severity)
+            .max(if rubric_new >= Severity::Critical {
+                Severity::Critical
+            } else {
+                Severity::None
+            });
+        let verdict = if is_remediation {
+            remediation_floor.max(risk_jump)
+        } else {
+            assessment
+                .severity
+                .max(risk_jump)
+                .max(escalation)
+                .max(shape_new)
+        };
+        let new_verdict = if is_remediation {
+            remediation_floor.max(risk_jump)
+        } else {
+            rubric_new.max(risk_jump).max(escalation).max(shape_new)
+        };
         let gated = match cli.gate {
             Gate::New => new_verdict,
             Gate::Any => verdict.max(escalation),
@@ -391,6 +431,7 @@ impl<'a> Analysis<'a> {
             risk,
             source_build_anomaly,
             source_payload_refresh,
+            remediation,
             verdict,
             new_verdict,
             gated,
@@ -527,6 +568,9 @@ impl<'a> Analysis<'a> {
     /// [`reason`](Self::reason); the LLM's phrasing has no place here (a clean
     /// verdict's note is about counts, not the read).
     fn clean_note(&self) -> String {
+        if self.remediation.is_some() {
+            return self.headline_facts();
+        }
         let noted = self.assessment.behavioral.categories.len()
             + self.assessment.signature.ids.len()
             + self.assessment.identity.changes.len()
@@ -644,6 +688,18 @@ impl<'a> Analysis<'a> {
         if restored_endgame_package_shape(self.display_diff()) {
             return "restored package runtime tree and declared entrypoint".to_string();
         }
+        match self.remediation {
+            Some(Remediation::FocusedCleanup) => {
+                return "disabled risky handlers and added artifact cleanup".to_string();
+            }
+            Some(Remediation::ModelRecovery) => {
+                return "removed attack behavior and sharply reduced model risk".to_string();
+            }
+            Some(Remediation::BehaviorRemoval) => {
+                return "removed high-severity attack behavior".to_string();
+            }
+            None => {}
+        }
         if dependency_with_fallback_load(&self.assessment, &self.judged_diff) {
             return "added dependency alongside fallback module load".to_string();
         }
@@ -743,6 +799,21 @@ impl<'a> Analysis<'a> {
                 "restoration shape: a previously absent declared entrypoint and its large runtime tree returned"
                     .to_string(),
             );
+        }
+        match self.remediation {
+            Some(Remediation::FocusedCleanup) => lines.push(
+                "remediation shape: multiple handlers were disabled at function entry and a named artifact is deleted"
+                    .to_string(),
+            ),
+            Some(Remediation::ModelRecovery) => lines.push(
+                "remediation shape: model risk fell sharply while attack behavior was removed"
+                    .to_string(),
+            ),
+            Some(Remediation::BehaviorRemoval) => lines.push(
+                "remediation shape: high-severity attack behavior was removed without a high-severity replacement"
+                    .to_string(),
+            ),
+            None => {}
         }
         if obfuscated_remote_script_loader(d) {
             lines.push(
@@ -884,6 +955,17 @@ impl<'a> Analysis<'a> {
             let Some(identity) = file.identity.as_ref() else {
                 continue;
             };
+            if identity
+                .old
+                .as_ref()
+                .is_some_and(crate::rubric::filename_only_identity)
+                || identity
+                    .new
+                    .as_ref()
+                    .is_some_and(crate::rubric::filename_only_identity)
+            {
+                continue;
+            }
             let old = identity
                 .old
                 .as_ref()
@@ -935,6 +1017,17 @@ impl<'a> Analysis<'a> {
             let Some(identity) = file.identity.as_ref() else {
                 continue;
             };
+            if identity
+                .old
+                .as_ref()
+                .is_some_and(crate::rubric::filename_only_identity)
+                || identity
+                    .new
+                    .as_ref()
+                    .is_some_and(crate::rubric::filename_only_identity)
+            {
+                continue;
+            }
             let include_version = file.path != "<root>";
             let old = identity
                 .old
@@ -1063,6 +1156,13 @@ impl<'a> Analysis<'a> {
                 );
             }
         }
+        let removed = self.removed_high_risk_behaviors();
+        if !removed.is_empty() {
+            let _ = writeln!(s, "\nREMOVED high-risk behavior:");
+            for group in removed {
+                let _ = writeln!(s, "- {}: {}", group.namespace, group.traits.join(", "));
+            }
+        }
         if a.signature.severity != Severity::None {
             let _ = writeln!(s, "\nknown-bad signatures matched:");
             for m in &a.signature.ids {
@@ -1149,6 +1249,28 @@ impl<'a> Analysis<'a> {
             }
         }
         s
+    }
+
+    /// Suspicious/hostile traits that disappeared, grouped for terminal and
+    /// model context. The normal rubric is intentionally gain-oriented for CI;
+    /// this supplies the equally important remediation direction.
+    pub(crate) fn removed_high_risk_behaviors(&self) -> Vec<RemovedBehavior> {
+        let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for finding in removed_high_risk_traits(self.display_diff()) {
+            let namespace = crate::rubric::namespace_of(&finding.id);
+            let leaf = crate::rubric::short_name(&finding.id);
+            let traits = groups.entry(namespace).or_default();
+            if !traits.contains(&leaf) {
+                traits.push(leaf);
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(namespace, mut traits)| {
+                traits.sort();
+                RemovedBehavior { namespace, traits }
+            })
+            .collect()
     }
 
     /// Build the `--format json` envelope. Compact and typed, mirroring
@@ -2987,31 +3109,155 @@ fn add_capability_text(families: &mut HashSet<&'static str>, text: &str) {
     }
 }
 
-/// A cleanup release may mention the exact malicious filename it removes.
-/// Keep the signature visible in the report, but do not treat that quoted
-/// indicator as newly introduced risk on the default `new` gate.
+/// Recognize a focused remediation without trusting incident prose alone.
+///
+/// The joined shape requires a newly referenced artifact indicator, actual
+/// file deletion, and at least two functions newly disabled by an immediate
+/// entry return. The latter is executable evidence: it distinguishes a repair
+/// that retains dead forensic code from an attacker merely claiming cleanup.
 fn remediation_cleanup_context(
+    old_root: &Path,
+    new_root: &Path,
     a: &Assessment,
-    diff: &DiffReportV1,
+    judged_diff: &DiffReportV1,
+    raw_diff: &DiffReportV1,
     risk: Option<crate::risk::Risk>,
-) -> bool {
-    let known_indicator = a
-        .signature
-        .ids
-        .iter()
-        .any(|m| m.is_new && m.id.ends_with("wp-comments-posts-masquerade"));
+) -> Option<Remediation> {
+    let known_indicator = raw_diff.files.iter().any(|file| {
+        file.scopes.traits.as_ref().is_some_and(|traits| {
+            traits
+                .added
+                .iter()
+                .chain(traits.changed.iter().map(|change| &change.new))
+                .any(|finding| {
+                    finding.id.ends_with("wp-comments-posts-reference")
+                        || finding.id.ends_with("wp-comments-posts-masquerade")
+                })
+        })
+    });
     let deletes_file = a
         .behavioral
         .categories
         .iter()
         .any(|c| c.class == "fs/delete" && !c.new_ids.is_empty());
-    let compact_cleanup = known_indicator && deletes_file && diff.summary.files_changed <= 4;
+    let disabled_functions = newly_disabled_source_functions(old_root, new_root, raw_diff);
+    let compact_cleanup = known_indicator
+        && deletes_file
+        && disabled_functions >= 2
+        && judged_diff.summary.files_changed <= 4
+        && judged_diff.summary.files_added <= 1;
     // A fixed release often removes the malicious code instead of adding a
     // recognizable signature. A large same-package model-risk drop is strong
     // evidence of that remediation transition; the clean baseline→fixed
     // comparison does not have the drop and remains subject to normal gates.
     let model_recovery = risk.is_some_and(|r| r.old - r.new >= 0.50);
-    compact_cleanup || model_recovery
+    if compact_cleanup {
+        Some(Remediation::FocusedCleanup)
+    } else if model_recovery {
+        Some(Remediation::ModelRecovery)
+    } else if attack_behavior_removed(judged_diff, a.new_severity()) {
+        Some(Remediation::BehaviorRemoval)
+    } else {
+        None
+    }
+}
+
+fn removed_high_risk_traits(diff: &DiffReportV1) -> Vec<&TraitChange> {
+    let mut findings = diff
+        .files
+        .iter()
+        .filter_map(|file| file.scopes.traits.as_ref())
+        .flat_map(|traits| {
+            traits.removed.iter().chain(
+                traits
+                    .changed
+                    .iter()
+                    .filter(|change| {
+                        crate::rubric::crit_rank(change.old.crit)
+                            > crate::rubric::crit_rank(change.new.crit)
+                    })
+                    .map(|change| &change.old),
+            )
+        })
+        .filter(|finding| {
+            matches!(
+                finding.crit,
+                cleave::Criticality::Suspicious | cleave::Criticality::Hostile
+            )
+        })
+        .collect::<Vec<_>>();
+    findings.sort_by(|a, b| a.id.cmp(&b.id));
+    findings.dedup_by(|a, b| a.id == b.id);
+    findings
+}
+
+fn attack_behavior_removed(diff: &DiffReportV1, new_severity: Severity) -> bool {
+    if new_severity > Severity::Medium {
+        return false;
+    }
+    let removed = removed_high_risk_traits(diff);
+    removed
+        .iter()
+        .any(|finding| finding.crit == cleave::Criticality::Hostile)
+        || removed.len() >= 2
+}
+
+/// Count functions newly made unreachable by a bare `return;` at entry.
+/// This intentionally recognizes only the simple, unambiguous source form;
+/// conditional returns and returns later in a body do not qualify.
+fn newly_disabled_source_functions(old_root: &Path, new_root: &Path, diff: &DiffReportV1) -> usize {
+    diff.files
+        .iter()
+        .filter(|file| matches!(file.status, FileStatus::Added | FileStatus::Changed))
+        .map(|file| {
+            let old = diff_source_bytes(old_root, &file.path)
+                .as_deref()
+                .map(immediate_entry_return_count)
+                .unwrap_or(0);
+            let new = diff_source_bytes(new_root, &file.path)
+                .as_deref()
+                .map(immediate_entry_return_count)
+                .unwrap_or(0);
+            new.saturating_sub(old)
+        })
+        .sum()
+}
+
+fn diff_source_bytes(root: &Path, diff_path: &str) -> Option<Vec<u8>> {
+    if let Some((_, member)) = diff_path.split_once("!!") {
+        return cleave::extract_member(root, member).ok().flatten();
+    }
+    let path = if root.is_dir() {
+        root.join(diff_path)
+    } else {
+        root.to_path_buf()
+    };
+    std::fs::read(path).ok()
+}
+
+fn immediate_entry_return_count(bytes: &[u8]) -> usize {
+    if bytes.iter().take(8192).any(|byte| *byte == 0) {
+        return 0;
+    }
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return 0;
+    };
+    let lines = source.lines().collect::<Vec<_>>();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| {
+            let line = line.trim();
+            line.contains("function ") && line.ends_with('{')
+        })
+        .filter(|(index, _)| {
+            lines[index + 1..]
+                .iter()
+                .map(|line| line.trim())
+                .find(|line| !line.is_empty() && !line.starts_with("//"))
+                .is_some_and(|line| line == "return;")
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -3019,18 +3265,101 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     use super::{
-        CapabilityShape, add_capability_text, capability_shape_score, changed_identity_claims,
-        changed_test_carrier, endgame_package_shape, executable_member_layout,
-        external_remote_script_loader, identity_claim_fields, is_compiled_binary_file_type,
-        is_source_archive, line_diff, normalized_archive_diff, normalized_member_path,
-        npm_snapshot_member_key, obfuscated_remote_script_loader, restored_endgame_package_shape,
+        CapabilityShape, add_capability_text, attack_behavior_removed, capability_shape_score,
+        changed_identity_claims, changed_test_carrier, endgame_package_shape,
+        executable_member_layout, external_remote_script_loader, identity_claim_fields,
+        immediate_entry_return_count, is_compiled_binary_file_type, is_source_archive, line_diff,
+        normalized_archive_diff, normalized_member_path, npm_snapshot_member_key,
+        obfuscated_remote_script_loader, removed_high_risk_traits, restored_endgame_package_shape,
         source_build_macro_score,
     };
+    use crate::Severity;
     use cleave::Criticality;
     use cleave::types::{
         DiffReportV1, DiffSummary, FileDiffEntry, FileStatus, ScopeDiff, ScopeDiffs, ScopeRocs,
         TraitChange,
     };
+
+    #[test]
+    fn entry_return_detection_requires_an_unconditional_first_statement() {
+        let source = br#"
+            public function disabled() {
+                return;
+                dangerous_call();
+            }
+            function conditional() {
+                if ($safe) return;
+                dangerous_call();
+            }
+            function later() {
+                setup();
+                return;
+            }
+        "#;
+        assert_eq!(immediate_entry_return_count(source), 1);
+    }
+
+    #[test]
+    fn attack_removal_requires_strong_disappearing_traits_and_no_replacement() {
+        let finding = |id: &str, crit| TraitChange {
+            id: id.to_string(),
+            trait_section: "objectives".to_string(),
+            crit,
+            desc: id.to_string(),
+            count: 1,
+        };
+        let make_diff = |removed| DiffReportV1 {
+            old_root: "affected.tgz".to_string(),
+            new_root: "fixed.tgz".to_string(),
+            summary: DiffSummary::default(),
+            scopes: ScopeDiffs::default(),
+            files: vec![FileDiffEntry {
+                path: "workflow.yml".to_string(),
+                status: FileStatus::Changed,
+                identity: None,
+                scopes: ScopeDiffs {
+                    traits: Some(ScopeDiff {
+                        removed,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                old_formula: None,
+                new_formula: None,
+            }],
+        };
+
+        let hostile = make_diff(vec![finding(
+            "objectives/supply-chain/trojanized/build-pipeline::encoded-shell",
+            Criticality::Hostile,
+        )]);
+        assert_eq!(removed_high_risk_traits(&hostile).len(), 1);
+        assert!(attack_behavior_removed(&hostile, Severity::Medium));
+        assert!(!attack_behavior_removed(&hostile, Severity::High));
+
+        let weak = make_diff(vec![finding(
+            "objectives/anti-static/obfuscation::one-clue",
+            Criticality::Suspicious,
+        )]);
+        assert!(!attack_behavior_removed(&weak, Severity::None));
+
+        let joined = make_diff(vec![
+            finding(
+                "objectives/anti-static/obfuscation::encoded-shell",
+                Criticality::Suspicious,
+            ),
+            finding(
+                "objectives/supply-chain/trojanized/build-pipeline::oidc-shell",
+                Criticality::Suspicious,
+            ),
+            finding(
+                "micro-behaviors/process/create::ordinary-exec",
+                Criticality::Notable,
+            ),
+        ]);
+        assert_eq!(removed_high_risk_traits(&joined).len(), 2);
+        assert!(attack_behavior_removed(&joined, Severity::None));
+    }
 
     #[test]
     fn endgame_shape_requires_behavioral_collapse_not_just_cleanup() {

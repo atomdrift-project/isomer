@@ -130,7 +130,238 @@ jobs:
           "./target/$TARGET/release/isomer" --version
           "./target/$TARGET/release/isomer" --help > /dev/null
 
-      # The name install.sh will look for, and the layout it will unpack.
+      # Signed path: import the Developer ID cert into a throwaway keychain that
+      # exists only for this job. Never touch the runner's login keychain, and
+      # never leave the .p12 on disk. Runs on both darwin targets so the Intel
+      # slice is signed too, even though this arm64 runner cannot execute it.
+      - name: Import Developer ID certificate
+        if: runner.os == 'macOS'
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -eu
+          if [ -z "$CERT_P12" ]; then
+            echo "::error::MACOS_CERT_P12 is not set - configure the signing secrets"
+            exit 1
+          fi
+          KEYCHAIN="$RUNNER_TEMP/atomdrift-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          echo "SIGNING_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          INTERMEDIATE_G1="$RUNNER_TEMP/DeveloperIDCA-G1.cer"
+          INTERMEDIATE_G2="$RUNNER_TEMP/DeveloperIDCA-G2.cer"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 1800 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain -d user | \
+            sed -e 's/^[[:space:]\"]*//' -e 's/[[:space:]\"]*$//')"
+          echo "ORIGINAL_DEFAULT_KEYCHAIN=$ORIGINAL_DEFAULT_KEYCHAIN" >> "$GITHUB_ENV"
+          security default-keychain -d user -s "$KEYCHAIN"
+
+          # Import both Apple Developer ID intermediates so certificate rotation
+          # between the legacy G1 and current G2 chains is painless. Pin the
+          # exact DER bytes because these files affect release trust.
+          curl --fail --silent --show-error --location \
+            https://www.apple.com/certificateauthority/DeveloperIDCA.cer \
+            --output "$INTERMEDIATE_G1"
+          curl --fail --silent --show-error --location \
+            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer \
+            --output "$INTERMEDIATE_G2"
+          INTERMEDIATE_G1_SHA="$(shasum -a 256 "$INTERMEDIATE_G1" | awk '{print $1}')"
+          INTERMEDIATE_G2_SHA="$(shasum -a 256 "$INTERMEDIATE_G2" | awk '{print $1}')"
+          if [ "$INTERMEDIATE_G1_SHA" != 7afc9d01a62f03a2de9637936d4afe68090d2de18d03f29c88cfb0b1ba63587f ]; then
+            echo "::error::Apple Developer ID G1 intermediate checksum mismatch"
+            exit 1
+          fi
+          if [ "$INTERMEDIATE_G2_SHA" != f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a ]; then
+            echo "::error::Apple Developer ID G2 intermediate checksum mismatch"
+            exit 1
+          fi
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+
+          # Derive the selector before adding the intermediate: the exported
+          # .p12 contains one leaf identity, so its certificate fingerprint is
+          # unambiguous and does not depend on Keychain common-name indexing.
+          SIGNING_IDENTITY="$(security find-certificate -a -Z "$KEYCHAIN" | \
+            awk '/SHA-1 hash:/ { print $3 }')"
+          IDENTITY_COUNT="$(printf '%s\n' "$SIGNING_IDENTITY" | awk 'NF { count++ } END { print count + 0 }')"
+          if [ "$IDENTITY_COUNT" -ne 1 ]; then
+            echo "::error::Expected exactly one certificate in MACOS_CERT_P12; found $IDENTITY_COUNT"
+            exit 1
+          fi
+          echo "SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+          security import "$INTERMEDIATE_G1" -k "$KEYCHAIN"
+          security import "$INTERMEDIATE_G2" -k "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/cert.p12" "$INTERMEDIATE_G1" "$INTERMEDIATE_G2"
+
+          # Without this, codesign blocks on an interactive keychain prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security find-identity -p codesigning "$KEYCHAIN" || true
+
+      # Hardened runtime is mandatory for notarization and blocks JIT by default,
+      # which would kill isomer: it runs its compiled rules through
+      # wasmtime/cranelift at load time. Hence the entitlements in
+      # .github/macos-entitlements.plist (see that file for why both allow-jit
+      # and allow-unsigned-executable-memory are required).
+      - name: Sign with Developer ID
+        if: runner.os == 'macOS'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          BIN="target/$TARGET/release/isomer"
+          codesign --force --timestamp --options runtime \
+            --entitlements .github/macos-entitlements.plist \
+            --sign "$SIGNING_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          codesign --display --entitlements - "$BIN"
+
+      - name: Notarize
+        if: runner.os == 'macOS'
+        env:
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          BIN="target/$TARGET/release/isomer"
+          if [ -z "$NOTARY_KEY" ] || [ -z "$NOTARY_KEY_ID" ] || [ -z "$NOTARY_ISSUER" ]; then
+            echo "::error::one or more MACOS_NOTARY_* secrets are unset"
+            exit 1
+          fi
+
+          NOTARY_KEY_FILE="$RUNNER_TEMP/notary.p8"
+          NOTARY_ARCHIVE="$RUNNER_TEMP/isomer.zip"
+          SUBMIT_RESULT="$RUNNER_TEMP/notary-submit.json"
+          STATUS_RESULT="$RUNNER_TEMP/notary-status.json"
+          printf '%s' "$NOTARY_KEY" | base64 --decode > "$NOTARY_KEY_FILE"
+          chmod 600 "$NOTARY_KEY_FILE"
+          /usr/bin/ditto -c -k "$BIN" "$NOTARY_ARCHIVE"
+
+          # Submission and processing are separate operations. Keep the UUID so a
+          # dropped connection while polling cannot force a second upload.
+          submit_attempt=1
+          until xcrun notarytool submit "$NOTARY_ARCHIVE" \
+            --key "$NOTARY_KEY_FILE" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER" \
+            --no-wait --output-format json > "$SUBMIT_RESULT"; do
+            if [ "$submit_attempt" -ge 3 ]; then
+              echo "::error::Apple notarization upload failed after $submit_attempt attempts"
+              exit 1
+            fi
+            echo "::warning::Notarization upload attempt $submit_attempt failed; retrying"
+            sleep $((submit_attempt * 30))
+            submit_attempt=$((submit_attempt + 1))
+          done
+
+          SUBMISSION_ID="$(plutil -extract id raw -o - "$SUBMIT_RESULT")"
+          echo "Apple notarization submission: $SUBMISSION_ID"
+          {
+            echo "### macOS notarization"
+            echo
+            echo "- Target: \`$TARGET\`"
+            echo "- Submission: \`$SUBMISSION_ID\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          wait_attempt=1
+          while :; do
+            rm -f "$STATUS_RESULT"
+            wait_rc=0
+            xcrun notarytool wait "$SUBMISSION_ID" \
+              --key "$NOTARY_KEY_FILE" \
+              --key-id "$NOTARY_KEY_ID" \
+              --issuer "$NOTARY_ISSUER" \
+              --timeout 20m \
+              --output-format json > "$STATUS_RESULT" || wait_rc=$?
+
+            # A timeout or transient App Store Connect error does not cancel the
+            # server-side submission. Query that same UUID before deciding.
+            if [ "$wait_rc" -ne 0 ]; then
+              echo "::warning::Notary wait exited $wait_rc; querying submission $SUBMISSION_ID"
+              info_attempt=1
+              while ! xcrun notarytool info "$SUBMISSION_ID" \
+                --key "$NOTARY_KEY_FILE" \
+                --key-id "$NOTARY_KEY_ID" \
+                --issuer "$NOTARY_ISSUER" \
+                --output-format json > "$STATUS_RESULT"; do
+                if [ "$info_attempt" -ge 3 ]; then
+                  rm -f "$STATUS_RESULT"
+                  break
+                fi
+                sleep $((info_attempt * 15))
+                info_attempt=$((info_attempt + 1))
+              done
+            fi
+
+            status=""
+            if [ -s "$STATUS_RESULT" ]; then
+              status="$(plutil -extract status raw -o - "$STATUS_RESULT" 2>/dev/null || true)"
+            fi
+            echo "Notarization status: ${status:-unavailable}"
+
+            case "$status" in
+              Accepted)
+                echo "- Status: Accepted" >> "$GITHUB_STEP_SUMMARY"
+                break
+                ;;
+              Invalid|Rejected)
+                echo "- Status: $status" >> "$GITHUB_STEP_SUMMARY"
+                xcrun notarytool log "$SUBMISSION_ID" \
+                  --key "$NOTARY_KEY_FILE" \
+                  --key-id "$NOTARY_KEY_ID" \
+                  --issuer "$NOTARY_ISSUER" || true
+                echo "::error::Apple rejected notarization submission $SUBMISSION_ID"
+                exit 1
+                ;;
+              "In Progress"|"") ;;
+              *)
+                echo "::warning::Unexpected notarization status: $status"
+                ;;
+            esac
+
+            if [ "$wait_attempt" -ge 12 ]; then
+              echo "- Status: ${status:-Unavailable} (timed out)" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::Notarization submission $SUBMISSION_ID did not finish within the release wait window"
+              exit 1
+            fi
+            wait_attempt=$((wait_attempt + 1))
+          done
+
+          rm -f "$NOTARY_KEY_FILE" "$NOTARY_ARCHIVE" "$SUBMIT_RESULT" "$STATUS_RESULT"
+          # A bare Mach-O can't be stapled - `stapler` only handles bundles, .dmg
+          # and .pkg - so Gatekeeper resolves the ticket online the first time a
+          # downloaded copy runs.
+
+      - name: Remove signing keychain
+        if: ${{ always() && runner.os == 'macOS' }}
+        run: |
+          set -eu
+          if [ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]; then
+            security default-keychain -d user -s "$ORIGINAL_DEFAULT_KEYCHAIN" || true
+          fi
+          if [ -n "${SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$SIGNING_KEYCHAIN" || true
+          fi
+          rm -f \
+            "$RUNNER_TEMP/cert.p12" \
+            "$RUNNER_TEMP/DeveloperIDCA-G1.cer" \
+            "$RUNNER_TEMP/DeveloperIDCA-G2.cer" \
+            "$RUNNER_TEMP/notary.p8" \
+            "$RUNNER_TEMP/isomer.zip" \
+            "$RUNNER_TEMP/notary-submit.json" \
+            "$RUNNER_TEMP/notary-status.json"
+
+      # The name install.sh will look for, and the layout it will unpack. On
+      # macOS the binary is now signed and notarized, so the tarball ships it.
       - name: Package
         env:
           TARGET: ${{ matrix.target }}

@@ -8,9 +8,9 @@
 # attack slips under that bar. The gate is deterministic, so the LLM read below
 # never changes the pass/fail; it only enriches the verdict.
 #
-# The model's read is on by default (the ✨ line in each verdict). Point it
-# elsewhere with LLM_URL=…; disable it — and go fully hermetic, no network — with
-# LLM_URL="".
+# The demo runs fully offline by default. Pass LLM_URL=… to point isomer at an
+# OpenAI-compatible endpoint and add the model's read (the ✨ line in each
+# verdict); the deterministic pass/fail is unaffected either way.
 #
 # Usage: scripts/demo.sh [path-to-isomer-binary]   (default: cargo run -q --)
 set -eu
@@ -19,7 +19,7 @@ ISOMER="${1:-cargo run -q --}"
 D="testdata/supplychain"
 DIV="────────────────────────────────────────────────────────────────────────────────"
 
-LLM_URL="${LLM_URL-http://10.9.8.149:8000/v1}"
+LLM_URL="${LLM_URL-}"
 if [ -n "$LLM_URL" ]; then
     ISOMER_LLM="$LLM_URL"
     export ISOMER_LLM

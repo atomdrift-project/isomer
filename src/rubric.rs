@@ -710,6 +710,15 @@ fn meaningful_identity_changes(
         (None, _) => return out,
     };
 
+    // Archive filenames are weak fallback identity, not publisher metadata.
+    // A reconstructed package can have a synthetic filename while its embedded
+    // package.json retains the real scoped npm name. If either side degraded to
+    // filename-only identity, comparing it with a manifest-derived identity
+    // invents an author/name takeover that never occurred.
+    if filename_only_identity(o) || filename_only_identity(n) {
+        return out;
+    }
+
     // Some analyzers emit an Identity object on both sides even when the old
     // object carries no claims. Treating `empty -> named` as drift makes a
     // clean release that restores package metadata look like a publisher
@@ -759,6 +768,33 @@ fn meaningful_identity_changes(
     push("publisher id", ids(o), ids(n));
     push("package name", claim(&o.name), claim(&n.name));
     out
+}
+
+/// Whether filefacts found no identity beyond an unverified basename (and an
+/// optional version parsed from that same basename). This is useful artifact
+/// labeling, but it is not package or publisher provenance.
+pub(crate) fn filename_only_identity(identity: &filefacts::Identity) -> bool {
+    let basename_claim = |claim: &Option<filefacts::Claim>| {
+        claim
+            .as_ref()
+            .is_none_or(|claim| claim.source == "file.basename" && !claim.verified)
+    };
+    identity.name.is_some()
+        && basename_claim(&identity.name)
+        && basename_claim(&identity.version)
+        && identity.title.is_none()
+        && identity.identifier.is_none()
+        && identity.project.is_none()
+        && identity.authors.is_empty()
+        && identity.organization.is_none()
+        && identity.producer.is_none()
+        && identity.build_path.is_none()
+        && identity.signer.is_none()
+        && identity.trust == filefacts::Trust::Unsigned
+        && identity.team_id.is_none()
+        && identity.emails.is_empty()
+        && identity.urls.is_empty()
+        && identity.unique_ids.is_empty()
 }
 
 /// Known-bad detection namespaces. A hit means "we recognize this", not "this
@@ -1046,6 +1082,29 @@ mod tests {
         assert_eq!(a("docker://alpine:3"), None);
         // A bare slug with no owner/repo is not a remote action.
         assert_eq!(a("node@18"), None);
+    }
+
+    #[test]
+    fn filename_fallback_is_not_treated_as_package_identity_drift() {
+        let mut reconstructed = filefacts::Identity::default();
+        reconstructed.name = Some(filefacts::Claim::claimed("@bitwarden-cli", "file.basename"));
+        reconstructed.version = Some(filefacts::Claim::claimed(
+            "2026.4.0-RECONSTRUCTED",
+            "file.basename",
+        ));
+
+        let mut package = filefacts::Identity::default();
+        package.name = Some(filefacts::Claim::claimed("@bitwarden/cli", "npm.name"));
+
+        assert!(meaningful_identity_changes(Some(&reconstructed), Some(&package)).is_empty());
+        assert!(filename_only_identity(&reconstructed));
+        assert!(!filename_only_identity(&package));
+
+        let mut renamed_package = filefacts::Identity::default();
+        renamed_package.name = Some(filefacts::Claim::claimed("@bitwarden/sdk", "npm.name"));
+        let changes = meaningful_identity_changes(Some(&package), Some(&renamed_package));
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].label, "package name");
     }
 
     #[test]
