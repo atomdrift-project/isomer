@@ -27,7 +27,7 @@ Use this order of evidence:
 
 A modest patch, same-version repack, or unchanged version has very little behavioral budget. A new executable with several unrelated capability families in that context, especially when delivered through an encrypted or malformed archive, is strong supply-chain evidence even if no single trait is hostile. Do not require a known-bad signature: no signature is evidence of absence of a known rule, not evidence that the change is benign. Descriptions and trait labels are fallible hints; weigh the co-occurring facts and the differential.
 
-The deterministic gate line is a calibration signal. A PASS means the new-side change is below the configured CI threshold; a FAIL means it is already gate-worthy. A PASS is not an absolute veto when direct evidence clearly shows a new backdoor, but do not turn a clean remediation into suspicious merely because the package grew, added ordinary assets/fonts, or retained normal library/network behavior. When remediation evidence says handlers were disabled and an artifact deleted, treat risky statements retained behind those unconditional entry returns as inactive forensic remnants, while still flagging independent live behavior. When it instead says model risk fell sharply while attack behavior was removed, judge the removal direction rather than the old compromised baseline. In particular, when the differential says a previously absent declared entrypoint and a large runtime tree were restored, treat generic capabilities inside that returning tree as baseline restoration—not newly malicious behavior—unless changed code shows a direct implant.
+The deterministic gate line is a calibration signal. A PASS means the new-side change is below the configured CI threshold; a FAIL means it is already gate-worthy. A PASS is not an absolute veto when direct evidence clearly shows a new backdoor, but do not turn a clean remediation into suspicious merely because the package grew, added ordinary assets/fonts, or retained normal library/network behavior. A machine-verified focused remediation means executable analysis found at least two changed handlers with unconditional first-statement returns plus an artifact-deletion routine. In that case classify the transition benign unless the differential shows a separate reachable path around those returns; static traits and dangerous-looking statements retained in the unreachable bodies are inactive forensic residue, not live RCE. When remediation instead says model risk fell sharply while attack behavior was removed, judge the removal direction rather than the old compromised baseline. In particular, when the differential says a previously absent declared entrypoint and a large runtime tree were restored, treat generic capabilities inside that returning tree as baseline restoration—not newly malicious behavior—unless changed code shows a direct implant.
 
 Parsed identity, product, project, title, publisher, signer, and trust fields are context about what a file claims to be. Treat unsigned metadata as a claim, and verified signer fields as stronger provenance—not as proof of safety. A mismatch between the claimed role and the observed new behavior is evidence; a claim such as “compression library” or “game library” does not excuse unrelated execution, persistence, network, or concealment behavior.
 
@@ -110,7 +110,10 @@ pub(crate) fn config(cli: &Cli) -> Option<InterpretConfig> {
         .clone()
         .or_else(|| std::env::var("ISOMER_LLM_MODEL").ok())
         .or_else(|| scan::interpret::discover_model(&base_url, api_key.as_deref()))
-        .unwrap_or_else(|| scan::interpret::DEFAULT_MODEL.to_string());
+        // scan deliberately has no guessed model name: an explicit value or
+        // the endpoint's advertised model is reliable, while a made-up
+        // fallback only converts discovery failure into a server-side 404.
+        .unwrap_or_default();
     let timeout = Duration::from_secs(
         cli.llm_timeout
             .unwrap_or(scan::interpret::DEFAULT_TIMEOUT_SECS),

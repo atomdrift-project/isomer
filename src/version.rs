@@ -87,15 +87,28 @@ impl Version {
                 best = Some(v);
             }
         }
-        best
+        let mut best = best?;
+        if let Some(suffix) = common_prerelease_suffix(name, &best.raw) {
+            best.raw.push_str(suffix);
+        }
+        Some(best)
     }
 
     /// Parse a version claim extracted from artifact metadata. PE resources
     /// commonly spell `4.3.0.0` as `4, 3, 0, 0`; normalize that representation
     /// without accepting arbitrary prose surrounding a number.
     pub(crate) fn from_claim(claim: &str) -> Option<Self> {
-        let parts: Vec<&str> = claim.split(['.', '_', ',']).map(str::trim).collect();
-        Self::from_numeric_parts(&parts)
+        if claim.contains(',') {
+            let parts: Vec<&str> = claim.split(',').map(str::trim).collect();
+            return Self::from_numeric_parts(&parts);
+        }
+        if !claim
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'))
+        {
+            return None;
+        }
+        Self::parse(&claim.replace('_', "."))
     }
 
     /// A version from already-split components, in dot form. Every component
@@ -120,6 +133,9 @@ pub(crate) enum BumpKind {
     Major,
     Minor,
     Patch,
+    /// A change within the same numeric version, such as `1.0.0-rc.1` to
+    /// `1.0.0`. It receives the same tight tolerance as a patch release.
+    Prerelease,
     Same,
     /// The new version is lower — itself a supply-chain red flag.
     Downgrade,
@@ -157,6 +173,24 @@ impl Bump {
                 };
             }
         }
+        fn prerelease(version: &Version) -> Option<&str> {
+            version
+                .raw
+                .split_once('-')
+                .map(|(_, suffix)| suffix.split('+').next().unwrap_or(suffix))
+        }
+        let old_prerelease = prerelease(old);
+        let new_prerelease = prerelease(new);
+        if old_prerelease != new_prerelease {
+            return Bump {
+                kind: if old_prerelease.is_none() {
+                    BumpKind::Downgrade
+                } else {
+                    BumpKind::Prerelease
+                },
+                steps: 0,
+            };
+        }
         Bump {
             kind: BumpKind::Same,
             steps: 0,
@@ -168,6 +202,7 @@ impl Bump {
             BumpKind::Major => "major",
             BumpKind::Minor => "minor",
             BumpKind::Patch => "patch",
+            BumpKind::Prerelease => "prerelease",
             BumpKind::Same => "same",
             BumpKind::Downgrade => "downgrade",
         }
@@ -177,6 +212,7 @@ impl Bump {
     pub(crate) fn describe(self) -> String {
         match self.kind {
             BumpKind::Same => "same version".to_string(),
+            BumpKind::Prerelease => "prerelease transition".to_string(),
             BumpKind::Downgrade => "downgrade".to_string(),
             _ if self.steps > 1 => format!("{} {} releases", self.steps, self.label()),
             _ => format!("{} release", self.label()),
@@ -192,9 +228,46 @@ impl Bump {
         match self.kind {
             BumpKind::Major => Severity::High,
             BumpKind::Minor => Severity::Medium,
-            BumpKind::Patch | BumpKind::Same | BumpKind::Downgrade => Severity::None,
+            BumpKind::Patch | BumpKind::Prerelease | BumpKind::Same | BumpKind::Downgrade => {
+                Severity::None
+            }
         }
     }
+}
+
+/// Preserve common SemVer prerelease suffixes after the numeric token without
+/// mistaking platform tags such as `-linux-x64` for versions. Archive suffixes
+/// are removed first so `-rc.1.tgz` becomes exactly `-rc.1`.
+fn common_prerelease_suffix<'a>(name: &'a str, numeric: &str) -> Option<&'a str> {
+    let stem = [
+        ".tar.gz", ".tar.xz", ".tar.bz2", ".tgz", ".txz", ".tbz2", ".whl", ".zip", ".gz", ".xz",
+        ".sample",
+    ]
+    .iter()
+    .find_map(|extension| name.strip_suffix(extension))
+    .unwrap_or(name);
+    let start = stem.find(numeric)? + numeric.len();
+    let suffix = stem.get(start..)?;
+    let prerelease = suffix.strip_prefix('-')?;
+    if prerelease.is_empty()
+        || !prerelease
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return None;
+    }
+    let mut identifiers = prerelease.split(['.', '-']);
+    let first = identifiers.next()?.to_ascii_lowercase();
+    let second = identifiers.next().map(str::to_ascii_lowercase);
+    let known = |identifier: &str| {
+        matches!(
+            identifier,
+            "alpha" | "beta" | "rc" | "pre" | "preview" | "dev" | "canary" | "next"
+        )
+    };
+    (known(&first)
+        || (first.bytes().all(|byte| byte.is_ascii_digit()) && second.is_some_and(|s| known(&s))))
+    .then_some(suffix)
 }
 
 #[cfg(test)]
@@ -213,12 +286,27 @@ mod tests {
         assert_eq!(classic.raw, "4.3.0");
         assert!(Version::detect("ClassicShellSetup_4__3_0.exe").is_none());
         assert!(Version::detect("index.js").is_none());
+        assert_eq!(
+            Version::detect("keyv-6.0.0-rc.1.tgz").unwrap().raw,
+            "6.0.0-rc.1"
+        );
+        assert_eq!(
+            Version::detect("joyfill-0.1.2-2773.beta.0.tgz")
+                .unwrap()
+                .raw,
+            "0.1.2-2773.beta.0"
+        );
+        assert_eq!(
+            Version::detect("tool-1.2.3-linux-x64.tgz").unwrap().raw,
+            "1.2.3"
+        );
     }
 
     #[test]
     fn parses_numeric_identity_claims_without_accepting_prose() {
         assert_eq!(Version::from_claim("4, 3, 0, 0").unwrap().raw, "4.3.0.0");
         assert_eq!(Version::from_claim("12_0_1").unwrap().raw, "12.0.1");
+        assert_eq!(Version::from_claim("6.0.0-rc.1").unwrap().raw, "6.0.0-rc.1");
         assert!(Version::from_claim("release 4.3.0").is_none());
     }
 
@@ -251,6 +339,9 @@ mod tests {
         let wordpress = Bump::classify(&v("4.4.6.3").unwrap(), &v("4.4.6.4").unwrap());
         assert_eq!(wordpress.kind, BumpKind::Patch);
         assert_eq!(wordpress.describe(), "patch release");
+        let prerelease = Bump::classify(&v("6.0.0-rc.1").unwrap(), &v("6.0.0").unwrap());
+        assert_eq!(prerelease.kind, BumpKind::Prerelease);
+        assert_eq!(prerelease.describe(), "prerelease transition");
         assert_eq!(
             Bump::classify(&v("4.3.0.0").unwrap(), &v("4.3.0").unwrap()).kind,
             BumpKind::Same

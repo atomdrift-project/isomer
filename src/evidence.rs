@@ -8,7 +8,7 @@
 //! evidence is the *delta*: only windows touching a gained trait render, so the
 //! engineer sees what changed, not the whole file.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -103,8 +103,20 @@ pub(crate) struct HunkLine {
     pub is_match: bool,
 }
 
-/// Total hunks collected before ranking — a work cap, not a display cap.
-const HUNK_BUDGET: usize = 120;
+/// How a byte-level note should be presented. Composite rules do not own a
+/// single byte range: cleave records their matched component ids in
+/// `trait_refs`, while the context windows carry notes for those components.
+/// When a gained composite depends on a note, its conclusion is the useful
+/// attribution (and ranking strength) for that window.
+#[derive(Clone, Debug)]
+struct Attribution {
+    id: String,
+    desc: String,
+    severity: Severity,
+    score: f32,
+    /// Break equal-score ties in favor of the more specific composition.
+    legs: usize,
+}
 
 /// Analyze one file. A file that cannot be analyzed costs its own evidence and
 /// nothing else: the verdict already stands on the diff, so this logs and moves
@@ -159,9 +171,6 @@ pub(crate) fn hunks(
             continue;
         };
         file_hunks(pair, &report, gained_ids, &changed, &mut all);
-        if all.len() >= HUNK_BUDGET {
-            break;
-        }
     }
 
     // Match windows merge and trim to a short excerpt around their hit;
@@ -362,18 +371,6 @@ fn file_hunks(
                     .map(|fa| (Some(clean_member(&fa.path)), fa)),
             )
             .collect();
-    // The composite legs a gained trait references, so a gained composite still
-    // renders the component windows that justify it. cleave finding ids are
-    // interned (`Istr`); compare at the `&str` boundary so this holds whether
-    // the field is `String` or `Istr`.
-    let legs: HashSet<&str> = candidates
-        .iter()
-        .flat_map(|(_, fa)| &fa.findings)
-        .filter(|f| gained_ids.contains(f.id.as_str()))
-        .flat_map(|f| f.trait_refs.iter().map(cleave::types::Istr::as_str))
-        .collect();
-    let keep = |id: &str| gained_ids.contains(id) || legs.contains(id);
-
     let container = !report.files.is_empty();
     let old_lines = pair.old.as_deref().and_then(|p| old_line_set(p, container));
 
@@ -387,6 +384,11 @@ fn file_hunks(
         {
             continue;
         }
+        // Promote each component note to the strongest gained composite it
+        // proves. Keep this member-local: a common atom in another changed
+        // member is not evidence for a composite that fired here.
+        let promotions = composite_promotions(fa, gained_ids);
+        let keep = |id: &str| gained_ids.contains(id) || promotions.contains_key(id);
         // Source-additions path: when both sides' text is in reach, the change
         // *is* the added lines — show them whole (matched or not), so an attack
         // whose payload sits a few lines from the trait hit (unrealircd's
@@ -403,13 +405,11 @@ fn file_hunks(
                 &old_src,
                 fa,
                 &keep,
+                &promotions,
                 &pair.label,
                 member.as_deref(),
                 all,
             );
-            if all.len() >= HUNK_BUDGET {
-                return;
-            }
             continue;
         }
 
@@ -417,11 +417,11 @@ fn file_hunks(
         for chunk in &fa.context {
             let kept: Vec<&cleave::types::Note> =
                 chunk.notes.iter().filter(|n| keep(n.id.as_str())).collect();
-            let Some(top) = kept
-                .iter()
-                .copied()
-                .max_by(|a, b| score(a).total_cmp(&score(b)))
-            else {
+            let Some(top) = kept.iter().copied().max_by(|a, b| {
+                attribution(a, &promotions)
+                    .score
+                    .total_cmp(&attribution(b, &promotions).score)
+            }) else {
                 continue;
             };
             // Hex of an archive's raw bytes is compression garbage, and a
@@ -438,15 +438,13 @@ fn file_hunks(
                     first,
                     &kept,
                     top,
+                    &promotions,
                     label,
                     member.as_deref(),
                     old_lines.as_ref(),
                 ),
-                None => binary_hunk(chunk, top, label, member.as_deref()),
+                None => binary_hunk(chunk, top, &promotions, label, member.as_deref()),
             });
-            if all.len() >= HUNK_BUDGET {
-                return;
-            }
         }
     }
 }
@@ -486,6 +484,7 @@ fn addition_hunks(
     old: &[u8],
     fa: &cleave::types::FileAnalysis,
     keep: &impl Fn(&str) -> bool,
+    promotions: &HashMap<&str, Attribution>,
     file: &str,
     member: Option<&str>,
     all: &mut Vec<Hunk>,
@@ -509,7 +508,7 @@ fn addition_hunks(
         let ln = line_at(new, note.off);
         hit.entry(ln)
             .and_modify(|cur| {
-                if score(note) > score(cur) {
+                if attribution(note, promotions).score > attribution(cur, promotions).score {
                     *cur = note;
                 }
             })
@@ -531,10 +530,9 @@ fn addition_hunks(
         if (start..i).all(|k| new_lines[k].trim().is_empty()) {
             continue;
         }
-        all.push(addition_run(&new_lines, start, i, &hit, file, member));
-        if all.len() >= HUNK_BUDGET {
-            return;
-        }
+        all.push(addition_run(
+            &new_lines, start, i, &hit, promotions, file, member,
+        ));
     }
 }
 
@@ -546,6 +544,7 @@ fn addition_run(
     start: usize,
     end: usize,
     hit: &std::collections::HashMap<usize, &cleave::types::Note>,
+    promotions: &HashMap<&str, Attribution>,
     file: &str,
     member: Option<&str>,
 ) -> Hunk {
@@ -556,7 +555,11 @@ fn addition_run(
     // Strongest match anywhere in the run drives the header and tier.
     let top = (start..end)
         .filter_map(|k| hit.get(&(k + 1)).copied())
-        .max_by(|a, b| score(a).total_cmp(&score(b)));
+        .max_by(|a, b| {
+            attribution(a, promotions)
+                .score
+                .total_cmp(&attribution(b, promotions).score)
+        });
 
     let mut lines: Vec<HunkLine> = (start..end.min(start + MAX_RUN_LINES))
         .map(|k| HunkLine {
@@ -581,12 +584,10 @@ fn addition_run(
     // as a titleless block of added lines under the file, so the detected
     // behavior still stands out while the rest of the change stays visible.
     let (severity, score_v, id, desc) = match top {
-        Some(n) => (
-            tier(n.crit),
-            score(n),
-            n.id.as_str().to_string(),
-            desc_of(n),
-        ),
+        Some(n) => {
+            let a = attribution(n, promotions);
+            (a.severity, a.score, a.id, a.desc)
+        }
         None => (Severity::None, 0.0, String::new(), String::new()),
     };
     Hunk {
@@ -611,6 +612,58 @@ fn addition_run(
 /// as certain).
 fn score(n: &cleave::types::Note) -> f32 {
     f32::from(crit_rank(n.crit)) * if n.conf > 0.0 { n.conf } else { 1.0 }
+}
+
+fn finding_score(f: &cleave::types::Finding) -> f32 {
+    f32::from(crit_rank(f.crit)) * if f.conf > 0.0 { f.conf } else { 1.0 }
+}
+
+/// Strongest gained composite that a component note supports, keyed by the
+/// component id. Inherited archive findings are excluded: the originating
+/// member will contribute its own promotion and context.
+fn composite_promotions<'a>(
+    fa: &'a cleave::types::FileAnalysis,
+    gained_ids: &HashSet<&str>,
+) -> HashMap<&'a str, Attribution> {
+    let mut out = HashMap::new();
+    for f in &fa.findings {
+        if f.src.is_some() || !gained_ids.contains(f.id.as_str()) || f.trait_refs.is_empty() {
+            continue;
+        }
+        let candidate = Attribution {
+            id: f.id.as_str().to_string(),
+            desc: if f.desc.is_empty() {
+                "matched composite behavior".to_string()
+            } else {
+                crate::printable(f.desc.as_str())
+            },
+            severity: tier(f.crit),
+            score: finding_score(f),
+            legs: f.trait_refs.len(),
+        };
+        for leg in &f.trait_refs {
+            let slot = out.entry(leg.as_str()).or_insert_with(|| candidate.clone());
+            if (candidate.score, candidate.legs) > (slot.score, slot.legs) {
+                *slot = candidate.clone();
+            }
+        }
+    }
+    out
+}
+
+fn attribution(note: &cleave::types::Note, promotions: &HashMap<&str, Attribution>) -> Attribution {
+    let direct = Attribution {
+        id: note.id.as_str().to_string(),
+        desc: desc_of(note),
+        severity: tier(note.crit),
+        score: score(note),
+        legs: 0,
+    };
+    promotions
+        .get(note.id.as_str())
+        .filter(|p| (p.score, p.legs) > (direct.score, direct.legs))
+        .cloned()
+        .unwrap_or(direct)
 }
 
 fn desc_of(n: &cleave::types::Note) -> String {
@@ -658,10 +711,12 @@ fn text_hunk(
     first_line: u64,
     kept: &[&cleave::types::Note],
     top: &cleave::types::Note,
+    promotions: &HashMap<&str, Attribution>,
     file: &str,
     member: Option<&str>,
     old: Option<&HashSet<String>>,
 ) -> Hunk {
+    let attribution = attribution(top, promotions);
     let spans = line_spans(&chunk.data);
     let delta_of = |off: u64| -> usize {
         usize::try_from(off.saturating_sub(chunk.loc))
@@ -706,11 +761,11 @@ fn text_hunk(
         line: Some(first_line + top_idx as u64),
         loc: top.off,
         location: format!("{}:{}", member.unwrap_or(file), first_line + top_idx as u64),
-        id: top.id.as_str().to_string(),
-        desc: desc_of(top),
-        severity: tier(top.crit),
+        id: attribution.id,
+        desc: attribution.desc,
+        severity: attribution.severity,
         binary: false,
-        score: score(top),
+        score: attribution.score,
         additions: false,
         lines,
         span: Some((first_line, first_line + spans.len() as u64 - 1)),
@@ -724,9 +779,11 @@ fn text_hunk(
 fn binary_hunk(
     chunk: &cleave::types::ContextLine,
     top: &cleave::types::Note,
+    promotions: &HashMap<&str, Attribution>,
     file: &str,
     member: Option<&str>,
 ) -> Hunk {
+    let attribution = attribution(top, promotions);
     const STRIDE: usize = 16;
     const ROWS: usize = 2;
     let delta = usize::try_from(top.off.saturating_sub(chunk.loc))
@@ -749,11 +806,11 @@ fn binary_hunk(
         line: None,
         loc: top.off,
         location: member.unwrap_or(file).to_string(),
-        id: top.id.as_str().to_string(),
-        desc: desc_of(top),
-        severity: tier(top.crit),
+        id: attribution.id,
+        desc: attribution.desc,
+        severity: attribution.severity,
         binary: true,
-        score: score(top),
+        score: attribution.score,
         additions: false,
         lines,
         span: None,
@@ -1094,6 +1151,31 @@ fn manifest_runtime_entrypoints(report: &cleave::AnalysisReport) -> HashSet<Stri
         })
         .collect();
 
+    // Node resolves a package with no `main`/`exports` declaration to a
+    // sibling `index.*`. Filefacts emits explicit manifest references, but
+    // there is no literal path to emit for this default. Add it only for an
+    // actual package.json with no declared local target and only when the
+    // resolved member exists in the analyzed archive.
+    entrypoints.extend(report.files.iter().filter_map(|file| {
+        if !file.path.ends_with("package.json") {
+            return None;
+        }
+        let has_declared_entrypoint = file.filefacts.iter().any(|facts| {
+            facts.references.iter().any(|reference| {
+                matches!(reference.kind, filefacts::RefKind::Local)
+                    && reference.source.starts_with("package.json:")
+            })
+        });
+        if has_declared_entrypoint {
+            return None;
+        }
+        default_npm_runtime_entrypoint(&file.path, &paths).map(|path| {
+            path.split_once("!!")
+                .map_or(path, |(_, member)| member)
+                .to_string()
+        })
+    }));
+
     // Some ecosystems declare identity directly in the runtime file instead
     // of a separate manifest: WordPress plugin headers are the common case,
     // but this is deliberately format-neutral. A source member that carries
@@ -1110,6 +1192,13 @@ fn manifest_runtime_entrypoints(report: &cleave::AnalysisReport) -> HashSet<Stri
         })
     }));
     entrypoints
+}
+
+fn default_npm_runtime_entrypoint<'a>(
+    manifest_path: &str,
+    paths: &HashSet<&'a str>,
+) -> Option<&'a str> {
+    resolve_report_local_target(manifest_path, "index", paths)
 }
 
 /// Resolve one manifest-local path against the files Cleave actually emitted.
@@ -1171,6 +1260,96 @@ fn ids(field: Option<&str>) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Composite conclusions have no single context note of their own. Their
+    /// component windows must nevertheless rank and read as evidence for the
+    /// gained conclusion, or a generic notable atom can hide a hostile result.
+    #[test]
+    fn composite_conclusion_promotes_its_component_evidence() {
+        use cleave::Criticality;
+
+        let component_id = "micro-behaviors/process/create/agent::unattended";
+        let composite_id = "objectives/impact/destroy::agent-directed";
+        let file = cleave::types::FileAnalysis {
+            findings: vec![cleave::types::Finding {
+                id: composite_id.into(),
+                desc: "Unattended agent receives destructive goal".into(),
+                conf: 0.99,
+                crit: Criticality::Hostile,
+                trait_refs: vec![
+                    component_id.into(),
+                    "objectives/impact/destroy::goal".into(),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let gained = HashSet::from([composite_id]);
+        let promotions = composite_promotions(&file, &gained);
+        let note = cleave::types::Note {
+            crit: Criticality::Component,
+            id: component_id.into(),
+            desc: "unattended flag".into(),
+            off: 42,
+            len: 12,
+            conf: 0.98,
+        };
+
+        let promoted = attribution(&note, &promotions);
+        assert_eq!(promoted.id, composite_id);
+        assert_eq!(promoted.severity, Severity::Critical);
+        assert_eq!(promoted.desc, "Unattended agent receives destructive goal");
+        assert!(promoted.score > score(&note));
+    }
+
+    /// Collection must inspect the whole change. Presentation applies its own
+    /// ranked cap later; stopping after an arbitrary number of early additions
+    /// can hide a stronger payload near the end of a generated source file.
+    #[test]
+    fn evidence_collection_reaches_late_matches() {
+        use cleave::Criticality;
+
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 0..130 {
+            old.push_str(&format!("keep-{i}\n"));
+            new.push_str(&format!("keep-{i}\nadded-{i}\n"));
+        }
+        let target = "added-129";
+        let off = new.find(target).expect("late added line") as u64;
+        let file = cleave::types::FileAnalysis {
+            context: vec![cleave::types::ContextLine {
+                loc: off,
+                line: Some(260),
+                col: Some(1),
+                data: target.as_bytes().to_vec(),
+                notes: vec![cleave::types::Note {
+                    crit: Criticality::Hostile,
+                    id: "objectives/impact/destroy::late".into(),
+                    desc: "late destructive behavior".into(),
+                    off,
+                    len: target.len() as u32,
+                    conf: 1.0,
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut hunks = Vec::new();
+        addition_hunks(
+            new.as_bytes(),
+            old.as_bytes(),
+            &file,
+            &|_| true,
+            &HashMap::new(),
+            "generated.js",
+            None,
+            &mut hunks,
+        );
+
+        assert_eq!(hunks.len(), 130);
+        assert_eq!(hunks.last().map(|h| h.severity), Some(Severity::Critical));
+        assert_eq!(hunks.last().map(|h| h.line), Some(Some(260)));
+    }
+
     /// Traits write ATT&CK and MBC annotations as free text, so the parser
     /// meets every shape the corpus actually contains — a bare id, a quoted
     /// comma list with spaces, a comma list without, an empty field — and
@@ -1210,5 +1389,24 @@ mod tests {
         };
         assert!(!same.changed());
         assert!(same.gained().is_empty());
+    }
+
+    #[test]
+    fn npm_default_entrypoint_resolves_only_an_existing_sibling_index() {
+        let paths = HashSet::from([
+            "package/package.json",
+            "package/index.js",
+            "package/lib/index.js",
+        ]);
+        assert_eq!(
+            default_npm_runtime_entrypoint("package/package.json", &paths),
+            Some("package/index.js")
+        );
+
+        let no_index = HashSet::from(["package/package.json", "package/main.js"]);
+        assert_eq!(
+            default_npm_runtime_entrypoint("package/package.json", &no_index),
+            None
+        );
     }
 }

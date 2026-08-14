@@ -761,6 +761,16 @@ impl<'a> Analysis<'a> {
         if dependency_with_fallback_load(&self.assessment, &self.judged_diff) {
             return "added dependency alongside fallback module load".to_string();
         }
+        if let Some(expansion) = dependency_backed_public_api_anomaly(
+            self.display_diff(),
+            self.naming.bump,
+            &self.survey.runtime_entrypoints,
+        ) {
+            return format!(
+                "patch-level public API expansion pulls floating dependency {}",
+                expansion.dependency
+            );
+        }
         if obfuscated_remote_script_loader(self.display_diff()) {
             return "gained obfuscated remote browser script loader".to_string();
         }
@@ -908,6 +918,18 @@ impl<'a> Analysis<'a> {
                 display_member_path(&graft.entrypoint),
                 display_member_path(&graft.payload),
                 graft.timestamp_spread,
+            ));
+        }
+        if let Some(expansion) = dependency_backed_public_api_anomaly(
+            d,
+            self.naming.bump,
+            &self.survey.runtime_entrypoints,
+        ) {
+            lines.push(format!(
+                "dependency-backed API expansion: {} adds {} ({}) to its public surface",
+                display_member_path(&expansion.entrypoint),
+                expansion.dependency,
+                expansion.spec,
             ));
         }
         for dependency in &self.deps {
@@ -1205,7 +1227,16 @@ impl<'a> Analysis<'a> {
         if let Some(r) = self.risk {
             let _ = writeln!(s, "ml_malware_probability: {:.2} -> {:.2}", r.old, r.new);
         }
-        if let Some(n) = prop.drift.note() {
+        // Proportionality is an attack prior only for a capability gain. Once
+        // executable analysis has proved a focused cleanup, repeating the raw
+        // "disproportionate gain" conclusion contradicts the stronger
+        // direction-of-change evidence and predictably misleads small models.
+        if self.remediation == Some(Remediation::FocusedCleanup) {
+            let _ = writeln!(
+                s,
+                "transition: machine-verified focused remediation (proportionality escalation suppressed)"
+            );
+        } else if let Some(n) = prop.drift.note() {
             let _ = writeln!(s, "proportionality: {n}");
         }
         if let Some(n) = &prop.skew {
@@ -1223,6 +1254,11 @@ impl<'a> Analysis<'a> {
             "deterministic gate is {} before any model opinion; a passing gate is not a veto, but package size, ordinary assets, or generic library behavior alone are not grounds to override it.",
             if self.clean { "PASS" } else { "FAIL" }
         );
+        if self.remediation == Some(Remediation::FocusedCleanup) {
+            s.push_str(
+                "focused-remediation proof: at least two changed handlers now have an unconditional return as their first statement, and a new cleanup routine deletes the named attack artifact. Static traits retained below those returns are inactive forensic residue. Classify the transition direction; infer live execution only from a separate reachable path shown in the differential.\n",
+            );
+        }
         let identities = self.identity_summary();
         if !identities.is_empty() {
             s.push_str("\nCLAIMED IDENTITY (context, not proof):\n");
@@ -1439,7 +1475,7 @@ impl<'a> Analysis<'a> {
 
         // The proof hunks and the full identity claims — everything the UI and
         // the CLI cache need to redraw without re-reading the artifact.
-        let hunks = self.hunks(EVIDENCE_JSON_CAP);
+        let hunks = self.hunks(usize::MAX);
         let evidence = hunks
             .iter()
             .map(|h| j::Ev {
@@ -1562,10 +1598,6 @@ impl<'a> Analysis<'a> {
         Ok(serde_json::to_string(&envelope)?)
     }
 }
-
-/// Evidence hunks to embed in `--format json`. Higher than the terminal's
-/// display cap: the JSON is a complete, cacheable record, not a screenful.
-const EVIDENCE_JSON_CAP: usize = 24;
 
 /// Convert Cleave's complete judged differential into a compact, stable
 /// feature record. This intentionally has no display cap: terminal rendering
@@ -2068,6 +2100,46 @@ fn normalized_archive_diff(diff: &DiffReportV1) -> Cow<'_, DiffReportV1> {
             aliases.push((*old, *new));
         }
     }
+
+    // Python source distributions commonly keep importable packages beneath
+    // `name-version/src/`, while wheels place the same package directly at the
+    // archive root. Pair only an exact suffix match across those two layouts.
+    // Requiring one unambiguous removed/added pair, with exactly one `src/`
+    // side, avoids turning arbitrary moves between directories into updates.
+    let already_aliased: BTreeSet<&str> = aliases
+        .iter()
+        .flat_map(|(old, new)| [old.path.as_str(), new.path.as_str()])
+        .collect();
+    let mut python_groups: BTreeMap<String, Vec<(&FileDiffEntry, bool)>> = BTreeMap::new();
+    for file in &diff.files {
+        if already_aliased.contains(file.path.as_str())
+            || !matches!(file.status, FileStatus::Removed | FileStatus::Added)
+        {
+            continue;
+        }
+        if let Some((sdist_src, suffix)) = python_distribution_member_key(&file.path) {
+            python_groups
+                .entry(suffix)
+                .or_default()
+                .push((file, sdist_src));
+        }
+    }
+    for candidates in python_groups.values() {
+        let removed: Vec<_> = candidates
+            .iter()
+            .filter(|(file, _)| file.status == FileStatus::Removed)
+            .collect();
+        let added: Vec<_> = candidates
+            .iter()
+            .filter(|(file, _)| file.status == FileStatus::Added)
+            .collect();
+        if let ([(old, old_sdist_src)], [(new, new_sdist_src)]) =
+            (removed.as_slice(), added.as_slice())
+            && old_sdist_src != new_sdist_src
+        {
+            aliases.push((*old, *new));
+        }
+    }
     if aliases.is_empty() {
         return Cow::Borrowed(diff);
     }
@@ -2126,6 +2198,23 @@ fn npm_snapshot_member_key(path: &str) -> Option<(bool, String)> {
         return Some((true, suffix.to_ascii_lowercase()));
     }
     Version::detect(root).map(|_| (false, suffix.to_ascii_lowercase()))
+}
+
+/// Return an import-path key and whether it came from a versioned sdist's
+/// conventional `src/` tree. Flat archive members are candidates only; they
+/// can pair solely with an exact key from the sdist layout in the caller.
+fn python_distribution_member_key(path: &str) -> Option<(bool, String)> {
+    let member = path.rsplit("!!").next()?;
+    let (root, suffix) = member.split_once('/')?;
+    if Version::detect(root).is_some() {
+        return suffix
+            .strip_prefix("src/")
+            .map(|suffix| (true, suffix.to_ascii_lowercase()));
+    }
+    if root.ends_with(".dist-info") || root.ends_with(".egg-info") {
+        return None;
+    }
+    Some((false, member.to_ascii_lowercase()))
 }
 
 /// Whether any of the six scopes recorded an addition, removal, or change.
@@ -2674,6 +2763,8 @@ fn change_shape_escalation(
     // Keep the size bound so a large, ordinary framework rewrite does not trip
     // merely because it also reorganized imports.
     let dependency_with_fallback_load = dependency_with_fallback_load(a, diff);
+    let dependency_backed_api =
+        dependency_backed_public_api_anomaly(diff, bump, runtime_entrypoints).is_some();
     // A remote browser loader, whether its destination is a literal host or is
     // assembled from character codes, is much stronger than any component
     // atomic. Require complete convergence on one file and use it as release-
@@ -2681,8 +2772,10 @@ fn change_shape_escalation(
     // framework can legitimately add a loader, but a patch has almost no
     // budget for a new remote-code path.
     let remote_script_loader = bump.is_some_and(|b| {
-        matches!(b.kind, BumpKind::Same | BumpKind::Patch)
-            && (obfuscated_remote_script_loader(diff) || external_remote_script_loader(diff))
+        matches!(
+            b.kind,
+            BumpKind::Same | BumpKind::Patch | BumpKind::Prerelease
+        ) && (obfuscated_remote_script_loader(diff) || external_remote_script_loader(diff))
     });
     // A newly added encrypted ZIP disguised as another resource format is a
     // compact payload-delivery clue. Keep the differential rule narrow: it
@@ -2870,6 +2963,7 @@ fn change_shape_escalation(
         || cross_domain_cluster
         || endgame
         || dependency_with_fallback_load
+        || dependency_backed_api
         || remote_script_loader
         || added_encrypted_payload_archive
         || same_version_archive_replacement
@@ -2988,8 +3082,12 @@ fn opaque_runtime_payload_anomaly(
     bump: Option<Bump>,
     runtime_entrypoints: &HashSet<String>,
 ) -> Option<OpaqueRuntimePayloadAnomaly> {
-    if !bump.is_some_and(|b| matches!(b.kind, BumpKind::Same | BumpKind::Patch))
-        || !compact_change(&diff.summary)
+    if !bump.is_some_and(|b| {
+        matches!(
+            b.kind,
+            BumpKind::Same | BumpKind::Patch | BumpKind::Prerelease
+        )
+    }) || !compact_change(&diff.summary)
         || diff.summary.overall_roc < 0.30
         || root_size_growth(diff).is_none_or(|growth| growth < 0.50)
     {
@@ -3148,8 +3246,12 @@ fn runtime_graft_anomaly(
     bump: Option<Bump>,
     runtime_entrypoints: &HashSet<String>,
 ) -> Option<RuntimeGraftAnomaly> {
-    if !bump.is_some_and(|b| matches!(b.kind, BumpKind::Same | BumpKind::Patch))
-        || !compact_change(&diff.summary)
+    if !bump.is_some_and(|b| {
+        matches!(
+            b.kind,
+            BumpKind::Same | BumpKind::Patch | BumpKind::Prerelease
+        )
+    }) || !compact_change(&diff.summary)
         || diff.summary.overall_roc < 0.30
     {
         return None;
@@ -3288,6 +3390,124 @@ fn dependency_with_fallback_load(a: &Assessment, diff: &DiffReportV1) -> bool {
         && summary.overall_roc <= 0.25
 }
 
+#[derive(Debug)]
+struct DependencyApiExpansion {
+    dependency: String,
+    spec: String,
+    entrypoint: String,
+}
+
+/// Detect a patch-level public API expansion backed by newly trusted,
+/// floating pre-1.0 code. Each ingredient is common on its own; their join is
+/// the supply-chain boundary change: the package both pulls a mutable young
+/// dependency and exposes it through its declared runtime entrypoint.
+fn dependency_backed_public_api_anomaly(
+    diff: &DiffReportV1,
+    bump: Option<Bump>,
+    runtime_entrypoints: &HashSet<String>,
+) -> Option<DependencyApiExpansion> {
+    if !bump.is_some_and(|b| {
+        matches!(
+            b.kind,
+            BumpKind::Same | BumpKind::Patch | BumpKind::Prerelease
+        )
+    }) || !compact_change(&diff.summary)
+    {
+        return None;
+    }
+
+    let dependencies = diff.files.iter().flat_map(|file| {
+        file.scopes
+            .kv
+            .as_ref()
+            .into_iter()
+            .flat_map(|facts| &facts.added)
+            .filter_map(|fact| {
+                // Peer dependencies describe a compatibility contract rather
+                // than code this package newly installs itself.
+                if fact.path.starts_with("peerDependencies.") {
+                    return None;
+                }
+                let name = crate::rubric::dependency_name(&fact.path)?;
+                let spec = fact.value.as_str()?;
+                floating_pre_one_spec(spec).then(|| (name.to_string(), spec.to_string()))
+            })
+    });
+
+    for (dependency, spec) in dependencies {
+        let normalized_dependency = normalize_api_name(&dependency);
+        let meaningful_tokens: HashSet<String> = dependency
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .map(str::to_ascii_lowercase)
+            .filter(|token| {
+                token.len() >= 3
+                    && !matches!(
+                        token.as_str(),
+                        "api" | "core" | "js" | "lib" | "node" | "plugin" | "sdk" | "stream"
+                    )
+            })
+            .collect();
+        if meaningful_tokens.is_empty() {
+            continue;
+        }
+
+        for entrypoint in diff.files.iter().filter(|file| {
+            matches!(file.status, FileStatus::Added | FileStatus::Changed)
+                && runtime_entrypoints.contains(display_member_path(&file.path))
+        }) {
+            let Some(symbols) = entrypoint.scopes.symbols.as_ref() else {
+                continue;
+            };
+            let added: Vec<&str> = symbols
+                .added
+                .iter()
+                .map(|symbol| symbol.symbol.as_str())
+                .collect();
+            let imports_dependency = added
+                .iter()
+                .any(|symbol| normalize_api_name(symbol) == normalized_dependency);
+            let exposes_matching_member = added.iter().any(|symbol| {
+                let Some((_, member)) = symbol.rsplit_once('.') else {
+                    return false;
+                };
+                meaningful_tokens.contains(&normalize_api_name(member))
+            });
+            if imports_dependency && exposes_matching_member {
+                return Some(DependencyApiExpansion {
+                    dependency,
+                    spec,
+                    entrypoint: entrypoint.path.clone(),
+                });
+            }
+        }
+    }
+    None
+}
+
+fn normalize_api_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn floating_pre_one_spec(spec: &str) -> bool {
+    let spec = spec.trim();
+    let floating = spec.starts_with(['^', '~', '>', '<', '*'])
+        || spec.eq_ignore_ascii_case("latest")
+        || spec.split('.').any(|part| matches!(part, "x" | "X" | "*"));
+    if !floating {
+        return false;
+    }
+    let numeric = spec
+        .trim_start_matches(['^', '~', '>', '<', '=', ' '])
+        .trim_start_matches('v');
+    numeric.starts_with("0.")
+        || numeric == "0"
+        || numeric.starts_with('*')
+        || spec.eq_ignore_ascii_case("latest")
+}
+
 /// Whether one added-or-changed file gained *every* one of `suffixes` as a new
 /// trait. Keeping the join file-local is the point: unrelated helpers scattered
 /// across a normal web application must not add up to a loader.
@@ -3377,7 +3597,7 @@ fn executable_capability_escalation(diff: &DiffReportV1, bump: Option<Bump>) -> 
     }
     let package_context = package_payload_context(diff);
     let release_pressure = bump.map_or(0, |b| match b.kind {
-        BumpKind::Same | BumpKind::Patch | BumpKind::Downgrade => 2,
+        BumpKind::Same | BumpKind::Patch | BumpKind::Prerelease | BumpKind::Downgrade => 2,
         BumpKind::Minor => 1,
         BumpKind::Major => 0,
     });
@@ -3759,10 +3979,13 @@ fn normalized_member_path(path: &str) -> String {
             let Some((root, suffix)) = member.split_once('/') else {
                 return member.to_string();
             };
-            let Some(version) = Version::detect(root) else {
+            let root = if let Some(version) = Version::detect(root) {
+                clean_name(root, Some(&version))
+            } else if let Some(root) = git_snapshot_root(root) {
+                root.to_string()
+            } else {
                 return member.to_string();
             };
-            let root = clean_name(root, Some(&version));
             if root.is_empty() {
                 member.to_string()
             } else {
@@ -3771,6 +3994,21 @@ fn normalized_member_path(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("!!")
+}
+
+/// Strip the abbreviated/full commit suffix used by Git hosting source
+/// snapshots (`project-deadbee/…`). Requiring a normal Git hash length and at
+/// least one hex letter avoids treating ordinary numeric directory suffixes as
+/// commits; version-bearing roots are handled separately above.
+fn git_snapshot_root(root: &str) -> Option<&str> {
+    let (name, commit) = root.rsplit_once('-')?;
+    (name.len() > 0
+        && (7..=40).contains(&commit.len())
+        && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && commit
+            .bytes()
+            .any(|byte| matches!(byte.to_ascii_lowercase(), b'a'..=b'f')))
+    .then_some(name)
 }
 
 /// A diff path as the reader sees it: the archive member alone, with the
@@ -4199,12 +4437,13 @@ mod tests {
     use super::{
         CapabilityShape, add_capability_text, attack_behavior_removed, binary_replacement_anomaly,
         capability_shape_score, changed_identity_claims, changed_test_carrier, clean_name,
-        endgame_package_shape, executable_member_layout, external_remote_script_loader,
-        identity_claim_fields, immediate_entry_return_count, is_compiled_binary_file_type,
-        is_source_archive, line_diff, metric_change_importance, normalized_archive_diff,
-        normalized_member_path, npm_snapshot_member_key, numeric_delta,
-        obfuscated_remote_script_loader, opaque_runtime_payload_anomaly, removed_high_risk_traits,
-        restored_endgame_package_shape, runtime_graft_anomaly, source_build_macro_score,
+        dependency_backed_public_api_anomaly, endgame_package_shape, executable_member_layout,
+        external_remote_script_loader, identity_claim_fields, immediate_entry_return_count,
+        is_compiled_binary_file_type, is_source_archive, line_diff, metric_change_importance,
+        normalized_archive_diff, normalized_member_path, npm_snapshot_member_key, numeric_delta,
+        obfuscated_remote_script_loader, opaque_runtime_payload_anomaly,
+        python_distribution_member_key, removed_high_risk_traits, restored_endgame_package_shape,
+        runtime_graft_anomaly, source_build_macro_score,
     };
     use crate::Severity;
     use crate::version::{Bump, BumpKind, Version};
@@ -4231,6 +4470,86 @@ mod tests {
             }
         "#;
         assert_eq!(immediate_entry_return_count(source), 1);
+    }
+
+    #[test]
+    fn patch_public_api_expansion_requires_floating_young_dependency() {
+        let package = FileDiffEntry {
+            path: "<root>!!package/package.json".to_string(),
+            file_type: Some("package.json".to_string()),
+            status: FileStatus::Changed,
+            identity: None,
+            scopes: ScopeDiffs {
+                kv: Some(ScopeDiff {
+                    added: vec![KvChange {
+                        path: "dependencies.flatmap-stream".to_string(),
+                        namespace: "dependencies".to_string(),
+                        value: serde_json::Value::String("^0.1.0".to_string()),
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            old_formula: None,
+            new_formula: None,
+        };
+        let entrypoint = FileDiffEntry {
+            path: "<root>!!package/index.js".to_string(),
+            file_type: Some("javascript".to_string()),
+            status: FileStatus::Changed,
+            identity: None,
+            scopes: ScopeDiffs {
+                symbols: Some(ScopeDiff {
+                    added: vec![
+                        SymbolChange {
+                            symbol: "flatmap-stream".to_string(),
+                            ..Default::default()
+                        },
+                        SymbolChange {
+                            symbol: "exports.flatmap".to_string(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            old_formula: None,
+            new_formula: None,
+        };
+        let report = |spec: &str| {
+            let mut package = package.clone();
+            package.scopes.kv.as_mut().unwrap().added[0].value =
+                serde_json::Value::String(spec.to_string());
+            DiffReportV1 {
+                old_root: "old.tgz".to_string(),
+                new_root: "new.tgz".to_string(),
+                summary: DiffSummary {
+                    files_changed: 2,
+                    ..Default::default()
+                },
+                scopes: ScopeDiffs::default(),
+                files: vec![package, entrypoint.clone()],
+            }
+        };
+        let patch = Some(Bump {
+            kind: BumpKind::Patch,
+            steps: 1,
+        });
+        let minor = Some(Bump {
+            kind: BumpKind::Minor,
+            steps: 1,
+        });
+        let entrypoints = HashSet::from(["package/index.js".to_string()]);
+        assert!(
+            dependency_backed_public_api_anomaly(&report("^0.1.0"), patch, &entrypoints).is_some()
+        );
+        assert!(
+            dependency_backed_public_api_anomaly(&report("0.1.0"), patch, &entrypoints).is_none()
+        );
+        assert!(
+            dependency_backed_public_api_anomaly(&report("^0.1.0"), minor, &entrypoints).is_none()
+        );
     }
 
     #[test]
@@ -4877,6 +5196,18 @@ mod tests {
             normalized_member_path("<root>!!outer-1.0/plugins/payload.zip!!inner-2.0/bin/run"),
             "<root>!!outer/plugins/payload.zip!!inner/bin/run"
         );
+        assert_eq!(
+            normalized_member_path("<root>!!bfunky-http-parser-0cdd2ea/src/Parser.php"),
+            "<root>!!bfunky-http-parser/src/Parser.php"
+        );
+        assert_eq!(
+            normalized_member_path("<root>!!bfunky-http-parser-0e52069/src/Parser.php"),
+            "<root>!!bfunky-http-parser/src/Parser.php"
+        );
+        assert_eq!(
+            normalized_member_path("<root>!!release-1234567/src/Parser.php"),
+            "<root>!!release-1234567/src/Parser.php"
+        );
     }
 
     #[test]
@@ -4986,6 +5317,55 @@ mod tests {
             Some((true, "bin/tool".to_string()))
         );
         assert_eq!(npm_snapshot_member_key("<root>!!foo/bin/tool"), None);
+    }
+
+    #[test]
+    fn python_sdist_src_pairs_with_flat_wheel_package() {
+        let old = FileDiffEntry {
+            path: "<root>!!telnyx/_client.py".to_string(),
+            file_type: Some("python".to_string()),
+            status: FileStatus::Removed,
+            identity: None,
+            scopes: ScopeDiffs::default(),
+            old_formula: Some("clean".to_string()),
+            new_formula: None,
+        };
+        let new = FileDiffEntry {
+            path: "<root>!!telnyx-4.87.1/src/telnyx/_client.py".to_string(),
+            file_type: Some("python".to_string()),
+            status: FileStatus::Added,
+            identity: None,
+            scopes: ScopeDiffs::default(),
+            old_formula: None,
+            new_formula: Some("payload".to_string()),
+        };
+        let raw = DiffReportV1 {
+            old_root: "telnyx-4.87.0-py3-none-any.whl".to_string(),
+            new_root: "telnyx-4.87.1.tar.gz".to_string(),
+            summary: Default::default(),
+            scopes: Default::default(),
+            files: vec![old, new],
+        };
+        let judged = normalized_archive_diff(&raw);
+        assert_eq!(judged.files.len(), 1);
+        // The synthetic entries carry no scope deltas, so the merged status is
+        // unchanged; the formulas prove the two archive members were paired.
+        assert_eq!(judged.files[0].status, FileStatus::Unchanged);
+        assert_eq!(judged.files[0].old_formula.as_deref(), Some("clean"));
+        assert_eq!(judged.files[0].new_formula.as_deref(), Some("payload"));
+
+        assert_eq!(
+            python_distribution_member_key("<root>!!telnyx-4.87.1/src/telnyx/_client.py"),
+            Some((true, "telnyx/_client.py".to_string()))
+        );
+        assert_eq!(
+            python_distribution_member_key("<root>!!telnyx/_client.py"),
+            Some((false, "telnyx/_client.py".to_string()))
+        );
+        assert_eq!(
+            python_distribution_member_key("<root>!!telnyx-4.87.0.dist-info/METADATA"),
+            None
+        );
     }
 
     #[test]

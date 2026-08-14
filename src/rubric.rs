@@ -586,7 +586,7 @@ fn is_rwx(perms: &Option<String>) -> bool {
 /// `optionalDependencies.foo` → `foo`. Build-time trees (`devDependencies`)
 /// and non-manifest paths return `None` — a dev dependency does not ship in
 /// the installed package, so it is not the runtime supply-chain surface.
-fn dependency_name(path: &str) -> Option<&str> {
+pub(crate) fn dependency_name(path: &str) -> Option<&str> {
     [
         "dependencies.",
         "optionalDependencies.",
