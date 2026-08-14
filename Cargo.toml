@@ -82,6 +82,14 @@ map_err_ignore = "warn"
 significant_drop_in_scrutinee = "warn"
 significant_drop_tightening = "warn"
 
+# The debug binary's unwind tables outgrew the 16MB Mach-O `__eh_frame` limit,
+# so ld fell back to the long-form encoding and warned on every build. isomer
+# never unwinds by design — errors are `Result`, a panic is a bug — so aborting
+# drops the tables and the warning with them. Cargo ignores `panic` for the test
+# profile, so `cargo test` still unwinds and reports failures one at a time.
+[profile.dev]
+panic = "abort"
+
 # Thin LTO + cu=16 keeps most of fat LTO's runtime gain at roughly a third of
 # the link time — the right default for everyday `cargo build --release`.
 [profile.release]
