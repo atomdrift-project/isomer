@@ -657,6 +657,15 @@ impl<'a> Analysis<'a> {
         // the basename, so it can't be matched to the pair by path — but there
         // is only one pair, so the lone changed entry is unambiguously its.
         let single = self.pairs.len() == 1;
+        if single
+            && self
+                .judged_diff
+                .files
+                .iter()
+                .any(|file| file.path.contains("!!"))
+        {
+            return self.collect_archive_source_changes(&self.pairs[0]);
+        }
         let mut out = Vec::new();
         for pair in &self.pairs {
             let (Some(old), Some(new)) = (pair.old.as_deref(), pair.new.as_deref()) else {
@@ -696,6 +705,58 @@ impl<'a> Analysis<'a> {
             };
             out.push(SourceChange {
                 label: pair.label.clone(),
+                atoms: trait_atoms(entry),
+                diff: line_diff(&old_bytes, &new_bytes),
+            });
+        }
+        out
+    }
+
+    fn collect_archive_source_changes(&self, pair: &Pair) -> Vec<SourceChange> {
+        let (Some(old_archive), Some(new_archive)) = (pair.old.as_deref(), pair.new.as_deref())
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in
+            self.judged_diff.files.iter().filter(|entry| {
+                matches!(entry.status, FileStatus::Changed)
+                    && member_type(entry).is_some_and(|file_type| file_type.is_source_code())
+                    && entry.scopes.traits.as_ref().is_some_and(|traits| {
+                        !traits.added.is_empty() || !traits.removed.is_empty()
+                    })
+            })
+        {
+            let Some(old_member) = archive_member_for_side(self.diff, entry, true) else {
+                continue;
+            };
+            let Some(new_member) = archive_member_for_side(self.diff, entry, false) else {
+                continue;
+            };
+            let old_bytes = match extract_archive_member(old_archive, old_member) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
+                Err(error) => {
+                    eprintln!(
+                        "isomer: could not extract {old_member} from {}: {error:#}",
+                        old_archive.display()
+                    );
+                    continue;
+                }
+            };
+            let new_bytes = match extract_archive_member(new_archive, new_member) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
+                Err(error) => {
+                    eprintln!(
+                        "isomer: could not extract {new_member} from {}: {error:#}",
+                        new_archive.display()
+                    );
+                    continue;
+                }
+            };
+            out.push(SourceChange {
+                label: display_member_path(&entry.path).to_string(),
                 atoms: trait_atoms(entry),
                 diff: line_diff(&old_bytes, &new_bytes),
             });
@@ -769,6 +830,16 @@ impl<'a> Analysis<'a> {
             return format!(
                 "patch-level public API expansion pulls floating dependency {}",
                 expansion.dependency
+            );
+        }
+        if let Some(chain) = source_download_write_execute_anomaly(
+            self.display_diff(),
+            self.naming.bump,
+            &self.survey.runtime_entrypoints,
+        ) {
+            return format!(
+                "auto-loaded source downloads, writes, and executes a payload in {}",
+                display_member_path(&chain.file)
             );
         }
         if obfuscated_remote_script_loader(self.display_diff()) {
@@ -930,6 +1001,16 @@ impl<'a> Analysis<'a> {
                 display_member_path(&expansion.entrypoint),
                 expansion.dependency,
                 expansion.spec,
+            ));
+        }
+        if let Some(chain) = source_download_write_execute_anomaly(
+            d,
+            self.naming.bump,
+            &self.survey.runtime_entrypoints,
+        ) {
+            lines.push(format!(
+                "source execution chain: {} gained platform-gated HTTP download → file write → process launch",
+                display_member_path(&chain.file),
             ));
         }
         for dependency in &self.deps {
@@ -1597,6 +1678,71 @@ impl<'a> Analysis<'a> {
         };
         Ok(serde_json::to_string(&envelope)?)
     }
+}
+
+/// Resolve a normalized changed member back to the raw archive path for one
+/// side. Version-root normalization can merge a raw Removed+Added pair into a
+/// Changed entry, so extraction must recover each side's literal member name.
+fn archive_member_for_side<'a>(
+    raw: &'a DiffReportV1,
+    normalized: &FileDiffEntry,
+    old: bool,
+) -> Option<&'a str> {
+    let key = normalized_member_path(&normalized.path);
+    let candidates: Vec<&str> = raw
+        .files
+        .iter()
+        .filter(|entry| normalized_member_path(&entry.path) == key)
+        .filter(|entry| {
+            if old {
+                matches!(
+                    entry.status,
+                    FileStatus::Removed | FileStatus::Changed | FileStatus::Unchanged
+                )
+            } else {
+                matches!(
+                    entry.status,
+                    FileStatus::Added | FileStatus::Changed | FileStatus::Unchanged
+                )
+            }
+        })
+        .filter_map(|entry| entry.path.split_once("!!").map(|(_, member)| member))
+        .filter(|member| !member.contains('!'))
+        .collect();
+    match candidates.as_slice() {
+        [member] => Some(*member),
+        _ => None,
+    }
+}
+
+fn extract_archive_member(archive: &Path, canonical_member: &str) -> Result<Option<Vec<u8>>> {
+    for candidate in archive_member_candidates(archive, canonical_member) {
+        if let Some(bytes) = cleave::extract_member(archive, &candidate)? {
+            return Ok(Some(bytes));
+        }
+    }
+    Ok(None)
+}
+
+/// Candidate literal member paths for Cleave's canonicalized archive path.
+/// Source distributions conventionally change `name-version/` between
+/// releases; Cleave reports the stable `name/` path, while extraction needs
+/// the original root. The archive filename supplies the exact version token.
+fn archive_member_candidates(archive: &Path, canonical_member: &str) -> Vec<String> {
+    let mut candidates = vec![canonical_member.to_string()];
+    let Some(version) = archive
+        .file_name()
+        .and_then(|name| Version::detect(&name.to_string_lossy()))
+    else {
+        return candidates;
+    };
+    let Some((root, suffix)) = canonical_member.split_once('/') else {
+        return candidates;
+    };
+    if Version::detect(root).is_none() {
+        candidates.push(format!("{root}-{}/{suffix}", version.raw));
+    }
+    candidates
 }
 
 /// Convert Cleave's complete judged differential into a compact, stable
@@ -2765,6 +2911,8 @@ fn change_shape_escalation(
     let dependency_with_fallback_load = dependency_with_fallback_load(a, diff);
     let dependency_backed_api =
         dependency_backed_public_api_anomaly(diff, bump, runtime_entrypoints).is_some();
+    let source_download_execute =
+        source_download_write_execute_anomaly(diff, bump, runtime_entrypoints).is_some();
     // A remote browser loader, whether its destination is a literal host or is
     // assembled from character codes, is much stronger than any component
     // atomic. Require complete convergence on one file and use it as release-
@@ -2964,6 +3112,7 @@ fn change_shape_escalation(
         || endgame
         || dependency_with_fallback_load
         || dependency_backed_api
+        || source_download_execute
         || remote_script_loader
         || added_encrypted_payload_archive
         || same_version_archive_replacement
@@ -3506,6 +3655,72 @@ fn floating_pre_one_spec(spec: &str) -> bool {
         || numeric == "0"
         || numeric.starts_with('*')
         || spec.eq_ignore_ascii_case("latest")
+}
+
+#[derive(Debug)]
+struct SourceExecutionChain {
+    file: String,
+}
+
+/// A package initializer or declared runtime entrypoint that newly downloads
+/// bytes, writes them to disk, and launches a process is a complete delivery
+/// chain even when the package already used HTTP and subprocesses elsewhere.
+/// Keep every leg file-local and require platform gating to avoid summing
+/// unrelated application behavior into a false payload.
+fn source_download_write_execute_anomaly(
+    diff: &DiffReportV1,
+    bump: Option<Bump>,
+    runtime_entrypoints: &HashSet<String>,
+) -> Option<SourceExecutionChain> {
+    if !bump.is_some_and(|b| {
+        matches!(
+            b.kind,
+            BumpKind::Same | BumpKind::Patch | BumpKind::Prerelease
+        )
+    }) || !compact_change(&diff.summary)
+    {
+        return None;
+    }
+
+    diff.files.iter().find_map(|file| {
+        if !matches!(file.status, FileStatus::Added | FileStatus::Changed)
+            || !member_type(file).is_some_and(|file_type| file_type.is_source_code())
+        {
+            return None;
+        }
+        let path = display_member_path(&file.path);
+        let package_initializer = matches!(member_type(file), Some(filefacts::FileType::Python))
+            && path.rsplit('/').next() == Some("__init__.py");
+        if !package_initializer && !runtime_entrypoints.contains(path) {
+            return None;
+        }
+        let traits = file.scopes.traits.as_ref()?;
+        let ids: Vec<&str> = traits
+            .added
+            .iter()
+            .map(|change| change.id.as_str())
+            .chain(traits.changed.iter().map(|change| change.new.id.as_str()))
+            .collect();
+        let classes: HashSet<String> = ids
+            .iter()
+            .filter_map(|id| crate::rubric::capability_class(id))
+            .collect();
+        let has_class = |prefix: &str| classes.iter().any(|class| class.starts_with(prefix));
+        let fetches_response = ids.iter().any(|id| {
+            let id = id.to_ascii_lowercase();
+            id.contains("download")
+                || id.contains("response-body-read")
+                || id.contains("urlopen-response")
+        });
+        (fetches_response
+            && has_class("communications/http")
+            && has_class("process/create")
+            && (has_class("fs/write") || has_class("fs/file"))
+            && has_class("os/sysinfo"))
+        .then(|| SourceExecutionChain {
+            file: file.path.clone(),
+        })
+    })
 }
 
 /// Whether one added-or-changed file gained *every* one of `suffixes` as a new
@@ -4433,17 +4648,19 @@ fn immediate_entry_return_count(bytes: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashSet};
+    use std::path::Path;
 
     use super::{
-        CapabilityShape, add_capability_text, attack_behavior_removed, binary_replacement_anomaly,
-        capability_shape_score, changed_identity_claims, changed_test_carrier, clean_name,
-        dependency_backed_public_api_anomaly, endgame_package_shape, executable_member_layout,
-        external_remote_script_loader, identity_claim_fields, immediate_entry_return_count,
-        is_compiled_binary_file_type, is_source_archive, line_diff, metric_change_importance,
-        normalized_archive_diff, normalized_member_path, npm_snapshot_member_key, numeric_delta,
+        CapabilityShape, add_capability_text, archive_member_candidates, attack_behavior_removed,
+        binary_replacement_anomaly, capability_shape_score, changed_identity_claims,
+        changed_test_carrier, clean_name, dependency_backed_public_api_anomaly,
+        endgame_package_shape, executable_member_layout, external_remote_script_loader,
+        identity_claim_fields, immediate_entry_return_count, is_compiled_binary_file_type,
+        is_source_archive, line_diff, metric_change_importance, normalized_archive_diff,
+        normalized_member_path, npm_snapshot_member_key, numeric_delta,
         obfuscated_remote_script_loader, opaque_runtime_payload_anomaly,
         python_distribution_member_key, removed_high_risk_traits, restored_endgame_package_shape,
-        runtime_graft_anomaly, source_build_macro_score,
+        runtime_graft_anomaly, source_build_macro_score, source_download_write_execute_anomaly,
     };
     use crate::Severity;
     use crate::version::{Bump, BumpKind, Version};
@@ -4470,6 +4687,101 @@ mod tests {
             }
         "#;
         assert_eq!(immediate_entry_return_count(source), 1);
+    }
+
+    #[test]
+    fn canonical_sdist_member_reinserts_archive_version_for_extraction() {
+        assert_eq!(
+            archive_member_candidates(
+                Path::new("guardrails_ai-0.10.1-RECONSTRUCTED.tar.gz"),
+                "guardrails_ai/guardrails/__init__.py"
+            ),
+            [
+                "guardrails_ai/guardrails/__init__.py",
+                "guardrails_ai-0.10.1/guardrails/__init__.py"
+            ]
+        );
+        assert_eq!(
+            archive_member_candidates(Path::new("package.tgz"), "package/index.js"),
+            ["package/index.js"]
+        );
+    }
+
+    #[test]
+    fn auto_loaded_source_download_write_execute_chain_is_file_local() {
+        let gained = |id: &str| TraitChange {
+            id: id.to_string(),
+            trait_section: "micro-behaviors".to_string(),
+            crit: Criticality::Notable,
+            conf: 1.0,
+            desc: id.to_string(),
+            count: 1,
+        };
+        let initializer = FileDiffEntry {
+            path: "<root>!!pkg/pkg/__init__.py".to_string(),
+            file_type: Some("python".to_string()),
+            status: FileStatus::Changed,
+            identity: None,
+            scopes: ScopeDiffs {
+                traits: Some(ScopeDiff {
+                    added: vec![
+                        gained(
+                            "micro-behaviors/communications/http/lib/urllib::urlopen-response-body-read",
+                        ),
+                        gained("micro-behaviors/fs/write/file/direct::python-write-response-read"),
+                        gained("micro-behaviors/process/create/subprocess::subprocess-api-call"),
+                        gained(
+                            "micro-behaviors/os/sysinfo/platform/runtime::python-platform-branch",
+                        ),
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            old_formula: None,
+            new_formula: None,
+        };
+        let report = |file: FileDiffEntry| DiffReportV1 {
+            old_root: "old.tar.gz".to_string(),
+            new_root: "new.tar.gz".to_string(),
+            summary: DiffSummary {
+                files_changed: 1,
+                ..Default::default()
+            },
+            scopes: ScopeDiffs::default(),
+            files: vec![file],
+        };
+        let patch = Some(Bump {
+            kind: BumpKind::Patch,
+            steps: 1,
+        });
+        let minor = Some(Bump {
+            kind: BumpKind::Minor,
+            steps: 1,
+        });
+        assert!(
+            source_download_write_execute_anomaly(
+                &report(initializer.clone()),
+                patch,
+                &HashSet::new()
+            )
+            .is_some()
+        );
+        assert!(
+            source_download_write_execute_anomaly(
+                &report(initializer.clone()),
+                minor,
+                &HashSet::new()
+            )
+            .is_none()
+        );
+
+        let mut ordinary_helper = initializer;
+        ordinary_helper.path = "<root>!!pkg/pkg/updater.py".to_string();
+        assert!(
+            source_download_write_execute_anomaly(&report(ordinary_helper), patch, &HashSet::new())
+                .is_none()
+        );
     }
 
     #[test]
