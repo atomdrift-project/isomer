@@ -8,6 +8,13 @@ detector, so what it should say is defined by the transition, not the file:
     before -> during   MUST be detected      (the attack was introduced)
     during -> after    must NOT be detected   (remediation is not an attack)
     before -> after    must NOT be detected   (clean -> patched is not an attack)
+    before -> before   must NOT be detected   (an honest upgrade is not an attack)
+
+The last one needs an incident that preserved more than one pre-compromise
+release — several do, and those clean releases are the only ground truth in the
+corpus for what a *legitimate* upgrade of that exact package looks like. Each
+adjacent pair of them, in version order, is a release the maintainer actually
+shipped: if the gate fails on one, it would have blocked a real upgrade.
 
 "Detected" means isomer's gate fails at the chosen severity (``--fail-on high``
 by default) — the exact signal a CI check keys on. Every transition that breaks
@@ -16,6 +23,7 @@ its expectation is a VIOLATION:
     MISS            before -> during did not trip the gate  (a missed attack)
     FP-REMEDIATION  during -> after tripped the gate         (remediation flagged)
     FP-NET          before -> after tripped the gate         (clean->patched flagged)
+    FP-BASELINE     before -> before tripped the gate        (honest upgrade flagged)
 
 The script prints a per-violation report and a summary, and exits non-zero when
 there is any violation or error — so ``make validate-samples`` gates on it.
@@ -68,6 +76,11 @@ class Artifact:
     before: SampleFile
     during: SampleFile
     after: SampleFile | None
+    # Every clean pre-compromise release of this artifact, in version order and
+    # sharing `before`'s content form. Adjacent pairs are the honest upgrades.
+    # Fewer than two entries means the incident preserved only one baseline and
+    # there is no upgrade to judge.
+    baseline: list[SampleFile] = field(default_factory=list)
 
 
 @dataclass
@@ -86,6 +99,7 @@ class Result:
     bd: Transition
     da: Transition | None = None
     ba: Transition | None = None
+    bb: list[Transition] = field(default_factory=list)
     violations: list[str] = field(default_factory=list)
 
 
@@ -360,6 +374,39 @@ def pick(samples: list[dict], prefer: tuple[str, ...], root: Path,
     return min(candidates, key=rank)[1]
 
 
+def baseline_chain(samples: list[dict], root: Path, reference: dict) -> list[dict]:
+    """The clean pre-compromise releases, in version order, that pair honestly.
+
+    Only same-content-form samples qualify, for the reason ``pick`` gives: a
+    preserved incident report or loose source fragment is evidence, not a
+    release comparator. Byte-identical entries are dropped too — a few incidents
+    record the same tarball twice under different provenance, and diffing a file
+    against itself proves nothing. ``reference`` (the chosen ``before``) fixes
+    the form and is always a member of the result when it survives that filter.
+    """
+    form = file_form(root / reference["path"])
+    seen: set[str] = set()
+    chain: list[dict] = []
+    for sample in samples:
+        path = sample.get("path")
+        if (
+            not path
+            or sample.get("classification") not in CLEAN
+            or not (root / path).is_file()
+            or file_form(root / path) != form
+        ):
+            continue
+        key = sample.get("sha256") or path
+        if key in seen:
+            continue
+        seen.add(key)
+        chain.append(sample)
+    # Unparseable versions sort last, stable in manifest order, so a chain that
+    # is only partly versioned still pairs its known releases in release order.
+    chain.sort(key=lambda s: version_components(s) or (sys.maxsize,))
+    return chain if len(chain) > 1 else []
+
+
 def load_artifacts(corpus: Path) -> list[Artifact]:
     """One Artifact per (attack, artifact_id) with at least before+during on disk."""
     out: list[Artifact] = []
@@ -428,7 +475,9 @@ def load_artifacts(corpus: Path) -> list[Artifact]:
 
             bp, dp, ap = sample_file(before), sample_file(during), sample_file(after)
             if bp and dp:
-                out.append(Artifact(f"{attack}/{art}", year, bp, dp, ap))
+                chain = baseline_chain(phases.get("before", []), base, before)
+                baseline = [f for f in map(sample_file, chain) if f]
+                out.append(Artifact(f"{attack}/{art}", year, bp, dp, ap, baseline))
     out.sort(key=lambda artifact: (artifact.year, artifact.name))
     return out
 
@@ -492,6 +541,11 @@ def transitions_of(art: Artifact) -> list[tuple[str, SampleFile, SampleFile]]:
     if art.after:
         work.append(("da", art.during, art.after))
         work.append(("ba", art.before, art.after))
+    # Adjacent pairs only: the chain is a release history, and consecutive
+    # releases are the upgrades a user actually performs. Every pair would be
+    # quadratic for no new ground truth.
+    for i, (old_side, new_side) in enumerate(zip(art.baseline, art.baseline[1:])):
+        work.append((f"bb{i}", old_side, new_side))
     return work
 
 
@@ -519,6 +573,20 @@ def audit(art: Artifact, runs: dict[str, Transition]) -> Result:
             res.violations.append(f"ERROR before->after: {ba.error}")
         elif ba.detected:
             res.violations.append(f"FP-NET before->after detected (sev={ba.severity})")
+    for i, (old_side, new_side) in enumerate(zip(art.baseline, art.baseline[1:])):
+        bb = runs.get(f"bb{i}")
+        if not bb:
+            continue
+        res.bb.append(bb)
+        # Name both releases: unlike the other three transitions there can be
+        # several per artifact, and "which upgrade" is the whole finding.
+        pair = f"{old_side.logical_name} -> {new_side.logical_name}"
+        if bb.error:
+            res.violations.append(f"ERROR before->before {pair}: {bb.error}")
+        elif bb.detected:
+            res.violations.append(
+                f"FP-BASELINE before->before detected (sev={bb.severity}) {pair}"
+            )
     return res
 
 
@@ -602,9 +670,11 @@ def main() -> int:
     ba_seen = [r for r in results if r.ba and r.ba.detected is not None]
     da_fp = sum(1 for r in da_seen if r.da.detected)
     ba_fp = sum(1 for r in ba_seen if r.ba.detected)
+    bb_seen = [t for r in results for t in r.bb if t.detected is not None]
+    bb_fp = sum(1 for t in bb_seen if t.detected)
     violations = [r for r in results if r.violations]
     errors = sum(1 for r in results
-                 for t in (r.bd, r.da, r.ba) if t and t.error)
+                 for t in (r.bd, r.da, r.ba, *r.bb) if t and t.error)
 
     if args.json:
         print(json.dumps({
@@ -612,6 +682,7 @@ def main() -> int:
             "before_during_detected": bd_ok, "before_during_total": bd_total,
             "during_after_false_positives": da_fp, "during_after_total": len(da_seen),
             "before_after_false_positives": ba_fp, "before_after_total": len(ba_seen),
+            "before_before_false_positives": bb_fp, "before_before_total": len(bb_seen),
             "errors": errors,
             "violations": [{"artifact": r.name, "issues": r.violations} for r in violations],
         }, indent=2))
@@ -631,6 +702,8 @@ def main() -> int:
           f"   ({da_fp} false positive{'s' * (da_fp != 1)}; want 0)")
     print(f"  before -> after    {ba_fp}/{len(ba_seen)} detected"
           f"   ({ba_fp} false positive{'s' * (ba_fp != 1)}; want 0)")
+    print(f"  before -> before   {bb_fp}/{len(bb_seen)} detected"
+          f"   ({bb_fp} false positive{'s' * (bb_fp != 1)}; want 0)")
     if errors:
         print(f"  errors             {errors}")
 

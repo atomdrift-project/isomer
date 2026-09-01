@@ -2765,7 +2765,25 @@ impl Proportionality {
         // plugin maintenance can add one new web/API capability. Require a
         // change-shape signal as well (focused multi-capability edit,
         // endgame deletion, or the existing behavior/content skew read).
-        let shape_signal = skew.is_some()
+        //
+        // Skew alone is not enough either. It measures how *surgically* the
+        // edit was made, not how much capability arrived, and in a one-file
+        // artifact or a tightly-scoped patch the traits scope always outruns
+        // the content scopes — so a single added capability clears it for
+        // free. An implant brings several classes at once, which is why the
+        // focused-source branches below all carry a class floor; give the
+        // skew branch the same footing. The case this was costing:
+        // contact-form-7-multi-step's own incident-response patch, written by
+        // the WordPress.org review team to reset the accounts the attacker
+        // created, gained exactly one capability (a user password field) and
+        // was escalated to a gate-failing High for it.
+        let new_classes = a
+            .behavioral
+            .categories
+            .iter()
+            .filter(|c| !c.new_ids.is_empty())
+            .count();
+        let shape_signal = (skew.is_some() && new_classes >= 2)
             || change_shape_escalation(
                 a,
                 diff,
@@ -3094,7 +3112,15 @@ fn change_shape_escalation(
             || has_prefix("os/signal")
             || new_id_contains(&["syscall", "sigaction", "raw-"]))
         && (!source_archive || source_build_anomaly);
-    let secret_egress_cluster = has_prefix("communications/http")
+    // Release-pressure evidence, like `remote_script_loader` above: the legs
+    // below are a wallet library's ordinary job description, so they only
+    // indict a release whose version number promised nothing new. xrpl.js
+    // 2.14.1 -> 4.2.0 satisfies every leg — HTTP, base64, seed generation and
+    // a remote host URL — because that is what an XRP Ledger client does
+    // across two major versions; 2.14.1 -> 2.14.2, the real key-exfiltration
+    // patch, is where the same conjunction means something.
+    let secret_egress_cluster = routine_release(bump)
+        && has_prefix("communications/http")
         && (has_prefix("data/encode") || has_prefix("data/decode") || has_prefix("file/encoded"))
         && (has_prefix("crypto/library") || has_prefix("crypto/asymmetric"))
         && new_id_contains(&["private-key", "mnemonic", "wallet", "seed"])

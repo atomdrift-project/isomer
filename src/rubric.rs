@@ -786,7 +786,23 @@ fn meaningful_identity_changes(
             });
         }
     };
-    push("authors", authors(o), authors(n));
+    // A project gaining a co-maintainer is not publisher drift. Compare the
+    // author *set*: the takeover direction is an author disappearing or being
+    // replaced, which leaves the old set no longer contained in the new one.
+    // eslint-config-prettier 9.1.0 -> 10.1.5 reads `Simon Lydell -> Simon
+    // Lydell, JounQin` — a second maintainer joining an active project, which
+    // forced High on a clean major release and would have blocked the upgrade.
+    let author_set = |i: &Identity| {
+        i.authors
+            .iter()
+            .filter_map(|p| p.name.as_deref())
+            .map(crate::printable)
+            .filter(|name| !name.is_empty())
+            .collect::<HashSet<_>>()
+    };
+    if !author_set(o).is_subset(&author_set(n)) {
+        push("authors", authors(o), authors(n));
+    }
     push("signer", signer(o), signer(n));
     push(
         "organization",

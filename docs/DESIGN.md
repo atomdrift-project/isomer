@@ -464,10 +464,14 @@ string co-located with the DNS-lookup + shell-exec payload.
 ### Testdata + demo
 
 `testdata/supplychain/` holds the curated old→new pairs (xz-utils,
-rand-user-agent, node-ipc; ~740 KB, provenance in its README). `make demo`
+rand-user-agent, node-ipc, the two WordPress plugin cases, unrealircd, and
+openapi-react-query-codegen; ~6.6 MB, provenance in its README). `make demo`
 runs `scripts/demo.sh` over them and narrates each verdict in scan/cleave's
-visual idiom. `make {build,release,install,lint,fix,test,demo,clean}` mirror
-scan's Makefile.
+visual idiom. The demo asserts in both directions: every attack must reach at
+least Notable, and the one vendored *clean* upgrade — openapi-react-query-codegen
+2.2.0 → 3.0.2, a cross-major release by the same publisher — must stay under
+`--fail-on high`. A miss and a false positive both fail `make demo`.
+`make {build,release,install,lint,fix,test,demo,clean}` mirror scan's Makefile.
 
 Next: proportionality bands, then the `purl` verb (fetch + bloom skip via
 scan) and the markdown report body for the PR comment.
