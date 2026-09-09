@@ -38,6 +38,7 @@ import concurrent.futures as cf
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -121,7 +122,7 @@ def scalar(value: str) -> str:
 def parse_samples_without_yaml(text: str) -> list[dict]:
     """Read the sample records without requiring a third-party YAML package.
 
-    The corpus manifests are full YAML, but the audit only needs five scalar
+    The corpus manifests are full YAML, but the audit only needs selected scalar
     fields from entries under the top-level ``samples`` sequence. This small
     fallback deliberately understands only that subset; PyYAML remains the
     preferred parser when installed.
@@ -130,47 +131,64 @@ def parse_samples_without_yaml(text: str) -> list[dict]:
     in_samples = False
     records: list[dict] = []
     current: dict | None = None
+    item_indent: int | None = None
+    fields = {"artifact_id", "phase", "classification", "version", "filename", "path", "sha256"}
+    unsupported = "unsupported samples syntax; install PyYAML for full YAML support"
     i = 0
 
     def finish() -> None:
-        if current and current.get("artifact_id"):
+        if current is not None:
+            if not current.get("artifact_id"):
+                raise ValueError("sample record is missing artifact_id")
             records.append(current)
 
     while i < len(lines):
         line = lines[i]
-        if line == "samples:":
+        header = re.match(r"^samples:\s*(.*)$", line)
+        if header:
+            value = header.group(1).split("#", 1)[0].strip()
+            if value in ("[]", "null", "~"):
+                return []
+            if value:
+                raise ValueError(unsupported)
             in_samples = True
             i += 1
             continue
-        if in_samples and line and not line.startswith(" "):
-            break
         if not in_samples:
             i += 1
             continue
+        if not line.strip() or line.lstrip().startswith("#"):
+            i += 1
+            continue
 
-        item = re.match(r"^  -(?:\s+([A-Za-z_][\w-]*):\s*(.*))?$", line)
-        if item:
+        item = re.match(r"^( *)-(?:\s+([A-Za-z_][\w-]*):\s*(.*))?$", line)
+        if item and (item_indent is None or len(item.group(1)) == item_indent):
+            item_indent = len(item.group(1))
             finish()
             current = {}
-            if item.group(1) == "artifact_id" and item.group(2):
-                current["artifact_id"] = scalar(item.group(2))
+            # Process the first key just like subsequent keys, including
+            # folded scalars and manifests whose first key isn't artifact_id.
+            line = " " * (item_indent + 2) + (item.group(2) or "") + ": " + (item.group(3) or "")
+        elif not line.startswith(" "):
+            if re.match(r"^[A-Za-z_][\w-]*:", line) or line in ("---", "..."):
+                break
+            raise ValueError(unsupported)
+        elif current is None or (line.lstrip().startswith("-")
+                                 and len(line) - len(line.lstrip()) <= item_indent):
+            raise ValueError(unsupported)
+
+        field = re.match(r"^( *)([A-Za-z_][\w-]*):(?:\s*(.*))?$", line)
+        if (not field or current is None or item_indent is None
+                or len(field.group(1)) != item_indent + 2 or field.group(2) not in fields):
             i += 1
             continue
 
-        field = re.match(
-            r"^    (artifact_id|phase|classification|version|filename|path|sha256):(?:\s*(.*))?$",
-            line,
-        )
-        if not field or current is None:
-            i += 1
-            continue
-
-        key, value = field.group(1), field.group(2) or ""
+        key, value = field.group(2), field.group(3) or ""
         if value in (">", ">-", "|", "|-", ">+", "|+"):
             folded = value.startswith(">")
             parts: list[str] = []
             i += 1
-            while i < len(lines) and (not lines[i] or lines[i].startswith("     ")):
+            while i < len(lines) and (not lines[i] or lines[i].startswith(" " * (item_indent + 3))):
                 parts.append(lines[i].strip())
                 i += 1
             current[key] = (" " if folded else "\n").join(parts).strip()
@@ -414,8 +432,8 @@ def load_artifacts(corpus: Path) -> list[Artifact]:
     for manifest in sorted(corpus.glob("*/samples/manifest.yaml")):
         try:
             samples = load_samples(manifest)
-        except (OSError, ValueError, YAML_ERROR):
-            continue
+        except (OSError, ValueError, YAML_ERROR) as error:
+            raise ValueError(f"cannot read sample manifest {manifest}: {error}") from error
         attack = manifest.parent.parent.name
         base = manifest.parent
         year = incident_year(base.parent / "meta.yaml")
@@ -581,12 +599,9 @@ def audit(art: Artifact, runs: dict[str, Transition]) -> Result:
     if da:
         if da.error:
             res.violations.append(f"ERROR during->after: {da.error}")
-        # The new side can restore a capability that the clean `before` had
-        # and the malicious `during` removed. A standalone during->after diff
-        # calls that newly-present-on-the-old-side trait "new"; when the
-        # before->after comparison is clean, this is a baseline artifact, not
-        # a remediation false positive.
-        elif da.detected and not (ba and ba.detected is False):
+        # Judge each transition independently. A clean net comparison does
+        # not establish why the remediation comparison tripped the gate.
+        elif da.detected:
             res.violations.append(f"FP-REMEDIATION during->after detected (sev={da.severity})")
     if ba:
         if ba.error:
@@ -618,6 +633,19 @@ def default_isomer() -> str:
     return "isomer"
 
 
+def snapshot_traits(source: str | None, destination: Path) -> str | None:
+    """Use one working-tree rule snapshot across all parallel comparisons."""
+    if source is None:
+        return None
+    shutil.copytree(source, destination, ignore=shutil.ignore_patterns(".git"))
+    return str(destination)
+
+
+def default_jobs() -> int:
+    """Each scanner uses multiple cores and can retain several GB of data."""
+    return min(8, max(1, (os.cpu_count() or 2) // 2))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Audit isomer against the supply-chain attack corpus.",
@@ -635,7 +663,7 @@ def main() -> int:
                     choices=["low", "medium", "high", "critical"],
                     help="severity that counts as a detection")
     ap.add_argument("--jobs", type=int, default=0,
-                    help="concurrent isomer runs (0 = one per CPU; the report stays "
+                    help="concurrent isomer runs (0 = half the CPUs, capped at 8; the report stays "
                          "deterministic either way, since runs are independent and "
                          "results are sorted before printing)")
     ap.add_argument("--timeout", type=int, default=0,
@@ -649,7 +677,11 @@ def main() -> int:
               f"  set ISOMER_SAMPLES_DIR or pass --corpus.", file=sys.stderr)
         return 2
 
-    artifacts = load_artifacts(args.corpus)
+    try:
+        artifacts = load_artifacts(args.corpus)
+    except (OSError, ValueError, YAML_ERROR) as error:
+        print(f"validate-samples: {error}", file=sys.stderr)
+        return 2
     if args.limit:
         artifacts = artifacts[: args.limit]
     if not artifacts:
@@ -665,19 +697,25 @@ def main() -> int:
     work = [(i, kind, old, new)
             for i, art in enumerate(artifacts)
             for kind, old, new in transitions_of(art)]
-    jobs = args.jobs or (os.cpu_count() or 4)
+    jobs = args.jobs or default_jobs()
     print(f"auditing {len(artifacts)} artifacts ({len(work)} comparisons, {jobs} at a "
           f"time) against {args.isomer} (detect = fail-on {args.fail_on})…",
           file=sys.stderr)
 
     runs: dict[tuple[int, str], Transition] = {}
-    with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
-        futs = {ex.submit(run_transition, args.isomer, args.traits, args.fail_on,
-                          old, new, timeout): (i, kind)
-                for i, kind, old, new in work}
-        for n, fut in enumerate(cf.as_completed(futs), 1):
-            runs[futs[fut]] = fut.result()
-            print(f"\r  {n}/{len(work)}", end="", file=sys.stderr, flush=True)
+    with tempfile.TemporaryDirectory(prefix="isomer-audit-traits-") as staging:
+        try:
+            traits = snapshot_traits(args.traits, Path(staging) / "traits")
+        except OSError as error:
+            print(f"validate-samples: cannot snapshot traits: {error}", file=sys.stderr)
+            return 2
+        with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+            futs = {ex.submit(run_transition, args.isomer, traits, args.fail_on,
+                              old, new, timeout): (i, kind)
+                    for i, kind, old, new in work}
+            for n, fut in enumerate(cf.as_completed(futs), 1):
+                runs[futs[fut]] = fut.result()
+                print(f"\r  {n}/{len(work)}", end="", file=sys.stderr, flush=True)
     print("", file=sys.stderr)
     results = [audit(art, {k: runs[(i, k)] for k, _, _ in transitions_of(art)})
                for i, art in enumerate(artifacts)]

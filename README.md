@@ -78,9 +78,12 @@ They are also included in `make test`.
 Run `make validate-samples` for the slower end-to-end audit against
 `~/src/supplychain-attack-data/oss/attacks`. Simulations check decision logic;
 the corpus audit also checks extraction, trait matching, and model integration.
-Keep the trait working tree unchanged during an audit: parallel comparisons
-load rules independently. Failures include the verdict and change summary from
-the original run, so a later rerun does not erase intermittent evidence.
+Explicit trait directories are snapshotted once per audit, including working-tree
+edits, so later edits cannot change rules between comparisons. Failures include
+the verdict and change summary from the original run, so a later rerun does not
+erase intermittent evidence.
+The default worker count leaves room for each scanner's own threads and memory;
+use the audit script's `--jobs` option to override it.
 
 ## Warts
 
