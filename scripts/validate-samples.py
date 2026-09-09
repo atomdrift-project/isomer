@@ -90,6 +90,7 @@ class Transition:
     detected: bool | None  # None on error
     severity: str
     error: str | None = None
+    diagnostic: dict | None = None
 
 
 @dataclass
@@ -526,13 +527,32 @@ def run_transition(isomer: str, traits: str | None, fail_on: str,
         return Transition(None, "?", (stderr or "").strip().splitlines()[-1:][0]
                           if stderr.strip() else f"exit {p.returncode}")
     try:
-        gate = json.loads(stdout)["verdict"]["gate"]
+        report = json.loads(stdout)
+        gate = report["verdict"]["gate"]
     except (ValueError, KeyError):
         return Transition(None, "?", "unparseable json")
     # `gate.severity` is the severity the active --gate actually evaluated
     # (new-only by default), so a MISS reads as the below-threshold level the
     # gate saw — not a pre-existing critical the gate never keyed on.
-    return Transition(bool(gate["fail"]), gate.get("severity", "?"))
+    # Keep the decision evidence from this exact run. Re-running a violation
+    # can lose an intermittent scanner/cache/resource failure. Do not retain
+    # full raw reports: decoded source and strings can be hundreds of MB.
+    diagnostic = {
+        "verdict": report["verdict"],
+        "summary": report.get("raw", {}).get("diff", {}).get("summary"),
+    }
+    return Transition(bool(gate["fail"]), gate.get("severity", "?"), diagnostic=diagnostic)
+
+
+def violation_diagnostics(result: Result) -> dict:
+    """Exact-run evidence for anomalous transitions, without changing gates."""
+    transitions = [("before->during", result.bd, True),
+                   ("during->after", result.da, False),
+                   ("before->after", result.ba, False)]
+    transitions.extend((f"before->before[{i}]", run, False)
+                       for i, run in enumerate(result.bb))
+    return {name: run.diagnostic for name, run, expected in transitions
+            if run and run.detected is not None and run.detected != expected}
 
 
 def transitions_of(art: Artifact) -> list[tuple[str, SampleFile, SampleFile]]:
@@ -684,7 +704,8 @@ def main() -> int:
             "before_after_false_positives": ba_fp, "before_after_total": len(ba_seen),
             "before_before_false_positives": bb_fp, "before_before_total": len(bb_seen),
             "errors": errors,
-            "violations": [{"artifact": r.name, "issues": r.violations} for r in violations],
+            "violations": [{"artifact": r.name, "issues": r.violations,
+                            "diagnostics": violation_diagnostics(r)} for r in violations],
         }, indent=2))
         return 1 if violations else 0
 
@@ -694,6 +715,7 @@ def main() -> int:
             for v in r.violations:
                 kind, _, detail = v.partition(" ")
                 print(f"  {kind:<15} {r.name:<48} {detail}")
+            print("    diagnostics: " + json.dumps(violation_diagnostics(r), sort_keys=True))
 
     print("\nsummary:")
     print(f"  before -> during   {bd_ok}/{bd_total} detected"

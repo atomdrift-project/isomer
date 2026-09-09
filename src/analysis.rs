@@ -334,15 +334,13 @@ impl<'a> Analysis<'a> {
             &survey.runtime_entrypoints,
         );
 
-        // Azoth ML risk is the *primary* detector: a jump into a worse band
-        // drives the verdict on its own, even when no trait or signature
-        // fired. `None` when no model is available — then the hand-coded
-        // rubric stands alone.
+        // Azoth is a useful corroborating detector, but a probability barely
+        // crossing a band boundary is not enough to condemn a clean release.
+        // Require a material move and a high
+        // absolute score before risk can stand alone; the hand-coded rubric
+        // remains authoritative for known or shape-only behavior.
         let risk = crate::risk::score(&pairs);
-        let risk_jump = risk.map_or(Severity::None, |r| {
-            let (old, new) = (risk_band(r.old), risk_band(r.new));
-            if new > old { new } else { Severity::None }
-        });
+        let risk_jump = risk.map_or(Severity::None, significant_risk_escalation);
 
         // A few attacks are composed of individually medium traits, so the
         // per-trait rubric never reaches the gate. Two shape signals are
@@ -396,29 +394,13 @@ impl<'a> Analysis<'a> {
         // evidence, but they no longer describe executable new behavior. Keep
         // cleanup visible as Notable while preserving independent identity,
         // structure, known-signature, model, and direct-hostile signals.
-        let remediation_floor = Severity::Medium
-            .max(assessment.identity.severity)
-            .max(assessment.structure.severity)
-            .max(assessment.signature.severity)
-            .max(if rubric_new >= Severity::Critical {
-                Severity::Critical
-            } else {
-                Severity::None
-            });
-        let verdict = if is_remediation {
-            remediation_floor.max(risk_jump)
-        } else {
-            assessment
-                .severity
-                .max(risk_jump)
-                .max(escalation)
-                .max(shape_new)
-        };
-        let new_verdict = if is_remediation {
-            remediation_floor.max(risk_jump)
-        } else {
-            rubric_new.max(risk_jump).max(escalation).max(shape_new)
-        };
+        let (verdict, new_verdict) = deterministic_verdicts(
+            &assessment,
+            rubric_new,
+            risk_jump,
+            escalation.max(shape_new),
+            is_remediation,
+        );
         let gated = match cli.gate {
             Gate::New => new_verdict,
             Gate::Any => verdict,
@@ -2015,6 +1997,56 @@ pub(crate) fn risk_band(p: f32) -> Severity {
     }
 }
 
+/// Treat Azoth as a strong differential signal only when the probability move
+/// is meaningful, not merely because a release crossed 0.50 or 0.90 by a few
+/// points. A high-band move needs both a high absolute score and a large jump;
+/// a critical-band move is inherently stronger but still needs a visible
+/// delta. This keeps model calibration noise from overriding clean-release
+/// ground truth while preserving large jumps into clearly dangerous territory.
+fn significant_risk_escalation(risk: crate::risk::Risk) -> Severity {
+    const MIN_DELTA: f32 = 0.10;
+    const HIGH_SCORE: f32 = 0.75;
+    const HIGH_DELTA: f32 = 0.40;
+
+    if risk.delta() < MIN_DELTA {
+        return Severity::None;
+    }
+    match risk_band(risk.new) {
+        Severity::Critical => Severity::Critical,
+        Severity::High if risk.new >= HIGH_SCORE && risk.delta() >= HIGH_DELTA => Severity::High,
+        _ => Severity::None,
+    }
+}
+
+/// Combine the independent signals. Kept pure so simulations exercise the
+/// same decision as the CLI without loading models or scanning archives.
+fn deterministic_verdicts(
+    assessment: &Assessment,
+    rubric_new: Severity,
+    risk_jump: Severity,
+    escalation: Severity,
+    remediation: bool,
+) -> (Severity, Severity) {
+    if remediation {
+        let floor = Severity::Medium
+            .max(assessment.identity.severity)
+            .max(assessment.structure.severity)
+            .max(assessment.signature.severity)
+            .max(if rubric_new >= Severity::Critical {
+                Severity::Critical
+            } else {
+                Severity::None
+            })
+            .max(risk_jump);
+        (floor, floor)
+    } else {
+        (
+            assessment.severity.max(risk_jump).max(escalation),
+            rubric_new.max(risk_jump).max(escalation),
+        )
+    }
+}
+
 // ── version + naming ────────────────────────────────────────────────────────
 
 /// Detected versions and the artifact name for the header, from the input
@@ -2168,6 +2200,12 @@ fn clean_name(base: &str, ver: Option<&Version>) -> String {
 /// `pkg-1.0/bin/x` and `pkg-1.1/bin/x` are judged as one file. The raw report
 /// remains untouched for evidence and auditing.
 fn normalized_archive_diff(diff: &DiffReportV1) -> Cow<'_, DiffReportV1> {
+    decoded::reconcile_traits(normalized_archive_members(diff))
+}
+
+mod decoded;
+
+fn normalized_archive_members(diff: &DiffReportV1) -> Cow<'_, DiffReportV1> {
     use std::collections::BTreeSet;
 
     let mut groups: BTreeMap<String, (Option<&FileDiffEntry>, Option<&FileDiffEntry>)> =
@@ -2783,7 +2821,13 @@ impl Proportionality {
             .iter()
             .filter(|c| !c.new_ids.is_empty())
             .count();
-        let shape_signal = (skew.is_some() && new_classes >= 2)
+        let new_severity = a.new_severity();
+        let shape_signal = (skew.is_some()
+            && new_classes >= 2
+            // A surgical medium-only maintenance change is still allowed to
+            // be skewed; skew becomes release-pressure evidence only when the
+            // new side contains a gate-worthy capability.
+            && new_severity >= Severity::High)
             || change_shape_escalation(
                 a,
                 diff,
@@ -2792,11 +2836,11 @@ impl Proportionality {
                 source_build_anomaly,
                 runtime_entrypoints,
             ) >= Severity::High;
-        let drift = if a.behavioral.severity > bump.tolerance() && shape_signal {
+        let drift = if new_severity > bump.tolerance() && shape_signal {
             Drift::Disproportionate(format!(
                 "disproportionate — {} gained a {}-severity capability",
                 bump.describe(),
-                a.behavioral.severity.as_str()
+                new_severity.as_str()
             ))
         } else {
             Drift::WithinTolerance(format!("within tolerance for {}", bump.describe()))
@@ -2923,6 +2967,22 @@ fn change_shape_escalation(
         && ["communications/http", "time/schedule", "data/serialize"]
             .iter()
             .all(|class| has_new_class(a, class));
+    // External content inserted as HTML in a plugin installer can turn a
+    // poisoned feed into code running with administrator privileges. This is
+    // a review signal, not proof of taint flow: require all four new legs in
+    // one file and a routine release. Ordinary fetch/UI/storage combinations
+    // across an application are too common to be useful evidence.
+    let external_admin_html = routine_release(bump)
+        && compact
+        && file_gained_all_traits(
+            diff,
+            &[
+                "::fetch-external-url",
+                "::fetch-then-json",
+                "::dom-outer-html-insertion-sink",
+                "::plugin-upload-action-endpoint",
+            ],
+        );
     let endgame = endgame_package_shape(s);
     // A dependency addition paired with a new fallback module load is a
     // compact supply-chain shape: the release pulls in new code and changes
@@ -3134,6 +3194,7 @@ fn change_shape_escalation(
         || focused_source_with_cleanup
         || source_build_anomaly
         || cross_domain_cluster
+        || external_admin_html
         || endgame
         || dependency_with_fallback_load
         || dependency_backed_api
@@ -3727,7 +3788,11 @@ fn source_download_write_execute_anomaly<'a>(
 /// across a normal web application must not add up to a loader.
 fn file_gained_all_traits(diff: &DiffReportV1, suffixes: &[&str]) -> bool {
     diff.files.iter().any(|file| {
-        if !matches!(file.status, FileStatus::Added | FileStatus::Changed) {
+        // Archive roots aggregate their members' traits. A join on that
+        // synthetic scope would combine unrelated files into a false loader.
+        if !matches!(file.status, FileStatus::Added | FileStatus::Changed)
+            || !member_type(file).is_some_and(|kind| kind.is_source_code())
+        {
             return false;
         }
         let Some(traits) = file.scopes.traits.as_ref() else {
@@ -4523,7 +4588,7 @@ fn remediation_cleanup_context(
     // recognizable signature. A large same-package model-risk drop is strong
     // evidence of that remediation transition; the clean baseline→fixed
     // comparison does not have the drop and remains subject to normal gates.
-    let model_recovery = risk.is_some_and(|r| r.old - r.new >= 0.50);
+    let model_recovery = risk.is_some_and(|r| r.old >= 0.80 && r.old - r.new >= 0.40);
     if compact_cleanup {
         Some(Remediation::FocusedCleanup)
     } else if model_recovery {
@@ -4643,6 +4708,9 @@ fn immediate_entry_return_count(bytes: &[u8]) -> usize {
         })
         .count()
 }
+
+#[cfg(test)]
+mod simulations;
 
 #[cfg(test)]
 mod tests {

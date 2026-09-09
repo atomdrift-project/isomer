@@ -13,7 +13,7 @@ CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 # passes the right `-p` without a second place to keep in sync.
 PACKAGE := $(shell awk -F'"' '/^name = /{print $$2; exit}' Cargo.toml)
 
-.PHONY: all build release quick install lint fix test demo validate-samples install-precommit cut-release clean help
+.PHONY: all build release quick install lint fix test test-simulations demo validate-samples install-precommit cut-release clean help
 
 # Trait set the sample audit judges with. Defaults to the working-tree
 # traits-dev beside this repo when present, so the audit tracks trait edits;
@@ -54,6 +54,13 @@ fix:
 
 test:
 	$(CARGO) test --quiet
+	python3 -m unittest discover -s scripts -p 'test_*.py'
+
+# Fast scoring regressions over synthetic differentials. No samples, model
+# bundle, trait checkout, or network required; also included in `make test`.
+test-simulations:
+	$(CARGO) test --quiet analysis::simulations
+	python3 -m unittest discover -s scripts -p 'test_*.py'
 
 # Run the curated real-world supply-chain attacks — command in, verdict out,
 # nothing else. Doubles as a smoke test: fails if any case drops below notable.
@@ -127,6 +134,7 @@ help:
 	@echo "  lint      rustfmt --check + clippy with warnings denied"
 	@echo "  fix       auto-fix clippy + rustfmt"
 	@echo "  test      run the test suite"
+	@echo "  test-simulations  fast detector regressions without the sample corpus"
 	@echo "  demo      detect every bundled supply-chain case, narrated"
 	@echo "  validate-samples  audit before/during/after corpus for misses + false positives"
 	@echo "  install-precommit  gate commits on lint + test"

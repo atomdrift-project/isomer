@@ -67,6 +67,21 @@ reason = "vendored socket.io client; reviewed in #482"
 expires = "2026-11-09"   # optional
 ```
 
+## Testing
+
+Run `make test-simulations` for fast detector regressions. Small synthetic
+differentials exercise the production rubric, release-pressure rules, model
+score changes, and final verdict combination. The suite includes positive and
+negative controls and needs no corpus, model bundle, or trait checkout.
+They are also included in `make test`.
+
+Run `make validate-samples` for the slower end-to-end audit against
+`~/src/supplychain-attack-data/oss/attacks`. Simulations check decision logic;
+the corpus audit also checks extraction, trait matching, and model integration.
+Keep the trait working tree unchanged during an audit: parallel comparisons
+load rules independently. Failures include the verdict and change summary from
+the original run, so a later rerun does not erase intermittent evidence.
+
 ## Warts
 
 Heuristics are all generic, but hardcoded. The plan is to migrate to a new ML model (valence) once

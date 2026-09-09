@@ -109,7 +109,7 @@ pub(crate) fn config(cli: &Cli) -> Option<InterpretConfig> {
         .llm_model
         .clone()
         .or_else(|| std::env::var("ISOMER_LLM_MODEL").ok())
-        .or_else(|| scan::interpret::discover_model(&base_url, api_key.as_deref()))
+        .or_else(|| scan::interpret::discover_model(&base_url, api_key.as_deref()).ok())
         // scan deliberately has no guessed model name: an explicit value or
         // the endpoint's advertised model is reliable, while a made-up
         // fallback only converts discovery failure into a server-side 404.
