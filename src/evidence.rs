@@ -1026,6 +1026,7 @@ pub(crate) fn existing_risk(
 /// framework annotations here costs nothing beyond the bookkeeping.
 #[derive(Debug, Default)]
 pub(crate) struct Survey {
+    pub trait_profiles: crate::behavior_shift::Profiles,
     /// Capability classes present in the base version, so the rubric can tell
     /// a wholly new class from one that merely gained a trait.
     pub base_classes: HashSet<String>,
@@ -1084,8 +1085,20 @@ pub(crate) fn survey(pairs: &[Pair], options: &cleave::AnalysisOptions) -> Surve
                 continue;
             };
             let Some(report) = analyze(path, options) else {
+                survey.trait_profiles.incomplete = true;
                 continue;
             };
+            let profile = if is_base {
+                &mut survey.trait_profiles.old
+            } else {
+                &mut survey.trait_profiles.new
+            };
+            for finding in all_findings(&report) {
+                profile.observe(
+                    finding.id.as_str(),
+                    finding.crit.score_weight() as f32 * finding.conf,
+                );
+            }
             if !is_base {
                 survey
                     .runtime_entrypoints

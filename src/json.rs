@@ -48,6 +48,9 @@ pub(crate) struct Envelope<'a, R: Serialize> {
     /// analyzing it (`--deps`). Absent when the flag wasn't set.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deps: Vec<Dep<'a>>,
+    /// Current registry evidence for both sides, including provider records and errors.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub registry: &'a [crate::registry::Comparison],
     /// Optional `--llm` interpretation (mirrors scan's `llm`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm: Option<Llm<'a>>,
@@ -62,6 +65,11 @@ pub(crate) struct Envelope<'a, R: Serialize> {
 /// presentation envelope so model pipelines can evolve on their own cadence.
 #[derive(Serialize)]
 pub(crate) struct FeatureSet<'a> {
+    /// Judged summary after archive-root normalization. `scopes` below retains
+    /// Cleave's original aggregate totals, which may precede normalization.
+    pub judged_summary: cleave::types::DiffSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trait_shift: Option<crate::behavior_shift::Shift>,
     pub v: &'static str,
     pub topology: Topology,
     pub scopes: FeatureScopes,
@@ -207,6 +215,11 @@ pub(crate) struct SectionSide<'a> {
 /// One added dependency, profiled by fetching and analyzing it.
 #[derive(Serialize)]
 pub(crate) struct Dep<'a> {
+    pub profile: &'a crate::deps::RiskProfile,
+    pub baseline_profile: Option<&'a crate::deps::RiskProfile>,
+    pub baseline: Option<&'a str>,
+    pub new_severity: &'static str,
+    pub comparison: &'a str,
     /// The declared coordinate, `peacenotwar@^9.1.3`.
     pub coord: &'a str,
     pub ecosystem: &'a str,
@@ -293,7 +306,7 @@ pub(crate) struct Verdict<'a> {
     pub behavioral: Behavioral<'a>,
     pub signature: Signature<'a>,
     pub identity: Identity<'a>,
-    pub structure: Structure<'a>,
+    pub structure: Structure,
     /// MITRE ATT&CK and MBC ids the change moved. Ids only — isomer ships no
     /// catalog mapping them to prose, and a consumer that has one can join on
     /// these.
@@ -334,6 +347,7 @@ pub(crate) struct Risk {
     pub old: f32,
     pub new: f32,
     pub delta: f32,
+    pub new_classification: String,
     pub model: &'static str,
 }
 
@@ -405,19 +419,19 @@ pub(crate) struct IdChange<'a> {
 }
 
 #[derive(Serialize)]
-pub(crate) struct Structure<'a> {
+pub(crate) struct Structure {
     pub severity: &'static str,
-    pub facts: Vec<Fact<'a>>,
+    pub facts: Vec<Fact>,
 }
 
 #[derive(Serialize)]
-pub(crate) struct Fact<'a> {
+pub(crate) struct Fact {
     pub severity: &'static str,
     /// `added` for newly-present structure, `became` for existing structure
     /// altered in place.
     pub change: &'static str,
     pub label: &'static str,
-    pub detail: &'a str,
+    pub detail: String,
 }
 
 #[derive(Serialize)]
@@ -463,6 +477,7 @@ mod tests {
                     old: 0.1,
                     new: 0.98,
                     delta: 0.88,
+                    new_classification: "hostile".to_owned(),
                     model: "azoth",
                 }),
                 proportionality: Prop {
@@ -502,6 +517,8 @@ mod tests {
                 },
             },
             features: FeatureSet {
+                judged_summary: Default::default(),
+                trait_shift: None,
                 v: "1",
                 topology: Topology {
                     added: 0,
@@ -522,10 +539,12 @@ mod tests {
             },
             evidence: Vec::new(),
             deps: Vec::new(),
+            registry: &[],
             llm: None,
             raw: &raw,
         };
         let s = serde_json::to_string(&env).unwrap();
+        assert!(s.contains("\"new_classification\":\"hostile\""));
         // Field order: verdict and its proof precede the bulky raw diff.
         let order = [
             "\"v\"",

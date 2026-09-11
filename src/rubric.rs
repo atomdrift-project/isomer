@@ -12,6 +12,8 @@
 //!   (`third_party/*` detections and `well-known/malware/*`). Catches *known*
 //!   attacks; summarized as a count plus any referenced CVE.
 //! - **identity** — a drifted signer/publisher forces at least High on its own.
+//!   Replacing author credits alone remains reviewable at Medium; stripping
+//!   credits or changing parties in publisher/maintainer roles still gates.
 //!
 //! Known-bad signature ids carry no capability segments, so the behavioral axis
 //! is automatically independent of the signature axis. Proportionality
@@ -70,10 +72,16 @@ pub(crate) struct Category {
     pub new_ids: Vec<String>,
     /// Full ids of traits that existed before and were escalated in criticality.
     pub escalated_ids: Vec<String>,
-    /// Cleave's per-trait importance (`criticality weight × confidence`).
-    /// Judgement keeps every id; terminal rendering uses this only to choose
-    /// the most informative leaves when space is bounded.
-    pub trait_scores: HashMap<String, f32>,
+    /// Each gained id's tier and cleave's importance (`criticality weight ×
+    /// confidence`). Judgement keeps every id; the terminal reads this to rank.
+    pub traits: HashMap<String, TraitNote>,
+}
+
+/// One gained trait's tier and importance, for ranking.
+#[derive(Debug, Clone)]
+pub(crate) struct TraitNote {
+    pub severity: Severity,
+    pub score: f32,
 }
 
 impl Assessment {
@@ -184,6 +192,17 @@ pub(crate) struct IdentityChange {
 }
 
 impl IdentityChange {
+    fn severity(&self) -> Severity {
+        // Package author credits are not an authenticated publishing identity.
+        // A replacement is worth reviewing, but is not sufficient evidence of
+        // a takeover. Preserve the stronger signal when identity is stripped.
+        if self.label == "authors" && !self.new.is_empty() {
+            Severity::Medium
+        } else {
+            Severity::High
+        }
+    }
+
     /// The two sides as every renderer shows them: an absent value reads as
     /// `none`, so a signature that disappeared says "Apple Dev X → none" rather
     /// than trailing off into an empty gap.
@@ -240,7 +259,47 @@ pub(crate) struct StructFact {
     pub severity: Severity,
     pub kind: FactKind,
     pub label: &'static str,
-    pub detail: String,
+    /// The artifact the fact was read from — `name · abi` for a binary image —
+    /// when the fact is about one member rather than the whole change. The
+    /// terminal lays it out apart from the detail; the prose renderers join
+    /// them with [`sentence`](Self::sentence).
+    pub subject: Option<String>,
+    /// The observations behind the label as `(name, value)` rows —
+    /// `("entry", "0x1060 → 0x5000")`. A rubric fact carries one unnamed row:
+    /// the names read from the artifact.
+    pub facts: Vec<(&'static str, String)>,
+    /// What the fact does *not* prove, when that is easy to over-read.
+    pub caveat: Option<&'static str>,
+}
+
+impl StructFact {
+    /// The fact as one sentence — `subject: name value; name value (caveat)` —
+    /// for the prose renderers and the LLM.
+    pub(crate) fn sentence(&self) -> String {
+        let mut s = self
+            .subject
+            .as_ref()
+            .map(|subject| format!("{subject}: "))
+            .unwrap_or_default();
+        s.push_str(
+            &self
+                .facts
+                .iter()
+                .map(|(name, value)| {
+                    if name.is_empty() {
+                        value.clone()
+                    } else {
+                        format!("{name} {value}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+        if let Some(caveat) = self.caveat {
+            s.push_str(&format!(" ({caveat})"));
+        }
+        s
+    }
 }
 
 /// Judge a whole diff report. `base_classes` is the set of capability classes
@@ -253,16 +312,16 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &HashSet<String>) -> Ass
     let mut identity_changes: Vec<IdentityChange> = Vec::new();
 
     for file in &diff.files {
-        // Identity *drift* needs a previous identity to drift from. A file the
-        // change adds has none, so cleave reports `absent → <author>` — true,
-        // but not a publisher change: committing a first `package.json` would
-        // otherwise read as a takeover.
-        if let Some(idd) = file
-            .identity
-            .as_ref()
-            .filter(|i| i.changed)
-            .filter(|_| !matches!(file.status, cleave::types::FileStatus::Added))
-        {
+        // Identity drift compares a surviving file on both sides. Adding or
+        // deleting a whole member changes inventory, not its publisher claims.
+        // In contrast, stripping identity from a file that remains Changed is
+        // still drift and must keep its severity.
+        if let Some(idd) = file.identity.as_ref().filter(|i| i.changed).filter(|_| {
+            !matches!(
+                file.status,
+                cleave::types::FileStatus::Added | cleave::types::FileStatus::Removed
+            )
+        }) {
             identity_changes.extend(meaningful_identity_changes(
                 idd.old.as_ref(),
                 idd.new.as_ref(),
@@ -305,16 +364,22 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &HashSet<String>) -> Ass
                     namespaces: Vec::new(),
                     new_ids: Vec::new(),
                     escalated_ids: Vec::new(),
-                    trait_scores: HashMap::new(),
+                    traits: HashMap::new(),
                 });
                 entry.severity = entry.severity.max(sev);
                 entry.namespaces.push(namespace_of(&tc.id));
                 let score = tc.crit.score_weight() as f32 * tc.conf;
                 entry
-                    .trait_scores
+                    .traits
                     .entry(tc.id.clone())
-                    .and_modify(|old| *old = old.max(score))
-                    .or_insert(score);
+                    .and_modify(|note| {
+                        note.score = note.score.max(score);
+                        note.severity = note.severity.max(sev);
+                    })
+                    .or_insert(TraitNote {
+                        severity: sev,
+                        score,
+                    });
                 if is_new {
                     entry.new_ids.push(tc.id.clone());
                 } else {
@@ -363,11 +428,11 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &HashSet<String>) -> Ass
         .map(|s| s.severity)
         .max()
         .unwrap_or(Severity::None);
-    let identity_sev = if identity_changes.is_empty() {
-        Severity::None
-    } else {
-        Severity::High
-    };
+    let identity_sev = identity_changes
+        .iter()
+        .map(IdentityChange::severity)
+        .max()
+        .unwrap_or(Severity::None);
 
     let structure = structural_facts(diff);
     let structure_sev = structure.severity;
@@ -419,21 +484,21 @@ fn structural_facts(diff: &DiffReportV1) -> Structure {
         if let Some(kv) = file.scopes.kv.as_ref() {
             for k in &kv.added {
                 let p = &k.path;
-                if p.contains("needed_versions") {
-                    continue;
-                }
+                // ELF checks below use exact filefacts fields, not arbitrary
+                // source keys: translations containing "needed" are not
+                // loader dependencies. Cleave flattens scalar arrays as
+                // `field[]=value`.
                 if let Some(name) = dependency_name(p) {
                     pkg_deps.push(name.to_owned());
                 } else if p.ends_with(".uses") {
                     if let Some(a) = github_action(&k.value) {
                         actions_new.push(a);
                     }
-                } else if p.contains("needed") {
+                } else if p == "elf.needed" || p.starts_with("elf.needed[]=") {
                     push_val(&mut deps, &k.value);
-                } else if p.contains("ifuncs") {
+                } else if p == "elf.ifuncs" || p.starts_with("elf.ifuncs[]=") {
                     push_val(&mut ifuncs, &k.value);
-                } else if p.contains("dynsym")
-                    && let Some((_, rest)) = p.split_once("name=")
+                } else if let Some(rest) = p.strip_prefix("elf.dynsym_funcs[name=")
                     && let Some((name, _)) = rest.split_once(']')
                 {
                     dynsyms.push(name.to_string());
@@ -453,7 +518,9 @@ fn structural_facts(diff: &DiffReportV1) -> Structure {
         // A newly-set dynamic-linker auditor hook — xz's interception surface.
         if let Some(m) = file.scopes.metrics.as_ref() {
             for a in &m.added {
-                if a.path.ends_with("has_dt_audit") || a.path.ends_with("has_dt_depaudit") {
+                if matches!(a.path.as_str(), "elf.has_dt_audit" | "elf.has_dt_depaudit")
+                    && a.value.as_f64().is_some_and(|value| value > 0.0)
+                {
                     audit = true;
                 }
             }
@@ -520,11 +587,13 @@ fn structural_facts(diff: &DiffReportV1) -> Structure {
             severity,
             kind,
             label,
+            subject: None,
             // The names are lifted from the artifact (dependency and action
             // names, section names, imports); neutralize control chars so a
             // crafted name can't spoof the terminal. The ` · ` separators are
             // ours and survive unchanged.
-            detail: crate::printable(&names.join(" · ")),
+            facts: vec![("", crate::printable(&names.join(" · ")))],
+            caveat: None,
         });
     };
     if audit {
@@ -669,6 +738,20 @@ pub(crate) fn namespace_of(id: &str) -> String {
     }
 }
 
+/// The full taxonomy namespace, excluding the unstable local trait ID.
+pub(crate) fn trait_namespace(id: &str) -> &str {
+    id.split_once("::").map_or(id, |(namespace, _)| namespace)
+}
+
+/// Match a hierarchy at a path-component boundary, never inside a local ID.
+pub(crate) fn in_trait_hierarchy(id: &str, hierarchy: &str) -> bool {
+    let namespace = trait_namespace(id);
+    namespace == hierarchy
+        || namespace
+            .strip_prefix(hierarchy)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Meaningful identity changes between two sides. Deliberately excludes
 /// `version` (a version bump is not a publisher change) and signature
 /// timestamps; a change in author, signer, organization, publisher account,
@@ -727,6 +810,14 @@ fn meaningful_identity_changes(
     }
 
     let mut out = Vec::new();
+    // Filename-derived labels are not publisher claims, even when the member
+    // carrying one disappears entirely. Check before the one-sided branches
+    // so deleting a nested archive cannot invent identity stripping.
+    // A filename fallback opposite a manifest identity also indicates weaker
+    // extraction, not evidence of a publisher takeover.
+    if old.is_some_and(filename_only_identity) || new.is_some_and(filename_only_identity) {
+        return out;
+    }
     let (o, n) = match (old, new) {
         (Some(o), Some(n)) => (o, n),
         (Some(o), None) => {
@@ -745,15 +836,6 @@ fn meaningful_identity_changes(
         // (`absent → Alex Gherghisan`) when nothing was taken over.
         (None, _) => return out,
     };
-
-    // Archive filenames are weak fallback identity, not publisher metadata.
-    // A reconstructed package can have a synthetic filename while its embedded
-    // package.json retains the real scoped npm name. If either side degraded to
-    // filename-only identity, comparing it with a manifest-derived identity
-    // invents an author/name takeover that never occurred.
-    if filename_only_identity(o) || filename_only_identity(n) {
-        return out;
-    }
 
     // Some analyzers emit an Identity object on both sides even when the old
     // object carries no claims. Treating `empty -> named` as drift makes a
@@ -801,7 +883,16 @@ fn meaningful_identity_changes(
             .collect::<HashSet<_>>()
     };
     if !author_set(o).is_subset(&author_set(n)) {
-        push("authors", authors(o), authors(n));
+        let credits_only = o
+            .authors
+            .iter()
+            .chain(&n.authors)
+            .all(|p| p.role == "author");
+        push(
+            if credits_only { "authors" } else { "publisher" },
+            authors(o),
+            authors(n),
+        );
     }
     push("signer", signer(o), signer(n));
     push(
@@ -1129,6 +1220,34 @@ mod tests {
         assert_eq!(a("docker://alpine:3"), None);
         // A bare slug with no owner/repo is not a remote action.
         assert_eq!(a("node@18"), None);
+    }
+
+    #[test]
+    fn removing_filename_only_identity_is_not_publisher_removal() {
+        let fallback = filefacts::Identity {
+            name: Some(filefacts::Claim::claimed("example", "file.basename")),
+            version: Some(filefacts::Claim::claimed("1.2.3", "file.basename")),
+            ..Default::default()
+        };
+        assert!(meaningful_identity_changes(Some(&fallback), None).is_empty());
+        assert!(meaningful_identity_changes(None, Some(&fallback)).is_empty());
+
+        // Actual manifest claims must remain evidence, including when the
+        // artifact also carries a filename-derived name.
+        let manifest = filefacts::Identity {
+            name: Some(filefacts::Claim::claimed("example", "npm.name")),
+            ..Default::default()
+        };
+        let with_publisher = filefacts::Identity {
+            organization: Some(filefacts::Claim::claimed("Example", "npm.author.name")),
+            ..fallback
+        };
+        for identity in [&manifest, &with_publisher] {
+            let changes = meaningful_identity_changes(Some(identity), None);
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].label, "identity");
+            assert_eq!(changes[0].new, "removed");
+        }
     }
 
     #[test]

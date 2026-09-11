@@ -3,8 +3,13 @@
 #
 # Refuses the commit unless:
 #   1. Cargo.toml has no active local path override.
-#   2. `make lint` passes (rustfmt --check, then clippy with -D warnings).
-#   3. `make test` passes.
+#   2. `make test` passes.
+#   3. `make lint` passes (rustfmt --check, then clippy with -D warnings).
+#
+# Test runs BEFORE lint on purpose (mirrors ../scan and ../cleave): `cargo
+# test` fully builds the dependency tree, which clippy then reuses, so
+# `make lint` re-checks only isomer itself instead of re-checking the whole
+# dep tree.
 #
 # Bypass intentionally with `git commit --no-verify`.
 #
@@ -31,10 +36,10 @@ if grep -nE '^[[:space:]]*[^#].*path[[:space:]]*=[[:space:]]*"\.\.' Cargo.toml; 
 	exit 1
 fi
 
-echo "pre-commit: running make lint..."
-make lint
-
 echo "pre-commit: running make test..."
 make test
+
+echo "pre-commit: running make lint..."
+make lint
 
 echo "pre-commit: all checks passed."

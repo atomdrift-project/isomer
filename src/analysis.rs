@@ -22,7 +22,7 @@ use cleave::types::{
 };
 
 use crate::evidence::Hunk;
-use crate::rubric::Assessment;
+use crate::rubric::{Assessment, in_trait_hierarchy, trait_namespace};
 use crate::version::{Bump, BumpKind, Version};
 use crate::{Cli, Format, Gate, Severity};
 
@@ -258,6 +258,7 @@ pub(crate) struct Analysis<'a> {
     /// attributed to the dependency. Empty unless `--deps` was requested; a
     /// verb fills it after construction, since it is a separate network step.
     pub deps: Vec<crate::deps::DepProfile>,
+    pub registry: Vec<crate::registry::Comparison>,
     /// Evidence hunks, ranked strongest-first, computed on first use.
     ///
     /// Collecting them re-analyzes every changed file, and `ci` renders four
@@ -323,7 +324,8 @@ impl<'a> Analysis<'a> {
         // new class is distinguishable from one that merely gained a trait)
         // and the ATT&CK / MBC annotations each side carries.
         let survey = crate::evidence::survey(&pairs, options);
-        let assessment = crate::rubric::assess(&judged_diff, &survey.base_classes);
+        let mut assessment = crate::rubric::assess(&judged_diff, &survey.base_classes);
+        crate::binary::enrich(&pairs, &judged_diff, &mut assessment);
         let naming = Naming::resolve(old, new, cli, &judged_diff);
         let prop = Proportionality::eval(
             &assessment,
@@ -430,6 +432,7 @@ impl<'a> Analysis<'a> {
             risk_llm_raised: false,
             scope: None,
             deps: Vec::new(),
+            registry: Vec::new(),
             hunks: OnceCell::new(),
             source_changes: OnceCell::new(),
         };
@@ -447,6 +450,32 @@ impl<'a> Analysis<'a> {
     /// `ci` never folded the profiles in, so `isomer ci --deps` silently
     /// skipped interpretation altogether.
     pub(crate) fn finish(&mut self, cli: &Cli) {
+        if crate::registry::enabled(cli) {
+            self.registry = crate::registry::audit(&self.pairs, self.diff, self.options);
+            for row in &mut self.registry {
+                row.apply_release_policy(self.naming.bump);
+            }
+            let any = self
+                .registry
+                .iter()
+                .map(crate::registry::Comparison::severity)
+                .max()
+                .unwrap_or(Severity::None);
+            let new = self
+                .registry
+                .iter()
+                .map(|r| r.new_severity)
+                .max()
+                .unwrap_or(Severity::None);
+            self.deterministic_verdict = self.deterministic_verdict.max(any);
+            self.verdict = self.verdict.max(any);
+            self.new_verdict = self.new_verdict.max(new);
+            self.gated = match cli.gate {
+                Gate::New => self.new_verdict,
+                Gate::Any => self.verdict,
+            };
+            self.clean = !self.gated.fails(cli.fail_on);
+        }
         if cli.deps && !cli.offline {
             let profiles = crate::deps::profiles(self.diff, self.options, cli.progress());
             self.apply_dependency_profiles(profiles, cli);
@@ -454,17 +483,16 @@ impl<'a> Analysis<'a> {
         self.interpret(cli);
     }
 
-    /// Fold fetched added-dependency profiles into the deterministic verdict.
-    /// A newly declared dependency is wholly new code from this artifact's
-    /// perspective; when `--deps` finds High/Critical behavior in it, merely
-    /// printing that profile while returning a passing gate would be a false
-    /// negative. Fetch failures remain visible notes and contribute no score.
+    /// Keep absolute current risk for `any`, but gate `new` on the comparative
+    /// dependency profile when a predecessor is known. Independent evidence
+    /// is never lowered by an equivalent or reduced dependency profile.
     fn apply_dependency_profiles(&mut self, profiles: Vec<crate::deps::DepProfile>, cli: &Cli) {
         let severity = crate::deps::severity(&profiles);
+        let new_severity = crate::deps::new_severity(&profiles);
         self.deps = profiles;
         self.deterministic_verdict = self.deterministic_verdict.max(severity);
         self.verdict = self.verdict.max(severity);
-        self.new_verdict = self.new_verdict.max(severity);
+        self.new_verdict = self.new_verdict.max(new_severity);
         self.gated = match cli.gate {
             Gate::New => self.new_verdict,
             Gate::Any => self.verdict,
@@ -816,11 +844,11 @@ impl<'a> Analysis<'a> {
                 "auto-loaded source downloads, writes, and executes a payload in {member}"
             );
         }
-        if obfuscated_remote_script_loader(self.display_diff()) {
-            return "gained obfuscated remote browser script loader".to_string();
+        if gained_encoded_script_loading(self.display_diff()) {
+            return "gained character-code conversion and browser script loading".to_string();
         }
-        if external_remote_script_loader(self.display_diff()) {
-            return "gained external browser script loader".to_string();
+        if gained_script_loading_with_host(self.display_diff()) {
+            return "gained browser script loading and remote host references".to_string();
         }
         if binary_replacement_anomaly(self.display_diff(), self.naming.bump).is_some() {
             return "same-version compiled binary was structurally replaced".to_string();
@@ -881,9 +909,24 @@ impl<'a> Analysis<'a> {
             );
         }
         if let Some(f) = self.assessment.structure.facts.first() {
-            return format!("{}: {}", f.label, f.detail);
+            return format!("{}: {}", f.label, f.sentence());
         }
         "no behavioral change".to_string()
+    }
+
+    /// The scalar metrics that moved most across the whole change, ranked.
+    /// A package-wide top six is meaningful for a compact implant, but in a
+    /// thousand-file framework release it merely selects unrelated local
+    /// extrema from arbitrary files, so large releases get none here; their
+    /// complete metrics stay in JSON and their per-file movers ride each
+    /// evidence header.
+    pub(crate) fn metric_moves(&self) -> Vec<MetricMove> {
+        let d = self.display_diff();
+        if compact_change(&d.summary) {
+            strongest_metric_changes(d, 6)
+        } else {
+            Vec::new()
+        }
     }
 
     /// Compact, cross-scope facts about the *shape* of the differential. These
@@ -904,14 +947,20 @@ impl<'a> Analysis<'a> {
             changed = changed.saturating_sub(1);
         }
         let total = added + removed + changed + unchanged;
-        let mut lines = vec![format!(
-            "files: +{added} added, -{removed} removed, ~{changed} changed{}",
-            if total > 0 {
-                format!(", {total} compared")
-            } else {
-                String::new()
-            }
-        )];
+        // Only the counts that are non-zero; `+0 added` says nothing.
+        let mut files: Vec<String> = [
+            (added, "+", "added"),
+            (removed, "-", "removed"),
+            (changed, "~", "changed"),
+        ]
+        .into_iter()
+        .filter(|(n, ..)| *n > 0)
+        .map(|(n, sign, word)| format!("{sign}{n} {word}"))
+        .collect();
+        if total > 0 {
+            files.push(format!("{total} compared"));
+        }
+        let mut lines = vec![format!("files: {}", files.join(", "))];
         lines.push(format!(
             "scope ROC: overall {:.0}% · traits {:.0}% · metrics {:.0}% · facts {:.0}%",
             d.summary.overall_roc * 100.0,
@@ -922,18 +971,16 @@ impl<'a> Analysis<'a> {
         if let Some(size) = root_size_delta(d) {
             lines.push(format!("package size: {size}"));
         }
-        // A package-wide top six is meaningful for a compact implant, but in
-        // a thousand-file framework release it merely selects unrelated local
-        // extrema from arbitrary files. Large releases retain their complete
-        // metrics in JSON and their per-file ranked summaries in human views.
-        if compact_change(&d.summary) {
-            let metric_changes = strongest_metric_changes(d, 6);
-            if !metric_changes.is_empty() {
-                lines.push(format!(
-                    "largest metric changes: {}",
-                    metric_changes.join(" · ")
-                ));
-            }
+        let moves = self.metric_moves();
+        if !moves.is_empty() {
+            lines.push(format!(
+                "largest metric changes: {}",
+                moves
+                    .iter()
+                    .map(MetricMove::describe)
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            ));
         }
         if let Some(replacement) = binary_replacement_anomaly(d, self.naming.bump) {
             lines.push(format!(
@@ -998,11 +1045,34 @@ impl<'a> Analysis<'a> {
                 Clone::clone,
             );
             lines.push(format!(
-                "added dependency profile: {} · {} · {}",
+                "dependency profile: {} · {} · {} · {} (new: {})",
                 dependency.coord,
                 dependency.severity.as_str(),
-                detail
+                detail,
+                dependency.comparison,
+                dependency.new_severity.as_str()
             ));
+        }
+        for row in &self.registry {
+            for (side, observation) in [("before", &row.old), ("after", &row.new)] {
+                if let Some(observation) = observation {
+                    for finding in &observation.findings {
+                        lines.push(format!(
+                            "current registry {side}: {} · {} (new risk: {})",
+                            crate::printable(&observation.coordinate),
+                            finding.description,
+                            row.new_severity.as_str()
+                        ));
+                    }
+                    if let Some(error) = &observation.error {
+                        lines.push(format!(
+                            "registry coverage gap ({side}): {} · {}",
+                            crate::printable(&observation.coordinate),
+                            crate::printable(error)
+                        ));
+                    }
+                }
+            }
         }
         if restored_endgame_package_shape(d) {
             lines.push(
@@ -1025,14 +1095,14 @@ impl<'a> Analysis<'a> {
             ),
             None => {}
         }
-        if obfuscated_remote_script_loader(d) {
+        if gained_encoded_script_loading(d) {
             lines.push(
-                "joined behavior: one file builds text from a long numeric array and injects it as a remote browser script"
+                "joined behavior: one file gains character-code conversion and script loading; dataflow is not established"
                     .to_string(),
             );
-        } else if external_remote_script_loader(d) {
+        } else if gained_script_loading_with_host(d) {
             lines.push(
-                "joined behavior: one file creates a script element and dynamically loads a literal external host"
+                "joined behavior: one file gains script loading and remote host references; the loaded destination is not established"
                     .to_string(),
             );
         }
@@ -1391,7 +1461,7 @@ impl<'a> Analysis<'a> {
                     "- [{}] {kind} {}: {}",
                     f.severity.as_str(),
                     f.label,
-                    f.detail
+                    f.sentence()
                 );
             }
         }
@@ -1513,7 +1583,7 @@ impl<'a> Analysis<'a> {
                     crate::rubric::FactKind::Became => "became",
                 },
                 label: f.label,
-                detail: &f.detail,
+                detail: f.sentence(),
             })
             .collect();
         let changes = a
@@ -1555,7 +1625,8 @@ impl<'a> Analysis<'a> {
             .iter()
             .find_map(|f| f.identity.as_ref())
             .map_or((None, None), |idd| (idd.old.as_ref(), idd.new.as_ref()));
-        let features = feature_set(self.display_diff());
+        let mut features = feature_set(self.display_diff());
+        features.trait_shift = Some(self.survey.trait_profiles.shift());
 
         let envelope = j::Envelope {
             v: "2",
@@ -1587,6 +1658,7 @@ impl<'a> Analysis<'a> {
                     old: r.old,
                     new: r.new,
                     delta: r.delta(),
+                    new_classification: r.new_classification.to_string(),
                     model: if self.risk_llm_raised {
                         "azoth+llm"
                     } else {
@@ -1635,11 +1707,16 @@ impl<'a> Analysis<'a> {
                 .deps
                 .iter()
                 .map(|d| j::Dep {
+                    profile: &d.risk,
+                    baseline_profile: d.baseline_risk.as_ref(),
                     coord: &d.coord,
                     ecosystem: d.ecosystem,
                     severity: d.severity.as_str(),
                     highlights: &d.highlights,
                     note: d.note.as_deref(),
+                    baseline: d.baseline.as_deref(),
+                    new_severity: d.new_severity.as_str(),
+                    comparison: &d.comparison,
                 })
                 .collect(),
             llm: self.interp.as_ref().map(|i| j::Llm {
@@ -1648,6 +1725,7 @@ impl<'a> Analysis<'a> {
                 model: &i.model,
             }),
             raw: self.report,
+            registry: &self.registry,
         };
         Ok(serde_json::to_string(&envelope)?)
     }
@@ -1660,7 +1738,8 @@ fn archive_member_pair<'a>(
     raw: &'a DiffReportV1,
     normalized: &FileDiffEntry,
 ) -> Option<(&'a str, &'a str)> {
-    let key = normalized_member_path(&normalized.path);
+    let roots = archive_roots::Roots::from_diff(raw);
+    let key = roots.key(&normalized.path);
     // The literal name this member goes by on the side it is not `absent` from
     // — `Added` is the status missing from the old side, `Removed` from the
     // new. Only a lone candidate names a side; several would be a guess.
@@ -1668,7 +1747,7 @@ fn archive_member_pair<'a>(
         let mut members = raw
             .files
             .iter()
-            .filter(|entry| entry.status != absent && normalized_member_path(&entry.path) == key)
+            .filter(|entry| entry.status != absent && roots.key(&entry.path) == key)
             .filter_map(|entry| entry.path.split_once("!!").map(|(_, member)| member))
             .filter(|member| !member.contains('!'));
         let member = members.next()?;
@@ -1729,6 +1808,8 @@ fn feature_set(diff: &DiffReportV1) -> crate::json::FeatureSet<'_> {
         + summary.files_changed
         + summary.files_unchanged;
     j::FeatureSet {
+        judged_summary: diff.summary.clone(),
+        trait_shift: None,
         v: "1",
         topology: j::Topology {
             added: summary.files_added,
@@ -2000,9 +2081,10 @@ pub(crate) fn risk_band(p: f32) -> Severity {
 /// Treat Azoth as a strong differential signal only when the probability move
 /// is meaningful, not merely because a release crossed 0.50 or 0.90 by a few
 /// points. A high-band move needs both a high absolute score and a large jump;
-/// a critical-band move is inherently stronger but still needs a visible
-/// delta. This keeps model calibration noise from overriding clean-release
-/// ground truth while preserving large jumps into clearly dangerous territory.
+/// a critical-band move still needs a visible delta. The model's calibrated
+/// classification caps this signal: a benign decision is not an independent
+/// alarm, and a suspicious decision cannot become Critical from probability
+/// alone. Structural and behavioral evidence remain independent.
 fn significant_risk_escalation(risk: crate::risk::Risk) -> Severity {
     const MIN_DELTA: f32 = 0.10;
     const HIGH_SCORE: f32 = 0.75;
@@ -2011,11 +2093,13 @@ fn significant_risk_escalation(risk: crate::risk::Risk) -> Severity {
     if risk.delta() < MIN_DELTA {
         return Severity::None;
     }
-    match risk_band(risk.new) {
+    let ceiling = risk.model_severity();
+    let escalation = match risk_band(risk.new) {
         Severity::Critical => Severity::Critical,
         Severity::High if risk.new >= HIGH_SCORE && risk.delta() >= HIGH_DELTA => Severity::High,
         _ => Severity::None,
-    }
+    };
+    escalation.min(ceiling)
 }
 
 /// Combine the independent signals. Kept pure so simulations exercise the
@@ -2203,33 +2287,35 @@ fn normalized_archive_diff(diff: &DiffReportV1) -> Cow<'_, DiffReportV1> {
     decoded::reconcile_traits(normalized_archive_members(diff))
 }
 
+mod archive_roots;
 mod decoded;
 
 fn normalized_archive_members(diff: &DiffReportV1) -> Cow<'_, DiffReportV1> {
     use std::collections::BTreeSet;
 
-    let mut groups: BTreeMap<String, (Option<&FileDiffEntry>, Option<&FileDiffEntry>)> =
-        BTreeMap::new();
+    let roots = archive_roots::Roots::from_diff(diff);
+    let mut groups: BTreeMap<_, Vec<&FileDiffEntry>> = BTreeMap::new();
     for file in &diff.files {
         if !file.path.contains("!!") {
             continue;
         }
-        let key = normalized_member_path(&file.path);
-        let pair = groups.entry(key).or_default();
-        match file.status {
-            FileStatus::Removed => pair.0 = Some(file),
-            FileStatus::Added => pair.1 = Some(file),
-            FileStatus::Changed | FileStatus::Unchanged => {}
-        }
+        groups.entry(roots.key(&file.path)).or_default().push(file);
     }
 
     let mut aliases: Vec<(&FileDiffEntry, &FileDiffEntry)> = groups
         .values()
-        .filter_map(|(old, new)| {
-            let (Some(old), Some(new)) = (old.as_ref(), new.as_ref()) else {
+        .filter_map(|candidates| {
+            // Neither duplicate roots nor an existing exact-path pair may be
+            // overwritten by another member with the same normalized key.
+            let [a, b] = candidates.as_slice() else {
                 return None;
             };
-            (old.path != new.path).then_some((*old, *new))
+            let (old, new) = match (a.status, b.status) {
+                (FileStatus::Removed, FileStatus::Added) => (*a, *b),
+                (FileStatus::Added, FileStatus::Removed) => (*b, *a),
+                _ => return None,
+            };
+            (old.path != new.path).then_some((old, new))
         })
         .collect();
 
@@ -2335,12 +2421,14 @@ fn normalized_archive_members(diff: &DiffReportV1) -> Cow<'_, DiffReportV1> {
         }
         let identity = merge_identity(old, new);
         let scopes = merge_scopes(old, new);
-        let status =
-            if identity.as_ref().is_some_and(|diff| diff.changed) || scope_diffs_changed(&scopes) {
-                FileStatus::Changed
-            } else {
-                FileStatus::Unchanged
-            };
+        let status = if old.file_type != new.file_type
+            || identity.as_ref().is_some_and(|diff| diff.changed)
+            || scope_diffs_changed(&scopes)
+        {
+            FileStatus::Changed
+        } else {
+            FileStatus::Unchanged
+        };
         files.push(FileDiffEntry {
             path: new.path.clone(),
             file_type: new.file_type.clone().or_else(|| old.file_type.clone()),
@@ -2934,13 +3022,18 @@ fn change_shape_escalation(
     // The shared size bound: a small, focused change. Several branches below
     // are meaningful only within one, and a large release trips none of them.
     let compact = compact_change(s);
+    // These generic shape rules promise wholly new capabilities, not merely
+    // new detector spellings inside classes already present in the baseline.
+    // Packaging/metric metadata is not another behavioral capability.
     let new_classes = a
         .behavioral
         .categories
         .iter()
-        .filter(|c| !c.new_ids.is_empty())
+        .filter(|c| a.behavioral.is_new_category(c))
+        .filter(|c| c.new_ids.iter().any(|id| !id.starts_with("metadata/")))
         .count();
-    let focused_source = s.files_changed <= 2
+    let focused_source = routine_release(bump)
+        && s.files_changed <= 2
         && s.files_added <= 2
         && s.files_removed <= 2
         && s.overall_roc >= 0.20
@@ -2950,7 +3043,8 @@ fn change_shape_escalation(
     // while concentrating several new capabilities in a few changed files.
     // Keep this separate from the small focused branch: the higher movement
     // and four-class floor prevent routine patch cleanup from escalating.
-    let focused_source_with_cleanup = s.files_changed <= 4
+    let focused_source_with_cleanup = routine_release(bump)
+        && s.files_changed <= 4
         && s.files_added + s.files_removed <= 16
         && s.overall_roc >= 0.60
         && s.scope_roc.traits >= 0.60
@@ -2960,13 +3054,14 @@ fn change_shape_escalation(
     // in a small patch is a common dormant-loader shape. The class count and
     // movement floors keep ordinary single-purpose WordPress changes below
     // this branch.
-    let cross_domain_cluster = compact
+    let cross_domain_cluster = routine_release(bump)
+        && compact
         && s.overall_roc >= 0.05
         && s.scope_roc.traits >= 0.15
         && new_classes >= 6
         && ["communications/http", "time/schedule", "data/serialize"]
             .iter()
-            .all(|class| has_new_class(a, class));
+            .all(|class| a.behavioral.new_categories.contains(*class));
     // External content inserted as HTML in a plugin installer can turn a
     // poisoned feed into code running with administrator privileges. This is
     // a review signal, not proof of taint flow: require all four new legs in
@@ -2974,13 +3069,13 @@ fn change_shape_escalation(
     // across an application are too common to be useful evidence.
     let external_admin_html = routine_release(bump)
         && compact
-        && file_gained_all_traits(
+        && file_gained_all_hierarchies(
             diff,
             &[
-                "::fetch-external-url",
-                "::fetch-then-json",
-                "::dom-outer-html-insertion-sink",
-                "::plugin-upload-action-endpoint",
+                "micro-behaviors/communications/http/request/json",
+                "micro-behaviors/communications/http/request/client",
+                "micro-behaviors/ui/window/manage/html-insert",
+                "micro-behaviors/communications/http/request/plugin-install",
             ],
         );
     let endgame = endgame_package_shape(s);
@@ -2994,36 +3089,18 @@ fn change_shape_escalation(
         dependency_backed_public_api_anomaly(diff, bump, runtime_entrypoints).is_some();
     let source_download_execute =
         source_download_write_execute_anomaly(diff, bump, runtime_entrypoints).is_some();
-    // A remote browser loader, whether its destination is a literal host or is
-    // assembled from character codes, is much stronger than any component
-    // atomic. Require complete convergence on one file and use it as release-
+    // Script loading alongside character-code conversion or remote host
+    // references is a review signal, not proof of remote code execution.
+    // Require convergence on one file and use it as release-
     // pressure evidence only for same/patch releases: a major browser
-    // framework can legitimately add a loader, but a patch has almost no
-    // budget for a new remote-code path.
+    // framework can legitimately add these behavior families together.
     let remote_script_loader = routine_release(bump)
-        && (obfuscated_remote_script_loader(diff) || external_remote_script_loader(diff));
+        && (gained_encoded_script_loading(diff) || gained_script_loading_with_host(diff));
     // A newly added encrypted ZIP disguised as another resource format is a
     // compact payload-delivery clue. Keep the differential rule narrow: it
     // must contain many encrypted entries and an executable member, so a
     // routine password-protected source archive does not fail a release.
-    let added_encrypted_payload_archive = same_version
-        && diff.files.iter().any(|file| {
-            matches!(file.status, FileStatus::Added)
-                && file.scopes.traits.as_ref().is_some_and(|traits| {
-                    let has = |id: &str| {
-                        traits
-                            .added
-                            .iter()
-                            .any(|trait_change| trait_change.id == id)
-                    };
-                    has("micro-behaviors/data/archive/zip::zip-encrypted-entry")
-                        && has("micro-behaviors/data/archive/zip::zipcrypto-many-encrypted-entries")
-                        && has(
-                            "metadata/file/extension/identity::archive-content-extension-mismatch",
-                        )
-                        && has("metadata/file/metrics::archive-contains-executable-member")
-                })
-        });
+    let added_encrypted_payload_archive = same_version && added_disguised_encrypted_archive(diff);
     // A same-version archive replacement is unusual on its own, but it is a
     // strong supply-chain shape when the replacement also changes archive
     // protection and introduces anti-analysis signals. This catches bundled
@@ -3054,14 +3131,14 @@ fn change_shape_escalation(
             let text = traits
                 .added
                 .iter()
-                .map(|t| format!("{} {}", t.id, t.desc))
+                .map(|t| trait_namespace(&t.id))
                 .chain(
                     traits
                         .changed
                         .iter()
-                        .map(|change| format!("{} {}", change.new.id, change.new.desc)),
+                        .map(|change| trait_namespace(&change.new.id)),
                 )
-                .map(|text| text.to_ascii_lowercase())
+                .map(str::to_ascii_lowercase)
                 .collect::<Vec<_>>();
             let has = |needles: &[&str]| {
                 text.iter()
@@ -3118,24 +3195,11 @@ fn change_shape_escalation(
             .iter()
             .all(|class| classes.iter().any(|got| got == class))
         });
-    let encoded_payload_classes = [
-        "file/encoded",
-        "anti-static",
-        "process/interpreter",
-        "communications/http",
-        "fs/file",
-    ]
-    .iter()
-    .filter(|class| has_new_class(a, class))
-    .count();
-    // A newly encoded/obfuscated file plus execution and an external or file
-    // effect is a compact payload shape even when normal package files moved
+    // A newly encoded/obfuscated file plus execution and a network/file effect
+    // or detached process lifetime is a compact payload shape even when files moved
     // around it. This is deliberately a class-level combination, not a
     // filename or campaign signature.
-    let encoded_payload_cluster = encoded_payload_classes >= 3
-        && compact
-        && has_new_class(a, "anti-static")
-        && has_new_class(a, "file/encoded");
+    let encoded_payload_cluster = compact && gained_encoded_execution_cluster(diff);
 
     // Two platform-neutral release shapes deserve a high review signal even
     // when each individual trait is only medium:
@@ -3149,17 +3213,6 @@ fn change_shape_escalation(
             .iter()
             .any(|category| category.class.starts_with(prefix) && !category.new_ids.is_empty())
     };
-    let new_id_contains = |needles: &[&str]| {
-        a.behavioral
-            .categories
-            .iter()
-            .filter(|category| !category.new_ids.is_empty())
-            .flat_map(|category| category.new_ids.iter())
-            .any(|id| {
-                let id = id.to_ascii_lowercase();
-                needles.iter().any(|needle| id.contains(needle))
-            })
-    };
     let native_hook_cluster = has_prefix("process/create")
         && has_prefix("communications/http")
         && has_prefix("anti-analysis")
@@ -3168,9 +3221,10 @@ fn change_shape_escalation(
             || has_prefix("os/signal"));
     let native_build_hook_cluster = has_prefix("process/create")
         && has_prefix("supply-chain")
-        && (has_prefix("os/syscall")
-            || has_prefix("os/signal")
-            || new_id_contains(&["syscall", "sigaction", "raw-"]))
+        // Read the capability namespace, not words in an arbitrary trait ID:
+        // HTTP raw-content-length-header is not a raw syscall, and a string
+        // mentioning sigaction is not evidence of installing a signal handler.
+        && (has_prefix("os/syscall") || has_prefix("os/signal"))
         && (!source_archive || source_build_anomaly);
     // Release-pressure evidence, like `remote_script_loader` above: the legs
     // below are a wallet library's ordinary job description, so they only
@@ -3179,12 +3233,7 @@ fn change_shape_escalation(
     // a remote host URL — because that is what an XRP Ledger client does
     // across two major versions; 2.14.1 -> 2.14.2, the real key-exfiltration
     // patch, is where the same conjunction means something.
-    let secret_egress_cluster = routine_release(bump)
-        && has_prefix("communications/http")
-        && (has_prefix("data/encode") || has_prefix("data/decode") || has_prefix("file/encoded"))
-        && (has_prefix("crypto/library") || has_prefix("crypto/asymmetric"))
-        && new_id_contains(&["private-key", "mnemonic", "wallet", "seed"])
-        && new_id_contains(&["external-url", "remote-host-url", "tld-"]);
+    let secret_egress_cluster = secret_egress_cluster(a, diff, bump);
     let executable_capability_bundle = executable_capability_escalation(diff, bump);
     let binary_replacement = binary_replacement_anomaly(diff, bump).is_some();
     let opaque_runtime_payload =
@@ -3614,6 +3663,59 @@ fn dependency_with_fallback_load(a: &Assessment, diff: &DiffReportV1) -> bool {
         && summary.overall_roc <= 0.25
 }
 
+/// A patch gains wallet/key handling, encoding, and HTTP host references
+/// together in one source file, with a core capability absent from the baseline.
+/// New marker IDs within existing classes cannot establish that new capability.
+/// New connections between existing capabilities require a separate differential
+/// behavioral finding; co-occurrence alone cannot prove a new flow of secrets.
+fn secret_egress_cluster(a: &Assessment, diff: &DiffReportV1, bump: Option<Bump>) -> bool {
+    routine_release(bump)
+        && diff.files.iter().any(|file| {
+            if !matches!(file.status, FileStatus::Added | FileStatus::Changed)
+                || !member_type(file).is_some_and(|kind| kind.is_source_code())
+            {
+                return false;
+            }
+            let Some(traits) = &file.scopes.traits else {
+                return false;
+            };
+            let ids = || traits.added.iter().map(|change| change.id.as_str());
+            let has_class = |prefix: &str| {
+                ids()
+                    .filter_map(crate::rubric::capability_class)
+                    .any(|class| in_trait_hierarchy(&class, prefix))
+            };
+            let gains_core_capability =
+                ids()
+                    .filter_map(crate::rubric::capability_class)
+                    .any(|class| {
+                        a.behavioral.new_categories.contains(&class)
+                            && [
+                                "communications/http",
+                                "crypto/library",
+                                "crypto/asymmetric",
+                                "credential-access",
+                            ]
+                            .iter()
+                            .any(|prefix| in_trait_hierarchy(&class, prefix))
+                    });
+            let has_secret = ids().any(|id| {
+                in_trait_hierarchy(id, "micro-behaviors/crypto/library/blockchain/wallet")
+                    || in_trait_hierarchy(id, "objectives/credential-access")
+            });
+            gains_core_capability
+                && has_secret
+                && has_class("communications/http")
+                && (has_class("data/encode")
+                    || has_class("data/decode")
+                    || has_class("file/encoded"))
+                && (has_class("crypto/library") || has_class("crypto/asymmetric"))
+                && ids().any(|id| {
+                    in_trait_hierarchy(id, "micro-behaviors/communications/http/url/domain")
+                })
+        })
+}
+
 #[derive(Debug)]
 struct DependencyApiExpansion {
     dependency: String,
@@ -3763,30 +3865,40 @@ fn source_download_write_execute_anomaly<'a>(
                 .map(|change| change.id.as_str())
                 .chain(traits.changed.iter().map(|change| change.new.id.as_str()))
         };
-        let has_class = |prefix: &str| {
-            ids()
-                .filter_map(crate::rubric::capability_class)
-                .any(|class| class.starts_with(prefix))
-        };
-        let fetches_response = ids().any(|id| {
-            let id = id.to_ascii_lowercase();
-            id.contains("download")
-                || id.contains("response-body-read")
-                || id.contains("urlopen-response")
-        });
+        let has = |hierarchy: &str| ids().any(|id| in_trait_hierarchy(id, hierarchy));
+        let fetches_response = has("micro-behaviors/communications/http/download")
+            || has("micro-behaviors/communications/http/client/response-body");
+        // A system-information read is not a conditional platform gate.
+        let platform_gated = has("micro-behaviors/os/sysinfo/platform/branch");
         (fetches_response
-            && has_class("communications/http")
-            && has_class("process/create")
-            && (has_class("fs/write") || has_class("fs/file"))
-            && has_class("os/sysinfo"))
-        .then_some(path)
+            && has("micro-behaviors/process/create")
+            && (has("micro-behaviors/fs/write") || has("micro-behaviors/fs/file/write"))
+            && platform_gated)
+            .then_some(path)
     })
 }
 
-/// Whether one added-or-changed file gained *every* one of `suffixes` as a new
-/// trait. Keeping the join file-local is the point: unrelated helpers scattered
+/// Structural evidence on one newly added archive, independent of trait names
+/// or whether YAML traits were loaded. Missing measurements are not positives.
+fn added_disguised_encrypted_archive(diff: &DiffReportV1) -> bool {
+    diff.files.iter().any(|file| {
+        file.status == FileStatus::Added
+            && new_metric_value(file, "archive.security.encrypted_count")
+                .is_some_and(|count| count >= 5.0)
+            && new_metric_value(file, "archive.executable_count").is_some_and(|count| count >= 1.0)
+            && new_metric_value(
+                file,
+                "consistency.extension_content_mismatch.archive_as_unknown",
+            )
+            .is_some_and(|mismatch| mismatch == 1.0)
+    })
+}
+
+/// Whether one added-or-changed file gained *every* hierarchy. A local ID rename
+/// within an existing hierarchy is not a new behavior. Keep the join file-local:
+/// unrelated helpers scattered
 /// across a normal web application must not add up to a loader.
-fn file_gained_all_traits(diff: &DiffReportV1, suffixes: &[&str]) -> bool {
+fn file_gained_all_hierarchies(diff: &DiffReportV1, hierarchies: &[&str]) -> bool {
     diff.files.iter().any(|file| {
         // Archive roots aggregate their members' traits. A join on that
         // synthetic scope would combine unrelated files into a false loader.
@@ -3798,42 +3910,82 @@ fn file_gained_all_traits(diff: &DiffReportV1, suffixes: &[&str]) -> bool {
         let Some(traits) = file.scopes.traits.as_ref() else {
             return false;
         };
-        suffixes.iter().all(|suffix| {
-            traits
-                .added
+        hierarchies.iter().all(|hierarchy| {
+            traits.added.iter().any(|change| {
+                change.crit >= cleave::Criticality::Notable
+                    && in_trait_hierarchy(&change.id, hierarchy)
+            }) && !traits
+                .removed
                 .iter()
-                .any(|trait_change| trait_change.id.ends_with(suffix))
+                .chain(traits.changed.iter().map(|change| &change.old))
+                .any(|change| {
+                    change.crit >= cleave::Criticality::Notable
+                        && in_trait_hierarchy(&change.id, hierarchy)
+                })
         })
     })
 }
 
-/// A single changed file gained all parts of a concealed browser-side remote
-/// loader: a long numeric character array, conversion through
-/// `String.fromCharCode`, creation of a script element, and dynamic loading of
-/// that script.
-fn obfuscated_remote_script_loader(diff: &DiffReportV1) -> bool {
-    file_gained_all_traits(
+/// Correlate four new evidence families in one source file. Metadata class
+/// names include their leaf (`file/encoded::...`), so exact class equality
+/// silently disabled this rule. Read taxonomy namespaces instead. Encoding
+/// alone is not execution, and an archive's pooled traits are not one file.
+fn gained_encoded_execution_cluster(diff: &DiffReportV1) -> bool {
+    diff.files.iter().any(|file| {
+        if !matches!(file.status, FileStatus::Added | FileStatus::Changed)
+            || !member_type(file).is_some_and(|kind| kind.is_source_code())
+        {
+            return false;
+        }
+        let Some(traits) = &file.scopes.traits else {
+            return false;
+        };
+        let has = |prefix: &str| {
+            traits.added.iter().any(|finding| {
+                if !crate::rubric::is_finding(finding.crit) {
+                    return false;
+                }
+                let namespace = finding.id.split("::").next().unwrap_or(&finding.id);
+                namespace == prefix
+                    || namespace
+                        .strip_prefix(prefix)
+                        .is_some_and(|tail| tail.starts_with('/'))
+            })
+        };
+        has("metadata/file/encoded")
+            && has("objectives/anti-static/obfuscation")
+            && (has("micro-behaviors/process/create") || has("micro-behaviors/process/interpreter"))
+            && (has("micro-behaviors/communications/http/client")
+                || has("micro-behaviors/communications/http/request")
+                || has("micro-behaviors/fs/file/write")
+                || has("micro-behaviors/fs/write")
+                || has("micro-behaviors/process/daemonize"))
+    })
+}
+
+/// A single file gains character-code conversion and script loading. This is a
+/// differential review signal, not proof of an external destination or hostile
+/// dataflow. The release-pressure gate is applied by the caller.
+fn gained_encoded_script_loading(diff: &DiffReportV1) -> bool {
+    file_gained_all_hierarchies(
         diff,
         &[
-            "::long-numeric-array-literal",
-            "::fromcharcode-call",
-            "::browser-create-script-element",
-            "::dynamic-script-element-load",
+            "micro-behaviors/data/encode/char-code",
+            "micro-behaviors/process/create/load/script",
         ],
     )
 }
 
-/// The non-obfuscated sibling of [`obfuscated_remote_script_loader`]: one file
-/// gains script-element creation, dynamic loading, and a literal remote host.
+/// The non-obfuscated sibling of [`gained_encoded_script_loading`]: one file
+/// gains script loading and a remote host reference.
 /// This catches a payload appended plainly to a distributed browser bundle;
 /// the modest-release guard belongs to [`change_shape_escalation`].
-fn external_remote_script_loader(diff: &DiffReportV1) -> bool {
-    file_gained_all_traits(
+fn gained_script_loading_with_host(diff: &DiffReportV1) -> bool {
+    file_gained_all_hierarchies(
         diff,
         &[
-            "::js-remote-host-url",
-            "::browser-create-script-element",
-            "::dynamic-script-element-load",
+            "micro-behaviors/communications/http/url/domain",
+            "micro-behaviors/process/create/load/script",
         ],
     )
 }
@@ -3848,9 +4000,10 @@ fn restored_endgame_package_shape(diff: &DiffReportV1) -> bool {
     let entrypoint_restored = diff.files.iter().any(|file| {
         file.scopes.traits.as_ref().is_some_and(|traits| {
             traits.removed.iter().any(|trait_change| {
-                trait_change
-                    .id
-                    .ends_with("::npm-main-entrypoint-not-shipped")
+                in_trait_hierarchy(
+                    &trait_change.id,
+                    "metadata/package/files/missing-entrypoint",
+                )
             })
         })
     });
@@ -3966,13 +4119,11 @@ fn capability_shape(file: &FileDiffEntry) -> CapabilityShape {
 
     if let Some(traits) = file.scopes.traits.as_ref() {
         for trait_change in &traits.added {
-            add_capability_text(&mut shape.families, &trait_change.id);
-            add_capability_text(&mut shape.families, &trait_change.desc);
+            add_capability_text(&mut shape.families, trait_namespace(&trait_change.id));
             shape.executable |= trait_is_executable(&trait_change.id);
         }
         for change in &traits.changed {
-            add_capability_text(&mut shape.families, &change.new.id);
-            add_capability_text(&mut shape.families, &change.new.desc);
+            add_capability_text(&mut shape.families, trait_namespace(&change.new.id));
             shape.executable |= trait_is_executable(&change.new.id);
         }
     }
@@ -4035,13 +4186,14 @@ fn add_metric_signal(shape: &mut CapabilityShape, path: &str) {
 }
 
 fn trait_is_executable(id: &str) -> bool {
-    let lower = id.to_ascii_lowercase();
-    lower.contains("metadata/lang/compiled")
-        || lower.contains("metadata/binary/")
-        || lower.contains("macho")
-        || lower.contains("elf")
-        || lower.contains("pe-")
-        || lower.contains("main-entry")
+    let lower = trait_namespace(id).to_ascii_lowercase();
+    in_trait_hierarchy(id, "metadata/lang/compiled")
+        || in_trait_hierarchy(id, "metadata/binary")
+        // Format names are taxonomy tokens, not arbitrary substrings:
+        // `self` is not ELF and `scope-string` is not PE.
+        || lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| matches!(token, "macho" | "elf" | "pe"))
 }
 
 /// A content-level compiled-binary marker for package topology. This includes
@@ -4068,29 +4220,17 @@ fn executable_member_layout(path: &str) -> bool {
 }
 
 fn package_payload_context(diff: &DiffReportV1) -> bool {
-    let mut archive = false;
-    let mut encrypted = false;
-    let mut extension_mismatch = false;
-    let mut executable_member = false;
-
-    for file in &diff.files {
-        let Some(traits) = file.scopes.traits.as_ref() else {
-            continue;
-        };
-        for trait_change in traits
-            .added
-            .iter()
-            .chain(traits.changed.iter().map(|change| &change.new))
-        {
-            let text = format!("{} {}", trait_change.id, trait_change.desc).to_ascii_lowercase();
-            archive |= text.contains("archive") || text.contains("zip") || text.contains("7z");
-            encrypted |= text.contains("encrypt") || text.contains("password");
-            extension_mismatch |= text.contains("extension") && text.contains("mismatch");
-            executable_member |= text.contains("executable") && text.contains("member");
-        }
-    }
-
-    archive && executable_member && (encrypted || extension_mismatch)
+    diff.files.iter().any(|file| {
+        matches!(file.status, FileStatus::Added | FileStatus::Changed)
+            && new_metric_value(file, "archive.executable_count").is_some_and(|count| count > 0.0)
+            && (new_metric_value(file, "archive.security.encrypted_count")
+                .is_some_and(|count| count > 0.0)
+                || new_metric_value(
+                    file,
+                    "consistency.extension_content_mismatch.archive_as_unknown",
+                )
+                .is_some_and(|mismatch| mismatch == 1.0))
+    })
 }
 
 fn capability_shape_score(
@@ -4160,65 +4300,108 @@ fn root_size_delta(diff: &DiffReportV1) -> Option<String> {
 /// shared differential context for humans and the LLM: structural replacement
 /// clues such as a 90% code-size collapse should not be hidden behind a single
 /// aggregate metric ROC.
-fn strongest_metric_changes(diff: &DiffReportV1, limit: usize) -> Vec<String> {
-    let qualify_path = |path: &str| {
-        !path.contains("mtime")
-            && !path.contains("timing")
-            && !path.contains("dependencies")
-            && !path.contains("has_direct_loader_dep")
-            && !path.contains("load_segment")
-            && !path.ends_with("size_bytes")
+/// One scalar metric that moved: its name, both values in compact form, and
+/// the relative change. Shared by the terminal's metrics table, the per-file
+/// evidence captions, and the prose the LLM reads.
+#[derive(Clone, Debug)]
+pub(crate) struct MetricMove {
+    /// The file the metric belongs to, when the change spans more than one.
+    pub member: Option<String>,
+    /// The metric's name — a path like `elf.entry`, or a leaf.
+    pub label: String,
+    pub old: String,
+    pub new: String,
+    /// `+389%`, `-33%`, or `new` when the old value was zero.
+    pub delta: String,
+    /// Ranking strength, from [`metric_change_importance`].
+    pub importance: f64,
+}
+
+impl MetricMove {
+    /// `member:label old→new (delta)` — the one-line prose form.
+    pub(crate) fn describe(&self) -> String {
+        let member = self
+            .member
+            .as_ref()
+            .map(|m| format!("{m}:"))
+            .unwrap_or_default();
+        format!(
+            "{member}{} {}→{} ({})",
+            self.label, self.old, self.new, self.delta
+        )
+    }
+}
+
+/// The movement in one metric change under `label`, or `None` when the metric
+/// is noise here — timestamps and timing, `size_bytes` (which restates other
+/// movers), and the dependency and segment facts the structure section names —
+/// or when the values are non-numeric or equal.
+pub(crate) fn metric_move(
+    change: &Changed<MetricChange>,
+    member: Option<String>,
+    label: String,
+) -> Option<MetricMove> {
+    let path = change.new.path.as_str();
+    if path.contains("mtime")
+        || path.contains("timing")
+        || path.contains("dependencies")
+        || path.contains("has_direct_loader_dep")
+        || path.contains("load_segment")
+        || path.ends_with("size_bytes")
+    {
+        return None;
+    }
+    let (old, new) = (change.old.value.as_f64()?, change.new.value.as_f64()?);
+    if old == new {
+        return None;
+    }
+    let delta = if old == 0.0 {
+        "new".to_string()
+    } else {
+        format!("{:+.0}%", (new - old) / old.abs() * 100.0)
     };
+    Some(MetricMove {
+        member,
+        label,
+        old: compact_metric_number(old),
+        new: compact_metric_number(new),
+        delta,
+        importance: metric_change_importance(old, new),
+    })
+}
+
+fn strongest_metric_changes(diff: &DiffReportV1, limit: usize) -> Vec<MetricMove> {
     let show_file = diff.files.len() > 1;
     let mut movers = Vec::new();
     for file in &diff.files {
         let Some(metrics) = file.scopes.metrics.as_ref() else {
             continue;
         };
+        let member = show_file.then(|| display_member_path(&file.path).to_string());
         for change in &metrics.changed {
-            let path = change.new.path.as_str();
-            if !qualify_path(path) {
-                continue;
-            }
-            let (Some(old), Some(new)) = (change.old.value.as_f64(), change.new.value.as_f64())
-            else {
-                continue;
-            };
-            if old == new {
-                continue;
-            }
-            let importance = metric_change_importance(old, new);
-            let delta = if old == 0.0 {
-                "new".to_string()
-            } else {
-                format!("{:+.0}%", (new - old) / old.abs() * 100.0)
-            };
-            let label = if show_file {
-                format!("{}:{path}", display_member_path(&file.path))
-            } else {
-                path.to_string()
-            };
-            let rendered = format!(
-                "{label} {}→{} ({delta})",
-                compact_metric_number(old),
-                compact_metric_number(new)
-            );
-            movers.push((importance, label, rendered));
+            let label = change.new.path.clone();
+            movers.extend(metric_move(change, member.clone(), label));
         }
     }
-    // One row per label, keeping its strongest movement. `dedup_by` only drops
-    // *adjacent* equals, so the labels have to be brought together first —
-    // sorting by importance alone would leave two rows for the same label
+    // One row per name, keeping its strongest movement. `dedup_by` only drops
+    // *adjacent* equals, so the names have to be brought together first —
+    // sorting by importance alone would leave two rows for the same name
     // (`a.tgz!!pkg/x.js` and `b.zip!!pkg/x.js` share one) sitting apart and both
     // would survive into the top `limit`.
-    movers.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.total_cmp(&a.0)));
-    movers.dedup_by(|a, b| a.1 == b.1);
-    movers.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let name = |m: &MetricMove| (m.member.clone(), m.label.clone());
+    movers.sort_by(|a, b| {
+        name(a)
+            .cmp(&name(b))
+            .then_with(|| b.importance.total_cmp(&a.importance))
+    });
+    movers.dedup_by(|a, b| name(a) == name(b));
+    movers.sort_by(|a, b| {
+        b.importance
+            .total_cmp(&a.importance)
+            .then_with(|| name(a).cmp(&name(b)))
+    });
+    movers.truncate(limit);
     movers
-        .into_iter()
-        .take(limit)
-        .map(|(_, _, rendered)| rendered)
-        .collect()
 }
 
 /// Rank a numeric metric movement without letting every `0 -> 1` counter beat
@@ -4552,8 +4735,8 @@ fn add_capability_text(families: &mut HashSet<&'static str>, text: &str) {
 
 /// Recognize a focused remediation without trusting incident prose alone.
 ///
-/// The joined shape requires a newly referenced artifact indicator, actual
-/// file deletion, and at least two functions newly disabled by an immediate
+/// The joined shape requires newly referenced concealed-payload evidence,
+/// new file-deletion behavior, and at least two functions newly disabled by an immediate
 /// entry return. The latter is executable evidence: it distinguishes a repair
 /// that retains dead forensic code from an attacker merely claiming cleanup.
 fn remediation_cleanup_context(
@@ -4564,25 +4747,19 @@ fn remediation_cleanup_context(
     raw_diff: &DiffReportV1,
     risk: Option<crate::risk::Risk>,
 ) -> Option<Remediation> {
-    let known_indicator = raw_diff.files.iter().any(|file| {
+    let payload_evidence = raw_diff.files.iter().any(|file| {
         file.scopes.traits.as_ref().is_some_and(|traits| {
-            traits
-                .added
-                .iter()
-                .chain(traits.changed.iter().map(|change| &change.new))
-                .any(|finding| {
-                    finding.id.ends_with("wp-comments-posts-reference")
-                        || finding.id.ends_with("wp-comments-posts-masquerade")
-                })
+            traits.added.iter().any(|finding| {
+                in_trait_hierarchy(&finding.id, "objectives/supply-chain/hidden-payload")
+            })
         })
     });
     // Last in the chain on purpose: it extracts every added or changed member
     // from *both* roots, and the cheap predicates ahead of it are false on
     // essentially every run.
-    let compact_cleanup = known_indicator
+    let compact_cleanup = payload_evidence
         && has_new_class(a, "fs/delete")
-        && judged_diff.summary.files_changed <= 4
-        && judged_diff.summary.files_added <= 1
+        && focused_cleanup_budget(judged_diff)
         && newly_disabled_source_functions(old_root, new_root, raw_diff) >= 2;
     // A fixed release often removes the malicious code instead of adding a
     // recognizable signature. A large same-package model-risk drop is strong
@@ -4598,6 +4775,74 @@ fn remediation_cleanup_context(
     } else {
         None
     }
+}
+
+/// Expanded containers duplicate their members' changes. A tree and its ZIP
+/// should have the same cleanup budget. Keep opaque archives in the count:
+/// only an actual descendant proves that the container is represented below.
+fn cleanup_member_counts(diff: &DiffReportV1) -> (usize, usize) {
+    let mut changed = 0;
+    let mut added = 0;
+    for file in &diff.files {
+        if !matches!(file.status, FileStatus::Changed | FileStatus::Added) {
+            continue;
+        }
+        let expanded = diff.files.iter().any(|member| {
+            member
+                .path
+                .strip_prefix(&file.path)
+                .is_some_and(|suffix| suffix.starts_with("!!"))
+        });
+        if expanded {
+            continue;
+        }
+        changed += usize::from(matches!(file.status, FileStatus::Changed));
+        added += usize::from(matches!(file.status, FileStatus::Added));
+    }
+    (changed, added)
+}
+
+fn focused_cleanup_budget(diff: &DiffReportV1) -> bool {
+    let (changed, added) = cleanup_member_counts(diff);
+    changed + added <= 16 && added <= 1 && cleanup_behavior_changes(diff) <= 4
+}
+
+/// Focus cleanup on the files gaining meaningful observations, not unrelated
+/// sub-finding churn. Missing or truncated scopes cannot prove absence
+/// of behavior and therefore consume the budget. Added files always count.
+fn cleanup_behavior_changes(diff: &DiffReportV1) -> usize {
+    diff.files
+        .iter()
+        .filter(|file| {
+            if !matches!(file.status, FileStatus::Changed | FileStatus::Added) {
+                return false;
+            }
+            if diff.files.iter().any(|member| {
+                member
+                    .path
+                    .strip_prefix(&file.path)
+                    .is_some_and(|suffix| suffix.starts_with("!!"))
+            }) {
+                return false;
+            }
+            if matches!(file.status, FileStatus::Added) {
+                return true;
+            }
+            let Some(traits) = &file.scopes.traits else {
+                return true;
+            };
+            traits.truncated
+                || traits
+                    .added
+                    .iter()
+                    .any(|finding| crate::rubric::is_finding(finding.crit))
+                || traits.changed.iter().any(|change| {
+                    crate::rubric::is_finding(change.new.crit)
+                        && crate::rubric::crit_rank(change.new.crit)
+                            > crate::rubric::crit_rank(change.old.crit)
+                })
+        })
+        .count()
 }
 
 fn removed_high_risk_traits(diff: &DiffReportV1) -> Vec<&TraitChange> {
@@ -4650,13 +4895,13 @@ fn newly_disabled_source_functions(old_root: &Path, new_root: &Path, diff: &Diff
         .map(|file| {
             let Some(new) = diff_source_bytes(new_root, &file.path)
                 .as_deref()
-                .map(immediate_entry_return_count)
+                .map(|bytes| immediate_entry_return_count(&file.path, bytes))
             else {
                 return 0;
             };
             let old = diff_source_bytes(old_root, &file.path)
                 .as_deref()
-                .map(immediate_entry_return_count);
+                .map(|bytes| immediate_entry_return_count(&file.path, bytes));
             match (file.status, old) {
                 // An added file has no base side, so everything it disables is
                 // genuinely new.
@@ -4684,29 +4929,53 @@ fn diff_source_bytes(root: &Path, diff_path: &str) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
-fn immediate_entry_return_count(bytes: &[u8]) -> usize {
-    if bytes.iter().take(8192).any(|byte| *byte == 0) {
-        return 0;
-    }
-    let Ok(source) = std::str::from_utf8(bytes) else {
+fn immediate_entry_return_count(path: &str, bytes: &[u8]) -> usize {
+    let Ok(parsed) = filefacts::open_with_path(Path::new(path), bytes) else {
         return 0;
     };
-    let lines = source.lines().collect::<Vec<_>>();
-    lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| {
-            let line = line.trim();
-            line.contains("function ") && line.ends_with('{')
-        })
-        .filter(|(index, _)| {
-            lines[index + 1..]
-                .iter()
-                .map(|line| line.trim())
-                .find(|line| !line.is_empty() && !line.starts_with("//"))
-                .is_some_and(|line| line == "return;")
-        })
-        .count()
+    let Some(ast) = parsed.source_ast() else {
+        return 0;
+    };
+    let root = ast.tree.root_node();
+    // This proof can lower a verdict. An unavailable or recovered parse is
+    // unknown, never proof that code is disabled. Text examples in comments,
+    // strings, and heredocs must not manufacture an entry-return signal.
+    if root.has_error() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if matches!(
+            node.kind(),
+            "function_definition"
+                | "function_declaration"
+                | "method_declaration"
+                | "method_definition"
+        ) && let Some(body) = node.child_by_field_name("body")
+            && matches!(body.kind(), "compound_statement" | "statement_block")
+        {
+            let mut body_cursor = body.walk();
+            let first = body
+                .named_children(&mut body_cursor)
+                .find(|child| child.kind() != "comment");
+            if first.is_some_and(|statement| {
+                statement.kind() == "return_statement" && statement.named_child_count() == 0
+            }) {
+                count += 1;
+            }
+        }
+        // Cursor traversal is iterative even for adversarial nesting.
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return count;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4721,13 +4990,13 @@ mod tests {
         CapabilityShape, add_capability_text, archive_member_candidates, attack_behavior_removed,
         binary_replacement_anomaly, capability_shape_score, changed_identity_claims,
         changed_test_carrier, clean_name, dependency_backed_public_api_anomaly,
-        endgame_package_shape, executable_member_layout, external_remote_script_loader,
-        identity_claim_fields, immediate_entry_return_count, is_compiled_binary_file_type,
-        is_source_archive, line_diff, metric_change_importance, normalized_archive_diff,
-        normalized_member_path, npm_snapshot_member_key, numeric_delta,
-        obfuscated_remote_script_loader, opaque_runtime_payload_anomaly,
-        python_distribution_member_key, removed_high_risk_traits, restored_endgame_package_shape,
-        runtime_graft_anomaly, source_build_macro_score, source_download_write_execute_anomaly,
+        endgame_package_shape, executable_member_layout, gained_encoded_script_loading,
+        gained_script_loading_with_host, identity_claim_fields, immediate_entry_return_count,
+        is_compiled_binary_file_type, is_source_archive, line_diff, metric_change_importance,
+        normalized_archive_diff, normalized_member_path, npm_snapshot_member_key, numeric_delta,
+        opaque_runtime_payload_anomaly, python_distribution_member_key, removed_high_risk_traits,
+        restored_endgame_package_shape, runtime_graft_anomaly, source_build_macro_score,
+        source_download_write_execute_anomaly,
     };
     use crate::Severity;
     use crate::version::{Bump, BumpKind, Version};
@@ -4739,7 +5008,8 @@ mod tests {
 
     #[test]
     fn entry_return_detection_requires_an_unconditional_first_statement() {
-        let source = br#"
+        let source = br#"<?php
+            class Example {
             public function disabled() {
                 return;
                 dangerous_call();
@@ -4752,8 +5022,65 @@ mod tests {
                 setup();
                 return;
             }
+            }
         "#;
-        assert_eq!(immediate_entry_return_count(source), 1);
+        assert_eq!(immediate_entry_return_count("example.php", source), 1);
+    }
+
+    #[test]
+    fn entry_return_detection_does_not_accept_documentation_as_code() {
+        for source in [
+            "<?php /*\nfunction example() {\nreturn;\n}\n*/\nlive_call();",
+            "<?php $example = <<<'TEXT'\nfunction example() {\nreturn;\n}\nTEXT;\nlive_call();",
+        ] {
+            assert_eq!(
+                immediate_entry_return_count("example.php", source.as_bytes()),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn entry_return_detection_uses_syntax_not_line_layout() {
+        for (path, source) in [
+            (
+                "example.php",
+                "<?php function disabled() { /* explanation */ return; live_call(); }",
+            ),
+            (
+                "example.js",
+                "function disabled() { /* explanation */ return; liveCall(); }",
+            ),
+            (
+                "example.ts",
+                "function disabled(): void { return; liveCall(); }",
+            ),
+        ] {
+            assert_eq!(
+                immediate_entry_return_count(path, source.as_bytes()),
+                1,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_return_detection_rejects_uncertain_or_active_bodies() {
+        for source in [
+            "<?php function active() { return dangerous_call(); }",
+            "<?php function active() { if ($safe) return; dangerous_call(); }",
+            "<?php function active() { setup(); return; }",
+            "<?php function broken() { return;",
+        ] {
+            assert_eq!(
+                immediate_entry_return_count("example.php", source.as_bytes()),
+                0
+            );
+        }
+        assert_eq!(
+            immediate_entry_return_count("example.bin", &[0xff, 0, 0xfe]),
+            0
+        );
     }
 
     #[test]
@@ -4793,13 +5120,11 @@ mod tests {
                 traits: Some(ScopeDiff {
                     added: vec![
                         gained(
-                            "micro-behaviors/communications/http/lib/urllib::urlopen-response-body-read",
+                            "micro-behaviors/communications/http/client/response-body::renamed-read",
                         ),
                         gained("micro-behaviors/fs/write/file/direct::python-write-response-read"),
                         gained("micro-behaviors/process/create/subprocess::subprocess-api-call"),
-                        gained(
-                            "micro-behaviors/os/sysinfo/platform/runtime::python-platform-branch",
-                        ),
+                        gained("micro-behaviors/os/sysinfo/platform/branch::renamed-check"),
                     ],
                     ..Default::default()
                 }),
@@ -5395,7 +5720,7 @@ mod tests {
         };
 
         assert!(restored_endgame_package_shape(&make_diff(
-            "metadata/package/manifest/entrypoint::npm-main-entrypoint-not-shipped"
+            "metadata/package/files/missing-entrypoint::arbitrary-local-name"
         )));
         assert!(!restored_endgame_package_shape(&make_diff(
             "metadata/package/files::ordinary-tree-change"
@@ -5404,12 +5729,12 @@ mod tests {
 
     #[test]
     fn obfuscated_remote_loader_requires_convergence_on_one_file() {
-        let trait_change = |suffix: &str| TraitChange {
-            id: format!("micro-behaviors/test::{suffix}"),
+        let trait_change = |hierarchy: &str| TraitChange {
+            id: format!("{hierarchy}::arbitrary-local-name"),
             trait_section: "micro-behaviors".to_string(),
             crit: Criticality::Notable,
             conf: 1.0,
-            desc: suffix.to_string(),
+            desc: hierarchy.to_string(),
             count: 1,
         };
         let make_diff = |ids: &[&str]| DiffReportV1 {
@@ -5434,36 +5759,33 @@ mod tests {
             }],
         };
         let complete = [
-            "long-numeric-array-literal",
-            "fromcharcode-call",
-            "browser-create-script-element",
-            "dynamic-script-element-load",
+            "micro-behaviors/data/encode/char-code",
+            "micro-behaviors/process/create/load/script",
         ];
-        assert!(obfuscated_remote_script_loader(&make_diff(&complete)));
-        assert!(!external_remote_script_loader(&make_diff(&complete)));
+        assert!(gained_encoded_script_loading(&make_diff(&complete)));
+        assert!(!gained_script_loading_with_host(&make_diff(&complete)));
         for omitted in &complete {
             let partial = complete
                 .iter()
                 .copied()
                 .filter(|id| id != omitted)
                 .collect::<Vec<_>>();
-            assert!(!obfuscated_remote_script_loader(&make_diff(&partial)));
+            assert!(!gained_encoded_script_loading(&make_diff(&partial)));
         }
 
         let literal = [
-            "js-remote-host-url",
-            "browser-create-script-element",
-            "dynamic-script-element-load",
+            "micro-behaviors/communications/http/url/domain",
+            "micro-behaviors/process/create/load/script",
         ];
-        assert!(external_remote_script_loader(&make_diff(&literal)));
-        assert!(!obfuscated_remote_script_loader(&make_diff(&literal)));
+        assert!(gained_script_loading_with_host(&make_diff(&literal)));
+        assert!(!gained_encoded_script_loading(&make_diff(&literal)));
         for omitted in &literal {
             let partial = literal
                 .iter()
                 .copied()
                 .filter(|id| id != omitted)
                 .collect::<Vec<_>>();
-            assert!(!external_remote_script_loader(&make_diff(&partial)));
+            assert!(!gained_script_loading_with_host(&make_diff(&partial)));
         }
     }
 

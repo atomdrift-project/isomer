@@ -1,11 +1,10 @@
 //! Risk scoring via the azoth ML model that scan uses.
 //!
 //! The rubric judges *what* capabilities changed; azoth answers *how malicious
-//! does the model think each side is*. Because both sides are the same artifact
-//! on the same classifier route (`liblzma.so` 5.4.5 vs 5.6.0), their scores are
-//! directly comparable — the cross-file caveat that makes absolute scores
-//! incomparable does not apply within a diff. So the delta is meaningful: it is
-//! the model's opinion of how much more dangerous the new release is.
+//! does the model think each side is*. Probabilities are diagnostic context:
+//! routes and calibrated cutoffs can differ, even for two releases of the same
+//! artifact. Preserve the model's decision rather than inferring maliciousness
+//! from a universal probability cutoff.
 //!
 //! Scoring degrades gracefully: if the model bundle can't be found or loaded,
 //! risk is simply absent from the report rather than an error.
@@ -18,9 +17,20 @@ use std::sync::OnceLock;
 pub(crate) struct Risk {
     pub old: f32,
     pub new: f32,
+    pub new_classification: scan::Classification,
 }
 
 impl Risk {
+    /// Severity allowed by the model's calibrated decision, not a raw score band.
+    pub(crate) fn model_severity(self) -> crate::Severity {
+        use crate::Severity;
+        match self.new_classification {
+            scan::Classification::Suspicious => Severity::High,
+            scan::Classification::Hostile => Severity::Critical,
+            _ => Severity::None,
+        }
+    }
+
     /// Change in model risk from old to new. Positive means the new release
     /// looks more dangerous to the model.
     pub(crate) fn delta(self) -> f32 {
@@ -49,24 +59,20 @@ fn analyzer() -> Option<&'static scan::Analyzer> {
 /// optional context, never a hard dependency.
 pub(crate) fn score(pairs: &[crate::analysis::Pair]) -> Option<Risk> {
     let analyzer = analyzer()?;
-    let probability = |p: Option<&Path>| -> Option<f32> {
+    let scan = |p: Option<&Path>| {
         let p = p?;
-        Some(
-            analyzer
-                .scan_file(p, &crate::analysis::basename(p))
-                .ok()?
-                .probability,
-        )
+        analyzer.scan_file(p, &crate::analysis::basename(p)).ok()
     };
     pairs
         .iter()
         .filter_map(|pair| {
-            let new = probability(pair.new.as_deref())?;
+            let new = scan(pair.new.as_deref())?;
             // A file with no base side is new: it introduced whatever risk it
             // carries, so the old side reads as zero rather than unknown.
             Some(Risk {
-                old: probability(pair.old.as_deref()).unwrap_or(0.0),
-                new,
+                old: scan(pair.old.as_deref()).map_or(0.0, |s| s.probability),
+                new: new.probability,
+                new_classification: new.classification,
             })
         })
         .max_by(|a, b| a.new.total_cmp(&b.new))

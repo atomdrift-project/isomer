@@ -15,14 +15,18 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod analysis;
+mod behavior_shift;
+mod binary;
 mod ci;
 mod deps;
 mod evidence;
 mod fetch;
+mod frameworks;
 mod fs;
 mod json;
 mod llm;
 mod markdown;
+mod registry;
 mod rename;
 mod risk;
 mod rubric;
@@ -88,18 +92,23 @@ struct Cli {
     #[arg(long, global = true, value_name = "SECS")]
     llm_timeout: Option<u64>,
 
-    /// Follow each dependency the change *adds*: fetch it and report what it can
-    /// do, attributed to the dependency. Catches the transitive supply-chain
-    /// case (a benign version range pulling in a now-malicious release) a
-    /// manifest diff can't see. A network step; off by default.
+    /// Fetch added and changed runtime dependencies. Compare behavioral/risk
+    /// profiles for changed versions and unambiguous replacements. A network
+    /// step; off by default. Uses current, not historical, range resolutions.
     #[arg(long, global = true)]
     deps: bool,
+
+    /// Skip current registry metadata checks for packages and declared dependencies.
+    /// These checks are enabled by default; --offline also disables them.
+    #[arg(long, global = true)]
+    no_follow: bool,
 
     #[command(subcommand)]
     command: Command,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 enum Severity {
     None,
     Low,

@@ -163,11 +163,8 @@ fn risk(s: &mut String, a: &Analysis<'_>) {
     };
     let _ = writeln!(
         s,
-        "**ML malware risk** `{:.2}` {} → `{:.2}` {}{arrow}\n",
-        r.old,
-        crate::terminal::risk_label(r.old),
-        r.new,
-        crate::terminal::risk_label(r.new),
+        "**ML risk score** `{:.2}` → `{:.2}` (new decision: {}){arrow}\n",
+        r.old, r.new, r.new_classification,
     );
 }
 
@@ -261,7 +258,7 @@ fn structure(s: &mut String, a: &Analysis<'_>) {
             "- {} {kind} **{}** — {}",
             dots(f.severity),
             f.label,
-            cell(&f.detail)
+            cell(&f.sentence())
         );
     }
     let _ = writeln!(s);
@@ -282,14 +279,18 @@ fn frameworks(s: &mut String, a: &Analysis<'_>) {
     let _ = writeln!(s, "| | introduced | no longer present | unchanged |");
     let _ = writeln!(s, "|---|---|---|---|");
     for (label, sides) in rows {
+        // Each id with its official name, one per line in the cell.
         let list = |ids: Vec<&str>| {
             if ids.is_empty() {
                 "—".to_string()
             } else {
                 ids.iter()
-                    .map(|i| format!("`{}`", cell(i)))
+                    .map(|i| match crate::frameworks::name(i) {
+                        Some(name) => format!("`{}` {name}", cell(i)),
+                        None => format!("`{}`", cell(i)),
+                    })
                     .collect::<Vec<_>>()
-                    .join(" ")
+                    .join("<br>")
             }
         };
         let _ = writeln!(
@@ -354,7 +355,7 @@ fn evidence(s: &mut String, a: &Analysis<'_>) {
                 title
             );
             if let Some(ms) = crate::terminal::file_metrics_summary(a.display_diff(), name) {
-                let _ = writeln!(s, "<sub>{}</sub>\n", cell(&ms));
+                let _ = writeln!(s, "<sub>{}</sub>\n", cell(&ms.join(" · ")));
             }
             let mut body = String::new();
             for (k, h) in hunks[i..run.end].iter().enumerate() {

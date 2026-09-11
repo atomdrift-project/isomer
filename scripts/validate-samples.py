@@ -27,14 +27,27 @@ its expectation is a VIOLATION:
 
 The script prints a per-violation report and a summary, and exits non-zero when
 there is any violation or error — so ``make validate-samples`` gates on it.
+Qualified evidence labels produce warnings, not exemptions: affected context
+can lack the actual malicious payload, and clean labels need not mean risk-free.
 
-Corpus, binary, and detection bar are all overridable; see ``--help``.
+The comparisons come from the corpus, not from this script. Each record in the artifact
+tree ships a ``pairs.yaml`` naming every comparison it supports and what a differential
+detector should conclude from each. This audit used to derive that itself — ranking
+verification statuses, matching file formats, guessing version affinity from filenames,
+and parsing each manifest twice to check the guessing against itself — which meant the
+corpus and the audit could disagree about a package's release history with no single
+place to fix it. Reading the corpus's own statement removed about 400 lines and raised
+coverage from one comparison per package to one per compromised release.
+
+The tree is generated from the records repository (``make artifacts`` there) and is
+published to R2; it is not the records repository itself. Tree, binary, and detection bar
+are all overridable; see ``--help``.
 """
 from __future__ import annotations
 
 import argparse
-import ast
 import concurrent.futures as cf
+import hashlib
 import json
 import os
 import re
@@ -42,7 +55,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,13 +66,6 @@ except ModuleNotFoundError:
 
 YAML_ERROR = getattr(yaml, "YAMLError", ValueError)
 
-# Classification buckets. A phase can carry several samples (e.g. a clean
-# release shipped alongside the compromised one); pick by classification so the
-# pair is genuinely attack-vs-not, not just phase-vs-phase.
-COMPROMISED = ("malicious", "affected", "carrier")
-CLEAN = ("clean", "baseline_candidate")
-REMEDIATED = ("remediated", "clean", "fixed")
-
 SEVERITY_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
@@ -68,14 +73,30 @@ SEVERITY_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 class SampleFile:
     path: Path
     logical_name: str
+    # Preserve selection-time claims, separately from measured snapshot hashes.
+    # In particular, `affected` context is not proof of a malicious payload.
+    provenance: dict = field(default_factory=dict)
+
+
+@dataclass
+class SnapshotFile:
+    path: Path
+    sha256: str
+    size: int
 
 
 @dataclass
 class Artifact:
     name: str
     year: int
-    before: SampleFile
-    during: SampleFile
+    # None where the corpus recovered no clean comparator for this release. The
+    # remediation comparison is still ground truth: a fix must not read as an attack,
+    # whether or not the pre-attack release survived.
+    before: SampleFile | None
+    # None for a subject the corpus holds only clean releases of. There is no attack to
+    # detect, but the release chain is still ground truth for what an honest upgrade
+    # looks like, and flagging one would still be a false positive.
+    during: SampleFile | None
     after: SampleFile | None
     # Every clean pre-compromise release of this artifact, in version order and
     # sharing `before`'s content form. Adjacent pairs are the honest upgrades.
@@ -98,405 +119,171 @@ class Transition:
 class Result:
     name: str
     year: int
-    bd: Transition
+    bd: Transition | None
     da: Transition | None = None
     ba: Transition | None = None
     bb: list[Transition] = field(default_factory=list)
     violations: list[str] = field(default_factory=list)
+    evidence_warnings: dict[str, list[dict]] = field(default_factory=dict)
 
 
-def scalar(value: str) -> str:
-    """Decode the quoted scalar forms used by sample manifests."""
-    value = value.strip()
-    if value.startswith("'") and value.endswith("'"):
-        return value[1:-1].replace("''", "'")
-    if value.startswith('"') and value.endswith('"'):
-        try:
-            decoded = ast.literal_eval(value)
-        except (SyntaxError, ValueError):
-            return value[1:-1]
-        return decoded if isinstance(decoded, str) else value[1:-1]
-    return value
-
-
-def parse_samples_without_yaml(text: str) -> list[dict]:
-    """Read the sample records without requiring a third-party YAML package.
-
-    The corpus manifests are full YAML, but the audit only needs selected scalar
-    fields from entries under the top-level ``samples`` sequence. This small
-    fallback deliberately understands only that subset; PyYAML remains the
-    preferred parser when installed.
-    """
-    lines = text.splitlines()
-    in_samples = False
-    records: list[dict] = []
-    current: dict | None = None
-    item_indent: int | None = None
-    fields = {"artifact_id", "phase", "classification", "version", "filename", "path", "sha256"}
-    unsupported = "unsupported samples syntax; install PyYAML for full YAML support"
-    i = 0
-
-    def finish() -> None:
-        if current is not None:
-            if not current.get("artifact_id"):
-                raise ValueError("sample record is missing artifact_id")
-            records.append(current)
-
-    while i < len(lines):
-        line = lines[i]
-        header = re.match(r"^samples:\s*(.*)$", line)
-        if header:
-            value = header.group(1).split("#", 1)[0].strip()
-            if value in ("[]", "null", "~"):
-                return []
-            if value:
-                raise ValueError(unsupported)
-            in_samples = True
-            i += 1
-            continue
-        if not in_samples:
-            i += 1
-            continue
-        if not line.strip() or line.lstrip().startswith("#"):
-            i += 1
-            continue
-
-        item = re.match(r"^( *)-(?:\s+([A-Za-z_][\w-]*):\s*(.*))?$", line)
-        if item and (item_indent is None or len(item.group(1)) == item_indent):
-            item_indent = len(item.group(1))
-            finish()
-            current = {}
-            # Process the first key just like subsequent keys, including
-            # folded scalars and manifests whose first key isn't artifact_id.
-            line = " " * (item_indent + 2) + (item.group(2) or "") + ": " + (item.group(3) or "")
-        elif not line.startswith(" "):
-            if re.match(r"^[A-Za-z_][\w-]*:", line) or line in ("---", "..."):
-                break
-            raise ValueError(unsupported)
-        elif current is None or (line.lstrip().startswith("-")
-                                 and len(line) - len(line.lstrip()) <= item_indent):
-            raise ValueError(unsupported)
-
-        field = re.match(r"^( *)([A-Za-z_][\w-]*):(?:\s*(.*))?$", line)
-        if (not field or current is None or item_indent is None
-                or len(field.group(1)) != item_indent + 2 or field.group(2) not in fields):
-            i += 1
-            continue
-
-        key, value = field.group(2), field.group(3) or ""
-        if value in (">", ">-", "|", "|-", ">+", "|+"):
-            folded = value.startswith(">")
-            parts: list[str] = []
-            i += 1
-            while i < len(lines) and (not lines[i] or lines[i].startswith(" " * (item_indent + 3))):
-                parts.append(lines[i].strip())
-                i += 1
-            current[key] = (" " if folded else "\n").join(parts).strip()
-            continue
-        current[key] = scalar(value)
-        i += 1
-
-    finish()
-    return records
-
-
-def load_samples(manifest: Path) -> list[dict]:
-    text = manifest.read_text()
-    if yaml is not None:
-        doc = yaml.safe_load(text) or {}
-        return doc.get("samples") or []
-    return parse_samples_without_yaml(text)
-
-
-def incident_year(meta: Path) -> int:
-    """Return the top-level incident year, or sort undated records last.
-
-    Manifest ``retrieved_at`` values describe when this corpus was assembled,
-    not when the release changed. The curated metadata's top-level
-    ``start_date`` is the only common historical timestamp suitable for
-    ordering the calibration set.
-    """
-    try:
-        text = meta.read_text()
-    except OSError:
-        return 9999
-    match = re.search(r"^  start_date:\s*(\d{4})(?:-\d{2}-\d{2})?\s*$", text, re.M)
-    return int(match.group(1)) if match else 9999
-
-
-def file_form(path: Path) -> str:
-    """Return a cheap content form for comparator selection.
-
-    Recovered archives are often content-addressed as ``*.sample``. Requiring
-    their suffix to match ``*.tgz`` silently drops valid old/new pairs even
-    though both files are gzip streams. Magic is stable across reconstruction
-    and renaming; the suffix remains a conservative fallback for plain source
-    and unknown formats where these few bytes cannot identify a language.
-    """
-    try:
-        with path.open("rb") as stream:
-            head = stream.read(512)
-    except OSError:
-        return path.suffix.lower()
-    signatures = (
-        (b"\x1f\x8b", "gzip"),
-        (b"\xfd7zXZ\x00", "xz"),
-        (b"BZh", "bzip2"),
-        (b"\x28\xb5\x2f\xfd", "zstd"),
-        (b"PK\x03\x04", "zip"),
-        (b"7z\xbc\xaf\x27\x1c", "7z"),
-        (b"Rar!\x1a\x07", "rar"),
-        (b"\x7fELF", "elf"),
-        (b"MZ", "pe"),
-    )
-    for magic, form in signatures:
-        if head.startswith(magic):
-            return form
-    if len(head) >= 262 and head[257:262] == b"ustar":
-        return "tar"
-    if head[:4] in (
-        b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
-        b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
-        b"\xca\xfe\xba\xbe",
-    ):
-        return "macho"
-    return path.suffix.lower()
-
-
-def sample_logical_name(sample: dict, path: Path) -> str:
-    """Recover a content-appropriate basename for an Isomer comparison.
-
-    A quarantine's SHA-named ``.sample`` is provenance, not file identity.
-    Isomer must still receive a path whose package form can be identified;
-    otherwise an npm tarball is analyzed as generic gzip and produces false
-    identity removal. Prefer the corpus's preserved original name, then infer
-    only the archive suffix needed for content detection.
-    """
-    source = sample.get("source")
-    if isinstance(source, dict):
-        chain = source.get("chain")
-        if isinstance(chain, dict) and chain.get("original_filename"):
-            return Path(str(chain["original_filename"])).name
-
-    declared = Path(str(sample.get("filename") or "")).name
-    if declared and Path(declared).suffix.lower() != ".sample":
-        return declared
-    if path.suffix.lower() != ".sample":
-        return path.name
-
-    artifact = re.sub(r"[^A-Za-z0-9._-]+", "-", str(sample.get("artifact_id") or "sample"))
-    version = re.sub(r"[^A-Za-z0-9._-]+", "-", str(sample.get("version") or "recovered"))
-    stem = f"{artifact}-{version}"
-    form = file_form(path)
-    if form == "gzip":
-        # npm's package/package.json layout is a stronger form signal than the
-        # original extension; generic gzip tarballs keep the wider .tar.gz.
-        try:
-            with tarfile.open(path, "r:gz") as archive:
-                if any(member.name == "package/package.json" for member in archive):
-                    return f"{stem}.tgz"
-        except (OSError, tarfile.TarError):
-            pass
-        return f"{stem}.tar.gz"
-    extensions = {
-        "xz": ".xz", "bzip2": ".bz2", "zstd": ".zst",
-        "zip": ".zip", "7z": ".7z", "rar": ".rar",
-        "elf": ".elf", "pe": ".exe", "macho": ".macho",
-        "tar": ".tar",
+def evidence_warnings(old: SampleFile, new: SampleFile) -> list[dict]:
+    """Expose qualified corpus labels without changing transition expectations."""
+    qualifications = {
+        "affected": "Affected context does not by itself establish a malicious payload.",
+        "carrier": "A carrier label does not by itself establish an active malicious payload.",
+        "baseline_candidate": "A baseline candidate is not a confirmed clean baseline.",
     }
-    return f"{stem}{extensions.get(form, '.sample')}"
+    return [{"side": side, "classification": classification,
+             "message": qualifications[classification]}
+            for side, sample in (("old", old), ("new", new))
+            if (classification := sample.provenance.get("classification")) in qualifications]
 
 
-def version_components(sample: dict | None) -> tuple[int, ...] | None:
-    """Return a simple numeric release tuple from metadata or its filename.
+def incident_year(readme: Path) -> int:
+    """The year the incident started, from the README the artifact tree generates."""
+    try:
+        text = readme.read_text()
+    except OSError:
+        return 0
+    match = re.search(r"^\*\*When:\*\*\s*(\d{4})", text, re.M)
+    return int(match.group(1)) if match else 0
 
-    Corpus versions are overwhelmingly semver-like, but requiring a packaging
-    library here would defeat this script's dependency-free fallback. The
-    manifest's explicit version wins; the basename is only a recovery path.
+
+def side_file(tree: Path, record: str, side: dict) -> SampleFile | None:
+    """Resolve one side of a stated comparison to a file on disk.
+
+    The path is the whole address: ``<record>/<subject>/<phase>/<release>/<file>``.
+    ``unversioned`` is a release name like any other -- it is what the corpus says when a
+    payload's affected release is genuinely unknown, and several records say so outright.
+
+    The filename needs no repair. It is the name the artifact was distributed under, which
+    is why the old ``sample_logical_name`` heuristics and the staging symlinks they fed
+    are gone: there is nothing left to infer.
     """
-    if not sample:
+    version = side.get("version")
+    release = str(version) if version else "unversioned"
+    path = tree / record / side["subject"] / side["phase"] / release / side["file"]
+    if not path.is_file():
         return None
-    values = [sample.get("version"), Path(sample.get("path", "")).name]
-    for value in values:
-        if not value:
-            continue
-        matches = re.findall(r"(?<!\d)(\d+(?:\.\d+){1,3})(?!\d)", str(value))
-        if matches:
-            return tuple(int(part) for part in matches[-1].split("."))
-    return None
+    return SampleFile(path, side["file"], {
+        "record": record,
+        "phase": side.get("phase"),
+        "classification": side.get("classification"),
+        "version": str(version) if version is not None else None,
+        "declared_sha256": side.get("sha256"),
+    })
 
 
-def version_affinity(sample: dict, reference: tuple[int, ...] | None) -> tuple[int, int]:
-    """Prefer the nearest release line without pretending to order semver.
+def load_artifacts(tree: Path) -> list[Artifact]:
+    """Read the comparisons the corpus states, from every record's ``pairs.yaml``.
 
-    Same major+minor beats merely same-major, which beats a cross-major pair.
-    The numeric distance is only a tie-breaker inside that compatibility tier.
+    This used to be inference. The corpus recorded samples; the audit reconstructed which
+    of them to compare, by ranking verification status, matching file formats, and
+    guessing version affinity from filenames -- and it parsed the manifests twice, once
+    with a YAML library and once with a hand-rolled scalar reader, purely to check that
+    the guessing agreed with itself.
+
+    The corpus now states its own expectations. `pairs.yaml` names every comparison and
+    what a differential detector should conclude from it, so the audit reads them instead
+    of deriving them. When the corpus and the audit disagree about what a package's
+    release history looks like, that is now a corpus bug with one place to fix it.
+
+    One Artifact per compromised release, so every attack pair is exercised rather than
+    one per package. The baseline chain belongs to the subject rather than to any single
+    release, so it is attached to the first artifact of each subject and not repeated.
     """
-    candidate = version_components(sample)
-    if not reference or not candidate:
-        return 3, sys.maxsize
-    common = 0
-    for old, new in zip(reference, candidate):
-        if old != new:
-            break
-        common += 1
-    line = 0 if common >= 2 else 1 if common >= 1 else 2
-    width = max(len(reference), len(candidate))
-    old = reference + (0,) * (width - len(reference))
-    new = candidate + (0,) * (width - len(candidate))
-    distance = sum(abs(a - b) * (1000 ** (width - i - 1))
-                   for i, (a, b) in enumerate(zip(old, new)))
-    return line, distance
+    if yaml is None:
+        raise ValueError("PyYAML is required to read pairs.yaml")
 
-
-def pick(samples: list[dict], prefer: tuple[str, ...], root: Path,
-         match_path: str | None = None,
-         match_version: tuple[int, ...] | None = None,
-         exclude_sha256: str | None = None) -> dict | None:
-    """Pick a present sample, preferring class and matching file form.
-
-    A preserved incident report or source fragment is evidence, but it is not
-    a meaningful old/new comparator for a release archive. Once a reference
-    path exists, require the same content form before pairing another phase;
-    this lets a content-addressed ``.sample`` gzip pair with ``.tgz`` while a
-    loose ``.js`` payload or incident report still cannot impersonate it.
-    """
-    candidates = [
-        (i, s) for i, s in enumerate(samples)
-        if s.get("path") and (root / s["path"]).is_file()
-        and (exclude_sha256 is None or s.get("sha256") != exclude_sha256)
-    ]
-    if not candidates:
-        return None
-
-    if match_path:
-        reference_form = file_form(root / match_path)
-        matching = [
-            item for item in candidates
-            if file_form(root / item[1]["path"]) == reference_form
-        ]
-        if not matching:
-            return None
-        candidates = matching
-
-    def rank(item: tuple[int, dict]) -> tuple[int, int, int, int, int]:
-        i, sample = item
-        cls = sample.get("classification")
-        class_rank = prefer.index(cls) if cls in prefer else len(prefer)
-        form_rank = (
-            0 if match_path and file_form(root / sample["path"])
-            == file_form(root / match_path) else 1
-        )
-        version_line, version_distance = version_affinity(sample, match_version)
-        return class_rank, form_rank, version_line, version_distance, i
-
-    return min(candidates, key=rank)[1]
-
-
-def baseline_chain(samples: list[dict], root: Path, reference: dict) -> list[dict]:
-    """The clean pre-compromise releases, in version order, that pair honestly.
-
-    Only same-content-form samples qualify, for the reason ``pick`` gives: a
-    preserved incident report or loose source fragment is evidence, not a
-    release comparator. Byte-identical entries are dropped too — a few incidents
-    record the same tarball twice under different provenance, and diffing a file
-    against itself proves nothing. ``reference`` (the chosen ``before``) fixes
-    the form and is always a member of the result when it survives that filter.
-    """
-    form = file_form(root / reference["path"])
-    seen: set[str] = set()
-    chain: list[dict] = []
-    for sample in samples:
-        path = sample.get("path")
-        if (
-            not path
-            or sample.get("classification") not in CLEAN
-            or not (root / path).is_file()
-            or file_form(root / path) != form
-        ):
-            continue
-        key = sample.get("sha256") or path
-        if key in seen:
-            continue
-        seen.add(key)
-        chain.append(sample)
-    # Unparseable versions sort last, stable in manifest order, so a chain that
-    # is only partly versioned still pairs its known releases in release order.
-    chain.sort(key=lambda s: version_components(s) or (sys.maxsize,))
-    return chain if len(chain) > 1 else []
-
-
-def load_artifacts(corpus: Path) -> list[Artifact]:
-    """One Artifact per (attack, artifact_id) with at least before+during on disk."""
     out: list[Artifact] = []
-    for manifest in sorted(corpus.glob("*/samples/manifest.yaml")):
+    for pairs_file in sorted(tree.glob("*/pairs.yaml")):
         try:
-            samples = load_samples(manifest)
-        except (OSError, ValueError, YAML_ERROR) as error:
-            raise ValueError(f"cannot read sample manifest {manifest}: {error}") from error
-        attack = manifest.parent.parent.name
-        base = manifest.parent
-        year = incident_year(base.parent / "meta.yaml")
-        by_art: dict[str, dict[str, list[dict]]] = {}
-        for s in samples:
-            by_art.setdefault(s.get("artifact_id", "?"), {}).setdefault(
-                s.get("phase"), []
-            ).append(s)
+            document = yaml.safe_load(pairs_file.read_text()) or {}
+        except (OSError, YAML_ERROR) as error:
+            raise ValueError(f"cannot read {pairs_file}: {error}") from error
+        record = str(document.get("record") or pairs_file.parent.name)
+        year = incident_year(pairs_file.parent / "README.md")
 
-        for art, phases in by_art.items():
-            before = pick(phases.get("before", []), CLEAN, base)
-            before_path = before.get("path") if before else None
-            before_version = version_components(before)
-            during = pick(
-                phases.get("during", []), COMPROMISED, base,
-                match_path=before_path,
-                match_version=before_version,
-                exclude_sha256=before.get("sha256") if before else None,
-            )
-            # Some incidents preserve the clean archive alongside a payload
-            # fragment or extracted source file. Fall back across formats only
-            # when a same-format candidate exists but is byte-identical to the
-            # clean baseline (as in W3 Total Cache). Without that guard,
-            # historical HTML/TXT/diff reports would masquerade as release
-            # comparators. In the fallback case incomparable after phases stay
-            # unset below.
-            if not during:
-                duplicate = pick(
-                    phases.get("during", []), COMPROMISED, base, before_path,
-                    match_version=before_version,
-                )
-                if (
-                    duplicate
-                    and before
-                    and before.get("sha256")
-                    and duplicate.get("sha256") == before.get("sha256")
-                ):
-                    during = pick(
-                        phases.get("during", []), COMPROMISED, base,
-                        exclude_sha256=before.get("sha256"),
-                    )
-            during_path = during.get("path") if during else before_path
-            after = pick(
-                phases.get("after", []), REMEDIATED, base,
-                match_path=during_path,
-                match_version=version_components(during),
-            )
+        # Remediation is keyed on the exact compromised bytes it supersedes, so the
+        # `after` attached below is the one the corpus paired with this release, not
+        # whatever happens to be the newest fixed version of the package.
+        fixed_for: dict[tuple[str, str], dict] = {}
+        baselines: dict[str, list[dict]] = {}
+        attacks: list[dict] = []
+        for pair in document.get("pairs") or []:
+            kind = pair.get("kind")
+            if kind == "attack":
+                attacks.append(pair)
+            elif kind == "remediation":
+                # Keyed on subject as well as digest: the same bytes are held under more
+                # than one subject in several records, and a digest-only key let one
+                # subject's remediation displace another's.
+                fixed_for[(pair["old"]["subject"], str(pair["old"].get("sha256")))] = pair["new"]
+            elif kind == "baseline":
+                baselines.setdefault(pair["old"]["subject"], []).append(pair)
+
+        chained: set[str] = set()
+
+        def chain_for(subject: str) -> list[SampleFile]:
+            """The subject's clean release chain, named once per subject."""
+            if subject in chained:
+                return []
+            chained.add(subject)
+            steps = baselines.get(subject) or []
+            chain: list[SampleFile] = []
+            for index, step in enumerate(steps):
+                if index == 0:
+                    first = side_file(tree, record, step["old"])
+                    if first:
+                        chain.append(first)
+                nxt = side_file(tree, record, step["new"])
+                if nxt:
+                    chain.append(nxt)
+            return chain
+
+        for pair in attacks:
+            before = side_file(tree, record, pair["old"])
+            during = side_file(tree, record, pair["new"])
             if not (before and during):
                 continue
+            after_side = fixed_for.get((pair["new"]["subject"], str(pair["new"].get("sha256"))))
+            after = side_file(tree, record, after_side) if after_side else None
 
-            def sample_file(sample: dict | None) -> SampleFile | None:
-                if not sample:
-                    return None
-                p = base / sample.get("path", "")
-                if not p.is_file():
-                    return None
-                return SampleFile(p, sample_logical_name(sample, p))
+            subject = pair["new"]["subject"]
+            chain = chain_for(subject)
 
-            bp, dp, ap = sample_file(before), sample_file(during), sample_file(after)
-            if bp and dp:
-                chain = baseline_chain(phases.get("before", []), base, before)
-                baseline = [f for f in map(sample_file, chain) if f]
-                out.append(Artifact(f"{attack}/{art}", year, bp, dp, ap, baseline))
+            version = during.provenance.get("version")
+            name = f"{record}/{subject}" + (f"@{version}" if version else "")
+            out.append(Artifact(name, year, before, during, after, chain))
+
+        # A compromised release the corpus never found a clean comparator for still has a
+        # remediation to judge. Without this the audit would test less than the corpus
+        # states, purely because one of the three phases is missing.
+        paired = {(p["new"]["subject"], str(p["new"].get("sha256"))) for p in attacks}
+        for (subject, digest), after_side in fixed_for.items():
+            if (subject, digest) in paired:
+                continue
+            during = next((side_file(tree, record, p["old"]) for p in document.get("pairs") or []
+                           if p.get("kind") == "remediation"
+                           and p["old"]["subject"] == subject
+                           and str(p["old"].get("sha256")) == digest), None)
+            after = side_file(tree, record, after_side)
+            if not (during and after):
+                continue
+            version = during.provenance.get("version")
+            name = f"{record}/{subject}" + (f"@{version}" if version else "") + " (no clean comparator)"
+            out.append(Artifact(name, year, None, during, after, []))
+
+        # A subject the corpus holds only clean releases of still carries ground truth:
+        # each adjacent pair is an upgrade a user performed, and flagging one would be a
+        # false positive. Without this the 9 such comparisons would go untested purely
+        # because the incident's compromised release was never recovered.
+        for subject in sorted(set(baselines) - chained):
+            chain = chain_for(subject)
+            if len(chain) > 1:
+                out.append(Artifact(f"{record}/{subject}", year, chain[0], None, None, chain))
+
     out.sort(key=lambda artifact: (artifact.year, artifact.name))
     return out
 
@@ -511,39 +298,40 @@ def run_transition(isomer: str, traits: str | None, fail_on: str,
     # trip, and crucially no LLM verdict escalation, so the pass/fail is
     # reproducible on any machine (an empty ISOMER_LLM still falls back to a
     # localhost endpoint, which --offline hard-disables).
-    with tempfile.TemporaryDirectory(prefix="isomer-samples-") as staging:
-        def staged(sample: SampleFile, side: str) -> Path:
-            if sample.path.name == sample.logical_name:
-                return sample.path
-            parent = Path(staging) / side
-            parent.mkdir()
-            alias = parent / Path(sample.logical_name).name
-            alias.symlink_to(sample.path)
-            return alias
-
-        cmd = [isomer, "--offline", "fs", str(staged(old, "old")),
-               str(staged(new, "new")), "--format", "json",
-               "--fail-on", fail_on]
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, env=env, start_new_session=True)
+    # The files are handed to isomer where they sit. Samples used to be staged behind
+    # symlinks because the audit had to invent a plausible filename for a file the corpus
+    # stored under a digest or a capture timestamp; in the artifact tree the filename is
+    # the one the artifact was distributed under, so there is nothing to stage.
+    cmd = [isomer, "--offline", "fs", str(old.path), str(new.path),
+           "--format", "json", "--fail-on", fail_on]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=env, start_new_session=True)
+    try:
+        if timeout is None:
+            stdout, stderr = p.communicate()
+        else:
+            stdout, stderr = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # isomer may have parser/build children; kill the whole per-comparison
+        # session so one pathological archive cannot keep a serial audit alive.
         try:
-            if timeout is None:
-                stdout, stderr = p.communicate()
-            else:
-                stdout, stderr = p.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # isomer may have parser/build children; kill the whole per-comparison
-            # session so one pathological archive cannot keep a serial audit alive.
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            p.communicate()
-            return Transition(None, "?", "timeout")
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.communicate()
+        return Transition(None, "?", "timeout")
     # isomer exits 0 (clean) or 1 (gate failed); anything else is a real error.
     if p.returncode not in (0, 1):
         return Transition(None, "?", (stderr or "").strip().splitlines()[-1:][0]
                           if stderr.strip() else f"exit {p.returncode}")
+    # Forward-compatible scanner builds can return a valid verdict after skipping
+    # rules they cannot parse. Such a verdict cannot establish audit coverage,
+    # even when it happens to agree with the expected detection.
+    skipped = re.search(r"WARNING: skipped \d+ trait file\(s\)[^\n]*could not parse", stderr)
+    if skipped:
+        paths = re.findall(r'Failed to parse YAML in "([^"]+)"', stderr)
+        detail = f" ({', '.join(paths)})" if paths else ""
+        return Transition(None, "?", f"incomplete trait coverage: {skipped.group(0)}{detail}")
     try:
         report = json.loads(stdout)
         gate = report["verdict"]["gate"]
@@ -559,6 +347,12 @@ def run_transition(isomer: str, traits: str | None, fail_on: str,
         "verdict": report["verdict"],
         "summary": report.get("raw", {}).get("diff", {}).get("summary"),
     }
+    # Preserve compact, judged measurements for offline calibration, not the
+    # potentially enormous per-file feature/evidence payload.
+    features = report.get("features", {})
+    for key in ("trait_shift", "judged_summary", "scopes", "topology"):
+        if key in features:
+            diagnostic[key] = features[key]
     return Transition(bool(gate["fail"]), gate.get("severity", "?"), diagnostic=diagnostic)
 
 
@@ -575,9 +369,12 @@ def violation_diagnostics(result: Result) -> dict:
 
 def transitions_of(art: Artifact) -> list[tuple[str, SampleFile, SampleFile]]:
     """The isomer runs this artifact needs, as (kind, old, new)."""
-    work = [("bd", art.before, art.during)]
-    if art.after:
+    work: list[tuple[str, SampleFile, SampleFile]] = []
+    if art.before and art.during:
+        work.append(("bd", art.before, art.during))
+    if art.during and art.after:
         work.append(("da", art.during, art.after))
+    if art.before and art.after:
         work.append(("ba", art.before, art.after))
     # Adjacent pairs only: the chain is a release history, and consecutive
     # releases are the upgrades a user actually performs. Every pair would be
@@ -589,12 +386,16 @@ def transitions_of(art: Artifact) -> list[tuple[str, SampleFile, SampleFile]]:
 
 def audit(art: Artifact, runs: dict[str, Transition]) -> Result:
     """Judge one artifact from its already-executed transitions."""
-    bd, da, ba = runs["bd"], runs.get("da"), runs.get("ba")
+    bd, da, ba = runs.get("bd"), runs.get("da"), runs.get("ba")
     res = Result(art.name, art.year, bd, da, ba)
+    res.evidence_warnings = {
+        kind: warnings for kind, old, new in transitions_of(art)
+        if (warnings := evidence_warnings(old, new))
+    }
 
-    if bd.error:
+    if bd and bd.error:
         res.violations.append(f"ERROR before->during: {bd.error}")
-    elif bd.detected is False:
+    elif bd and bd.detected is False:
         res.violations.append(f"MISS before->during not detected (sev={bd.severity})")
     if da:
         if da.error:
@@ -641,9 +442,94 @@ def snapshot_traits(source: str | None, destination: Path) -> str | None:
     return str(destination)
 
 
+def snapshot_executable(command: str, destination: Path) -> SnapshotFile:
+    """Pin detector bytes before workers start; rebuilding cannot mix versions.
+
+    Use the same checked independent copy as inputs, not a hardlink. Model
+    bundles and other runtime resources are not captured by this snapshot.
+    """
+    resolved = shutil.which(command)
+    if resolved is None or not Path(resolved).is_file():
+        raise FileNotFoundError(f"executable not found or not executable: {command}")
+    source = Path(resolved).resolve()
+    sample = SampleFile(source, source.name)
+    captured = snapshot_samples([sample], destination)[source]
+    # Owner-only execution; never propagate setuid/setgid from the source.
+    captured.path.chmod(0o500)
+    return captured
+
+
+def snapshot_samples(samples: list[SampleFile], destination: Path) -> dict[Path, SnapshotFile]:
+    """Copy each input once; later corpus renames/edits cannot change this run.
+
+    These are independent copies, not symlinks or hardlinks. The recorded digest
+    identifies the bytes actually scanned, not an unverified manifest claim.
+    This is a per-file snapshot, not an atomic snapshot of the whole corpus.
+    """
+    snapshots: dict[Path, SnapshotFile] = {}
+    for sample in samples:
+        if sample.path in snapshots:
+            continue
+        target = destination / str(len(snapshots)) / sample.path.name
+        target.parent.mkdir(parents=True)
+        digest = hashlib.sha256()
+        size = 0
+        with sample.path.open("rb") as source, target.open("xb") as output:
+            before = os.fstat(source.fileno())
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                output.write(block)
+                digest.update(block)
+                size += len(block)
+            after = os.fstat(source.fileno())
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns) or size != before.st_size:
+            raise ValueError(f"input changed while being copied: {sample.path}")
+        snapshots[sample.path] = SnapshotFile(target, digest.hexdigest(), size)
+    return snapshots
+
+
 def default_jobs() -> int:
     """Each scanner uses multiple cores and can retain several GB of data."""
     return min(8, max(1, (os.cpu_count() or 2) // 2))
+
+
+def write_stream_record(stream, key: tuple[int, str], artifact: Artifact,
+                        old: SampleFile, new: SampleFile, transition: Transition,
+                        snapshots: dict[Path, SnapshotFile] | None = None) -> None:
+    """Append one self-contained completed comparison and flush it immediately."""
+    expected = key[1] == "bd"
+    issue = None
+    if transition.error or transition.detected is None:
+        issue = "ERROR"
+    elif transition.detected != expected:
+        issue = {"bd": "MISS", "da": "FP-REMEDIATION", "ba": "FP-NET"}.get(
+            key[1], "FP-BASELINE")
+    def describe(sample: SampleFile) -> dict:
+        description = {"path": str(sample.path), "logical_name": sample.logical_name}
+        if sample.provenance:
+            description["provenance"] = sample.provenance
+        if snapshots is not None:
+            snapshot = snapshots[sample.path]
+            description.update(sha256=snapshot.sha256, size=snapshot.size)
+        return description
+
+    stream.write(json.dumps({
+        "event": "comparison",
+        "artifact_index": key[0],
+        "artifact": artifact.name,
+        "year": artifact.year,
+        "transition": key[1],
+        "old": describe(old),
+        "new": describe(new),
+        "expected_detected": expected,
+        "evidence_warnings": evidence_warnings(old, new),
+        "issue": issue,
+        "detected": transition.detected,
+        "severity": transition.severity,
+        "error": transition.error,
+        "diagnostic": transition.diagnostic,
+    }, separators=(",", ":")) + "\n")
+    stream.flush()
 
 
 def main() -> int:
@@ -653,8 +539,8 @@ def main() -> int:
     )
     ap.add_argument("--corpus", type=Path,
                     default=Path(os.environ.get("ISOMER_SAMPLES_DIR",
-                                Path.home() / "src/supplychain-attack-data/oss/attacks")),
-                    help="corpus root holding <attack>/samples/manifest.yaml")
+                                Path.home() / "data/supplychain-attack-data")),
+                    help="artifact tree holding <record>/pairs.yaml")
     ap.add_argument("--isomer", default=os.environ.get("ISOMER", default_isomer()),
                     help="isomer binary")
     ap.add_argument("--traits", default=os.environ.get("CLEAVE_TRAITS_DIR"),
@@ -670,11 +556,17 @@ def main() -> int:
                     help="per-run seconds (0 = unlimited; timed-out comparisons are errors)")
     ap.add_argument("--limit", type=int, default=0, help="cap artifacts (0=all)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--check-corpus", action="store_true",
+                    help="resolve every stated comparison against the tree; no scans")
+    ap.add_argument("--stream-results", type=Path, metavar="PATH",
+                    default=os.environ.get("ISOMER_AUDIT_STREAM_RESULTS"),
+                    help="create a new JSONL file with flushed results in completion order")
     args = ap.parse_args()
 
     if not args.corpus.is_dir():
-        print(f"validate-samples: corpus not found at {args.corpus}\n"
-              f"  set ISOMER_SAMPLES_DIR or pass --corpus.", file=sys.stderr)
+        print(f"validate-samples: artifact tree not found at {args.corpus}\n"
+              f"  set ISOMER_SAMPLES_DIR or pass --corpus. The tree is generated from the\n"
+              f"  records repository with `make artifacts`, or synced from R2.", file=sys.stderr)
         return 2
 
     try:
@@ -682,10 +574,35 @@ def main() -> int:
     except (OSError, ValueError, YAML_ERROR) as error:
         print(f"validate-samples: {error}", file=sys.stderr)
         return 2
+
+    if args.check_corpus:
+        # Every side of every stated comparison had to resolve to a file for the artifact
+        # to be built at all, so this reports what the audit would run without running it.
+        # It is the cheap check that the tree and the records still agree.
+        counts: dict[str, int] = {}
+        for artifact in artifacts:
+            for kind, _, _ in transitions_of(artifact):
+                key = "before->before" if kind.startswith("bb") else {
+                    "bd": "before->during", "da": "during->after", "ba": "before->after",
+                }[kind]
+                counts[key] = counts.get(key, 0) + 1
+        if args.json:
+            print(json.dumps({"artifacts": len(artifacts), "comparisons": counts}, sort_keys=True))
+        else:
+            print(f"{len(artifacts)} artifacts, {sum(counts.values())} comparisons")
+            for key in sorted(counts):
+                print(f"  {counts[key]:6d}  {key}")
+        return 0
     if args.limit:
         artifacts = artifacts[: args.limit]
     if not artifacts:
-        print(f"validate-samples: no before+during pairs under {args.corpus}", file=sys.stderr)
+        # Pointing at the records repository instead of the tree is the likely mistake, and
+        # it looks identical to an empty corpus unless the message says so.
+        if not any(args.corpus.glob("*/pairs.yaml")):
+            print(f"validate-samples: no pairs.yaml under {args.corpus}\n"
+                  f"  this is the artifact tree, not the records repository.", file=sys.stderr)
+        else:
+            print(f"validate-samples: no comparisons under {args.corpus}", file=sys.stderr)
         return 2
 
     timeout = args.timeout or None
@@ -705,25 +622,70 @@ def main() -> int:
     runs: dict[tuple[int, str], Transition] = {}
     with tempfile.TemporaryDirectory(prefix="isomer-audit-traits-") as staging:
         try:
+            detector = snapshot_executable(args.isomer, Path(staging) / "detector")
+        except (OSError, ValueError) as error:
+            print(f"validate-samples: cannot snapshot executable: {error}", file=sys.stderr)
+            return 2
+        try:
             traits = snapshot_traits(args.traits, Path(staging) / "traits")
         except OSError as error:
             print(f"validate-samples: cannot snapshot traits: {error}", file=sys.stderr)
             return 2
-        with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
-            futs = {ex.submit(run_transition, args.isomer, traits, args.fail_on,
-                              old, new, timeout): (i, kind)
-                    for i, kind, old, new in work}
-            for n, fut in enumerate(cf.as_completed(futs), 1):
-                runs[futs[fut]] = fut.result()
-                print(f"\r  {n}/{len(work)}", end="", file=sys.stderr, flush=True)
+        stream = None
+        try:
+            if args.stream_results:
+                stream = args.stream_results.open("x", encoding="utf-8")
+            try:
+                snapshots = snapshot_samples(
+                    [sample for _, _, old, new in work for sample in (old, new)],
+                    Path(staging) / "inputs")
+            except (OSError, ValueError) as error:
+                print(f"validate-samples: cannot snapshot inputs: {error}", file=sys.stderr)
+                return 2
+            if stream:
+                stream.write(json.dumps({
+                    "event": "run", "schema": 1, "comparisons": len(work),
+                    "isomer": args.isomer, "traits_source": args.traits,
+                    "detector_snapshot": {"path": str(detector.path),
+                                          "sha256": detector.sha256, "size": detector.size},
+                    "traits_snapshot": traits, "corpus": str(args.corpus),
+                    "fail_on": args.fail_on, "offline": True,
+                    "input_snapshot": "independent-copies",
+                }) + "\n")
+                stream.flush()
+            def copied(sample: SampleFile) -> SampleFile:
+                return SampleFile(snapshots[sample.path].path, sample.logical_name)
+
+            with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+                futs = {ex.submit(run_transition, str(detector.path), traits, args.fail_on,
+                                  copied(old), copied(new), timeout): (i, kind, old, new)
+                        for i, kind, old, new in work}
+                for n, fut in enumerate(cf.as_completed(futs), 1):
+                    i, kind, old, new = futs[fut]
+                    key = (i, kind)
+                    try:
+                        transition = fut.result()
+                    except Exception as error:
+                        transition = Transition(None, "?", f"worker failed: {error}")
+                    runs[key] = transition
+                    if stream:
+                        write_stream_record(stream, key, artifacts[i], old, new, transition,
+                                            snapshots)
+                    print(f"\r  {n}/{len(work)}", end="", file=sys.stderr, flush=True)
+        except OSError as error:
+            print(f"validate-samples: cannot write result stream: {error}", file=sys.stderr)
+            return 2
+        finally:
+            if stream:
+                stream.close()
     print("", file=sys.stderr)
     results = [audit(art, {k: runs[(i, k)] for k, _, _ in transitions_of(art)})
                for i, art in enumerate(artifacts)]
     results.sort(key=lambda r: (r.year, r.name))
 
     # Tallies.
-    bd_ok = sum(1 for r in results if r.bd.detected)
-    bd_total = sum(1 for r in results if r.bd.detected is not None)
+    bd_ok = sum(1 for r in results if r.bd and r.bd.detected)
+    bd_total = sum(1 for r in results if r.bd and r.bd.detected is not None)
     da_seen = [r for r in results if r.da and r.da.detected is not None]
     ba_seen = [r for r in results if r.ba and r.ba.detected is not None]
     da_fp = sum(1 for r in da_seen if r.da.detected)
@@ -742,10 +704,21 @@ def main() -> int:
             "before_after_false_positives": ba_fp, "before_after_total": len(ba_seen),
             "before_before_false_positives": bb_fp, "before_before_total": len(bb_seen),
             "errors": errors,
+            "evidence_warnings": [{"artifact": r.name, "transitions": r.evidence_warnings}
+                                  for r in results if r.evidence_warnings],
             "violations": [{"artifact": r.name, "issues": r.violations,
                             "diagnostics": violation_diagnostics(r)} for r in violations],
         }, indent=2))
         return 1 if violations else 0
+
+    qualified = [r for r in results if r.evidence_warnings]
+    if qualified:
+        print("\nEVIDENCE WARNINGS (expectations and gates unchanged):")
+        for r in qualified:
+            for kind, warnings in r.evidence_warnings.items():
+                for warning in warnings:
+                    print(f"  {r.name} {kind} {warning['side']}: "
+                          f"{warning['message']} (classification={warning['classification']})")
 
     if violations:
         print(f"\nVIOLATIONS ({sum(len(r.violations) for r in violations)}):")

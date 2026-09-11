@@ -13,12 +13,12 @@ CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 # passes the right `-p` without a second place to keep in sync.
 PACKAGE := $(shell awk -F'"' '/^name = /{print $$2; exit}' Cargo.toml)
 
-.PHONY: all build release quick install lint fix test test-simulations demo validate-samples install-precommit cut-release clean help
+.PHONY: all build release quick install lint fix test test-simulations demo validate-manifests validate-samples install-precommit cut-release clean help
 
 # Trait set the sample audit judges with. Defaults to the working-tree
 # traits-dev beside this repo when present, so the audit tracks trait edits;
 # override CLEAVE_TRAITS_DIR to point elsewhere (or leave unset for bundled).
-TRAITS_DIR ?= $(if $(wildcard ../traits-dev/.),../traits-dev,)
+TRAITS_DIR ?= $(if $(CLEAVE_TRAITS_DIR),$(CLEAVE_TRAITS_DIR),$(if $(wildcard ../traits-dev/.),../traits-dev,))
 
 all: build
 
@@ -42,9 +42,14 @@ install: release
 # and examples under the same lints as the binary — clippy.toml relaxes only the
 # panic lints there. `--locked` fails on a stale Cargo.lock instead of quietly
 # rewriting it, so a lint run can't move a pinned git dep.
-lint:
+lint: lint-trait-ids
 	$(CARGO) fmt --check
 	$(CARGO) clippy --locked --all-targets -- -D warnings
+
+# No legacy allowlist: scorer dependencies on local trait names must migrate.
+.PHONY: lint-trait-ids
+lint-trait-ids:
+	python3 scripts/lint_trait_ids.py
 
 # Auto-fix what clippy and rustfmt can fix on their own; fmt last so it tidies
 # any code clippy rewrote. Same target set as `lint`.
@@ -60,6 +65,9 @@ test:
 # bundle, trait checkout, or network required; also included in `make test`.
 test-simulations:
 	$(CARGO) test --quiet analysis::simulations
+	$(CARGO) test --quiet binary::tests
+	$(CARGO) test --quiet registry::tests
+	$(CARGO) test --quiet deps::tests
 	python3 -m unittest discover -s scripts -p 'test_*.py'
 
 # Run the curated real-world supply-chain attacks — command in, verdict out,
@@ -69,10 +77,16 @@ test-simulations:
 demo: quick
 	@sh scripts/demo.sh "./target/quick/$(BINARY)"
 
+# Resolves every comparison the corpus states against the artifact tree, without
+# scanning anything. Requires PyYAML; fails if the tree is missing or a stated
+# comparison names a file that is not there.
+validate-manifests:
+	python3 scripts/validate-samples.py --check-corpus
+
 # Self-audit against the supply-chain corpus: for every attack, before->during
 # must be detected, and during->after / before->after must not. Prints a
 # violations report and exits non-zero on any miss or false positive. Point at
-# the corpus with ISOMER_SAMPLES_DIR (default ~/src/supplychain-attack-data);
+# the artifact tree with ISOMER_SAMPLES_DIR (default ~/data/supplychain-attack-data);
 # it skips cleanly (exit 2) when the corpus is absent.
 validate-samples: quick
 	@CLEAVE_TRAITS_DIR="$(TRAITS_DIR)" \
@@ -131,7 +145,8 @@ help:
 	@echo "  release   optimized build"
 	@echo "  quick     optimized build, no LTO — fast to link, used by demo"
 	@echo "  install   cargo install to ~/.cargo/bin"
-	@echo "  lint      rustfmt --check + clippy with warnings denied"
+	@echo "  lint      trait-ID policy + rustfmt --check + clippy with warnings denied"
+	@echo "  lint-trait-ids  reject production dependencies on local trait names"
 	@echo "  fix       auto-fix clippy + rustfmt"
 	@echo "  test      run the test suite"
 	@echo "  test-simulations  fast detector regressions without the sample corpus"

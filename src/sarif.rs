@@ -226,7 +226,7 @@ fn findings(a: &Analysis<'_>) -> Vec<Finding> {
             rule: format!("isomer/{}", crate::rubric::structure_id(f.label)),
             name: format!("Structural change: {}", f.label),
             severity: f.severity,
-            message: format!("{} {kind} {} — {}", a.naming.name, f.label, f.detail),
+            message: format!("{} {kind} {} — {}", a.naming.name, f.label, f.sentence()),
             help: "A raw structural property of the binary changed — a linked dependency, an \
                    ifunc resolver, a writable+executable section. These are facts read from \
                    the file format rather than rule matches, so they catch a novel attack that \
@@ -258,9 +258,15 @@ fn locate(a: &Analysis<'_>, hunks: &[&crate::evidence::Hunk], f: &Finding) -> Va
             .iter()
             .find(|h| f.ids.iter().any(|id| id == &h.id))
             .or_else(|| {
-                hunks
-                    .iter()
-                    .find(|h| f.hints.iter().any(|ns| h.id.contains(ns.as_str())))
+                hunks.iter().find(|h| {
+                    f.hints.iter().any(|ns| {
+                        crate::rubric::in_trait_hierarchy(&h.id, ns)
+                            || crate::rubric::in_trait_hierarchy(
+                                &crate::rubric::namespace_of(&h.id),
+                                ns,
+                            )
+                    })
+                })
             })
             // Still nothing: the strongest evidence in the change is a better
             // pointer than an arbitrary file.

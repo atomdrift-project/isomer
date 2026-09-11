@@ -22,6 +22,7 @@ colored = "3.1"
 filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+node-semver = "2.2"
 
 # atomdrift-scan (lib name `scan`) supplies the azoth ML model for risk
 # scoring each side of the diff, and will later drive purl/oci fetching,
@@ -103,6 +104,16 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 3
 
+# Carve-outs from the O3-everything glob above (mirrors scan/cleave): these
+# two are the largest compile-time units in the tree and the runtime gap to
+# O3 is single-digit percent on YARA workloads. Package entries win over the
+# glob, so everything else keeps its dev-runtime optimization.
+[profile.dev.package.wasmtime]
+opt-level = 2
+
+[profile.dev.package.cranelift-codegen]
+opt-level = 2
+
 # Thin LTO + cu=16 keeps most of fat LTO's runtime gain at roughly a third of
 # the link time — the right default for everyday `cargo build --release`.
 [profile.release]
@@ -139,3 +150,7 @@ incremental = true
 tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
 tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
 
+# Temporary development override: exercise the local extraction changes across
+# Isomer, Cleave, and scan. Replace with a published git pin before release.
+
+# Exercise local archive-cache and proximity-evidence fixes during the audit.

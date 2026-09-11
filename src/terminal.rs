@@ -8,7 +8,10 @@
 //! One grid language throughout — every section is a `label  body` row, its
 //! marker (a severity dot or a change sign) landing in the content column — with
 //! a blank line between sections so each triage question (known campaign? who
-//! shipped it? what can it newly do?) reads as its own block.
+//! shipped it? what can it newly do?) reads as its own block. Anything that
+//! belongs to a row — a fact's detail, a hunk's bytes, a class's traits — sits
+//! indented beneath it, so every line has a visible parent and no row runs
+//! past a 100-column pane.
 
 use std::fmt::Write as _;
 
@@ -29,6 +32,16 @@ const NAME_W: usize = 20;
 /// Width cap for the rule-description column, in the signature grid and over
 /// the evidence headers, so both lanes clip at the same place.
 const DESC_W: usize = 56;
+/// Indent of the rows that belong to a grid row — leaves, details, code —
+/// just past the label cell, the 2-wide change sign, and the 4-wide severity
+/// column.
+const INDENT: usize = PILL_COL + 7;
+/// Visible width the wrapped prose beneath a row stops at, from [`INDENT`].
+const PROSE_W: usize = 74;
+/// Display width of one code row in an evidence hunk. Narrower than
+/// [`crate::evidence::CODE_W`], the *windowing* budget, so a row plus its
+/// locator gutter still fits beside the label column.
+const CODE_COLS: usize = 74;
 
 /// The complete terminal report for one analysis.
 pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
@@ -63,6 +76,7 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
         // they are the whole story.
         let obs = a.observations();
         if !obs.is_empty() {
+            out.push('\n');
             out.push_str(&observations_section(&obs));
         }
     } else if let Some(existing) =
@@ -78,7 +92,38 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
     // silent change: a benign-looking version bump pulling a malicious release
     // is exactly the case worth surfacing.
     if !a.deps.is_empty() {
+        out.push('\n');
         out.push_str(&dependencies_section(&a.deps));
+    }
+    if !a.registry.is_empty() {
+        out.push_str("\nregistry (current lookup; not historical resolution):\n");
+        for row in &a.registry {
+            let _ = writeln!(
+                out,
+                "  {}: {} (new: {})",
+                crate::printable(&row.subject),
+                row.severity().as_str(),
+                row.new_severity.as_str()
+            );
+            if let Some(reason) = &row.policy_reason {
+                let _ = writeln!(out, "    {reason}");
+            }
+            for (side, observation) in [("before", &row.old), ("after", &row.new)] {
+                if let Some(observation) = observation {
+                    for finding in &observation.findings {
+                        let _ = writeln!(
+                            out,
+                            "    {side} {}: {}",
+                            crate::printable(&observation.coordinate),
+                            finding.description
+                        );
+                    }
+                }
+                if let Some(error) = observation.as_ref().and_then(|o| o.error.as_ref()) {
+                    let _ = writeln!(out, "    {side}: {}", crate::printable(error));
+                }
+            }
+        }
     }
     out
 }
@@ -112,6 +157,9 @@ fn render(out: &mut String, a: &Analysis<'_>) {
     if let Some(r) = a.risk {
         summary.push_str(&risk_row(r));
     }
+    push_section(&mut sections, &mut summary);
+    // The shape of the change — its own block, so the verdict lines above
+    // stand alone.
     differential_grid(&mut summary, a);
     push_section(&mut sections, &mut summary);
 
@@ -130,8 +178,12 @@ fn render(out: &mut String, a: &Analysis<'_>) {
     push_section(&mut sections, &mut section);
     frameworks_grid(&mut section, a);
     push_section(&mut sections, &mut section);
-    // Aggregate counts that sum honestly across file types (symbols, sections,
-    // strings); scalar per-file metrics ride each evidence header instead.
+    // The numbers behind the call — the metrics that moved most, then the
+    // aggregate counts that sum honestly across file types (symbols, sections,
+    // strings). In a container diff, each file's own movers ride its evidence
+    // header too.
+    metrics_grid(&mut section, a);
+    push_section(&mut sections, &mut section);
     for (i, body) in stats_rows(a.display_diff()).into_iter().enumerate() {
         let cell = section_cell(i, "stats", PILL_TEAL);
         section.push_str(&grid_line(&cell, "", &body));
@@ -165,6 +217,23 @@ fn differential_grid(out: &mut String, a: &Analysis<'_>) {
     let mut rows: Vec<(&str, &str)> = Vec::new();
     for line in &summary {
         let (label, body) = line.split_once(": ").unwrap_or(("diff", line.as_str()));
+        // The metric movers get a table of their own, the headline already
+        // opens the report, and the gate is the exit code — the LLM reads
+        // them here, the grid does not.
+        if matches!(
+            label,
+            "largest metric changes" | "deterministic assessment" | "primary deterministic signal"
+        ) || label.starts_with("current registry")
+            || label.starts_with("registry coverage gap")
+        {
+            continue;
+        }
+        // The LLM's scope name is jargon on a screen.
+        let label = if label == "scope ROC" {
+            "changed"
+        } else {
+            label
+        };
         // Payload indicators arrive as one ` · `-joined line but read as a list,
         // so they get a row each under a single heading.
         if label == "payload indicators" {
@@ -177,18 +246,30 @@ fn differential_grid(out: &mut String, a: &Analysis<'_>) {
     // the previous row, not on the row index, since a split-out run never
     // starts at the top of the section.
     let mut previous = "";
-    for (i, (label, body)) in rows.into_iter().enumerate() {
+    let mut row = 0;
+    for (label, body) in rows {
         let name = if label == previous {
-            String::new()
+            " ".repeat(label.chars().count())
         } else {
             label.bold().to_string()
         };
         previous = label;
-        out.push_str(&grid_line(
-            &section_cell(i, "diff", PILL_TEAL),
-            "",
-            &format!("{name}  {}", body.truecolor(190, 201, 209)),
-        ));
+        // A long shape sentence wraps under its own first word, so the label
+        // column stays a column.
+        let lead = label.chars().count() + 2;
+        for (k, line) in wrap_words(body, PROSE_W.saturating_sub(lead))
+            .into_iter()
+            .enumerate()
+        {
+            let cell = section_cell(row, "diff", PILL_TEAL);
+            row += 1;
+            let body = if k == 0 {
+                format!("{name}  {}", line.truecolor(190, 201, 209))
+            } else {
+                format!("{:lead$}{}", "", line.truecolor(190, 201, 209))
+            };
+            out.push_str(&grid_line(&cell, "", &body));
+        }
     }
 }
 
@@ -199,24 +280,52 @@ fn differential_grid(out: &mut String, a: &Analysis<'_>) {
 /// own reference anyway. `+` is a technique the change introduced, `−` one it
 /// no longer exhibits — a fix landing looks different from a regression.
 fn frameworks_grid(out: &mut String, a: &Analysis<'_>) {
+    const MAX: usize = 10;
     for (label, sides) in [("attack", &a.survey.attack), ("mbc", &a.survey.mbc)] {
         if !sides.changed() {
             continue;
         }
-        let mut items: Vec<String> = Vec::new();
-        items.extend(sides.gained().iter().map(|id| format!("+{id}")));
-        items.extend(sides.lost().iter().map(|id| format!("−{id}")));
-        let kept = sides.kept();
-        for (i, line) in wrap_items(&items, 60).into_iter().enumerate() {
+        // One id per row, its official name beside it: `+` introduced, `−` no
+        // longer exhibited, the introduced ones bright.
+        let mut rows: Vec<(String, bool)> = Vec::new();
+        rows.extend(sides.gained().into_iter().map(|id| (id.to_string(), true)));
+        rows.extend(sides.lost().into_iter().map(|id| (id.to_string(), false)));
+        let overflow = rows.len().saturating_sub(MAX);
+        rows.truncate(MAX);
+        let idw = rows
+            .iter()
+            .map(|(id, _)| id.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (i, (id, gained)) in rows.iter().enumerate() {
             let cell = section_cell(i, label, PILL_OCEAN);
-            let mut body = line.truecolor(205, 214, 221).to_string();
-            if i == 0 && kept > 0 {
-                body.push_str(&format!(
-                    "   {}",
-                    format!("{kept} unchanged").truecolor(102, 117, 127)
-                ));
-            }
-            out.push_str(&grid_line(&cell, "", &body));
+            let painted = if *gained {
+                id.truecolor(205, 214, 221)
+            } else {
+                id.truecolor(102, 117, 127)
+            };
+            let name = crate::frameworks::name(id).unwrap_or_default();
+            let body = format!(
+                "{}  {}",
+                pad_visible(&painted.to_string(), id, idw),
+                name.truecolor(190, 201, 209)
+            );
+            let marker = sign(Some(if *gained { '+' } else { '−' }));
+            out.push_str(&grid_line(&cell, &marker, &body));
+        }
+        let mut tail: Vec<String> = Vec::new();
+        if overflow > 0 {
+            tail.push(format!("+{overflow} more"));
+        }
+        if sides.kept() > 0 {
+            tail.push(format!("{} unchanged", sides.kept()));
+        }
+        if !tail.is_empty() {
+            out.push_str(&grid_line(
+                &blank_cell(),
+                &sign(None),
+                &tail.join(" · ").truecolor(102, 117, 127).to_string(),
+            ));
         }
     }
 }
@@ -263,19 +372,164 @@ fn files_grid(out: &mut String, diff: &DiffReportV1) {
 /// dependency, functions turned into ifunc resolvers, new imports — the
 /// signature-less tell for an xz-class attack. Every fact carries a change
 /// marker: `+` newly present, `~` existing structure altered in place.
+///
+/// Worst first, two rows per fact at most: the marker and label, with the
+/// image it was read from dim at the end (named once per run); then the
+/// observations on one line, ` · `-joined. A rubric fact's names ride the
+/// label row itself. The caveat is left to the prose renderers: on screen it
+/// is clutter.
 fn structure_grid(out: &mut String, structure: &crate::rubric::Structure) {
-    for (i, f) in structure.facts.iter().enumerate() {
+    let mut facts: Vec<&crate::rubric::StructFact> = structure.facts.iter().collect();
+    facts.sort_by_key(|f| std::cmp::Reverse(f.severity));
+    let sep = " · ".truecolor(102, 117, 127).to_string();
+    let mut previous: Option<&String> = None;
+    for (i, f) in facts.iter().enumerate() {
         let cell = section_cell(i, "structure", PILL_SLATE);
         let marker = match f.kind {
-            crate::rubric::FactKind::Added => "+",
-            crate::rubric::FactKind::Became => "~",
+            crate::rubric::FactKind::Added => '+',
+            crate::rubric::FactKind::Became => '~',
         };
-        let plain = format!("{marker} {}", f.label);
-        let painted = format!("{} {}", marker.truecolor(120, 134, 144), f.label.bold());
-        let name = pad_visible(&painted, &plain, NAME_W);
-        let body = format!("{name} {}", f.detail.truecolor(150, 160, 168));
-        out.push_str(&grid_line(&cell, &dots(f.severity), &body));
+        let mut head = f.label.bold().to_string();
+        // The values speak for themselves under the label; their names stay
+        // in the prose renderers. A rubric fact's one unnamed value — the
+        // names it found — rides the label row.
+        let mut items: Vec<(&str, String)> = Vec::new();
+        for (name, value) in &f.facts {
+            if name.is_empty() {
+                let _ = write!(head, " {}", value.truecolor(150, 160, 168));
+            } else {
+                items.push((value, value.truecolor(190, 201, 209).to_string()));
+            }
+        }
+        // A subject names its run once: three facts read from the same image
+        // carry it on the first, not three times over.
+        if let Some(subject) = f.subject.as_ref().filter(|s| Some(*s) != previous) {
+            let _ = write!(head, "   {}", subject.truecolor(102, 117, 127));
+        }
+        previous = f.subject.as_ref();
+        out.push_str(&grid_line(
+            &cell,
+            &format!("{}{}", sign(Some(marker)), dots(f.severity)),
+            &head,
+        ));
+        // Greedy over the plain widths, painted output: a fact with many
+        // observations takes a second row rather than running off the pane.
+        // This row may run to the pane edge; it is terse by construction.
+        const ROW_W: usize = PROSE_W + 8;
+        let (mut row, mut width): (Vec<String>, usize) = (Vec::new(), 0);
+        for (plain, painted) in items {
+            let w = plain.chars().count();
+            if !row.is_empty() && width + 3 + w > ROW_W {
+                let _ = writeln!(out, "{:INDENT$}{}", "", row.join(sep.as_str()));
+                row.clear();
+                width = 0;
+            }
+            width += if row.is_empty() { w } else { 3 + w };
+            row.push(painted);
+        }
+        if !row.is_empty() {
+            let _ = writeln!(out, "{:INDENT$}{}", "", row.join(sep.as_str()));
+        }
     }
+}
+
+/// The scalar metrics that moved most, one per row with the columns aligned —
+/// name, `old → new`, relative change — so the eye ranks them without reading.
+/// The rows arrive ranked by [`crate::analysis::metric_change_importance`].
+fn metrics_grid(out: &mut String, a: &Analysis<'_>) {
+    const MEMBER_W: usize = 24;
+    const LABEL_W: usize = 36;
+    let moves = a.metric_moves();
+    // In a container diff a member column leads, named once per run — the
+    // metric names stay whole, since the leaf is what distinguishes them.
+    let members: Vec<String> = moves
+        .iter()
+        .map(|m| {
+            m.member
+                .as_deref()
+                .map(|s| crate::clip(s, MEMBER_W))
+                .unwrap_or_default()
+        })
+        .collect();
+    let labels: Vec<String> = moves
+        .iter()
+        .map(|m| crate::clip(&m.label, LABEL_W))
+        .collect();
+    let widest = |items: &[String]| items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let (mw, lw) = (widest(&members), widest(&labels));
+    let (ow, nw, dw) = (
+        moves
+            .iter()
+            .map(|m| m.old.chars().count())
+            .max()
+            .unwrap_or(0),
+        moves
+            .iter()
+            .map(|m| m.new.chars().count())
+            .max()
+            .unwrap_or(0),
+        moves
+            .iter()
+            .map(|m| m.delta.chars().count())
+            .max()
+            .unwrap_or(0),
+    );
+    let mut previous = "";
+    for (i, m) in moves.iter().enumerate() {
+        let cell = section_cell(i, "metrics", PILL_TEAL);
+        let member = if members[i] == previous {
+            ""
+        } else {
+            &members[i]
+        };
+        previous = &members[i];
+        let delta = if m.delta.starts_with('-') {
+            format!("{:>dw$}", m.delta).truecolor(102, 117, 127)
+        } else {
+            format!("{:>dw$}", m.delta).truecolor(95, 175, 95)
+        };
+        let mut body = String::new();
+        if mw > 0 {
+            let _ = write!(
+                body,
+                "{}  ",
+                pad_visible(&member.truecolor(102, 117, 127).to_string(), member, mw)
+            );
+        }
+        let _ = write!(
+            body,
+            "{}  {} {} {}  {delta}",
+            pad_visible(
+                &labels[i].truecolor(190, 201, 209).to_string(),
+                &labels[i],
+                lw
+            ),
+            format!("{:>ow$}", m.old).truecolor(140, 150, 158),
+            "→".truecolor(102, 117, 127),
+            pad_visible(&m.new.truecolor(232, 237, 242).to_string(), &m.new, nw),
+        );
+        out.push_str(&grid_line(&cell, "", &body));
+    }
+}
+
+/// Greedy word wrap to `width` visible chars; a word longer than the width
+/// stands on its own row rather than being split.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 /// ` [ HOSTILE ]  liblzma.so   5.4.5 → 5.6.0 · 2 minor releases · 35% changed`.
@@ -326,11 +580,11 @@ pub(crate) fn change_scale(diff: &DiffReportV1) -> Vec<String> {
     parts
 }
 
-/// The ML detector on one line: `old → new` on a benign→malware bar, the band
-/// word, and the jump.
+/// The ML detector on one line: scores, a probability bar, the calibrated
+/// classification, and the jump. Color follows the decision, not a raw cutoff.
 fn risk_row(r: Risk) -> String {
     let d = r.delta();
-    let band = crate::analysis::risk_band(r.new);
+    let band = r.model_severity();
     let (arrow, dsev) = if d > 0.005 {
         ("▲", band)
     } else if d < -0.005 {
@@ -340,95 +594,82 @@ fn risk_row(r: Risk) -> String {
     };
     // The band word carries its own severity color, except a benign read, which
     // stays dim rather than claiming the green a clean verdict owns.
+    let label = r.new_classification.to_string();
     let word = if band == Severity::None {
-        risk_label(r.new).truecolor(102, 117, 127).to_string()
+        label.truecolor(102, 117, 127).to_string()
     } else {
-        paint(band, risk_label(r.new))
+        paint(band, &label)
     };
     let body = format!(
         "{} {} {}  {}  {}   {}",
         format!("{:.2}", r.old).truecolor(140, 150, 158),
         "→".truecolor(102, 117, 127),
         paint(band, &format!("{:.2}", r.new)).bold(),
-        bar(r.new),
+        bar(r.new, band),
         word,
         paint(dsev, &format!("{arrow} {d:+.2}")),
     );
     grid_line(&pill_cell("risk", PILL_OCEAN), "", &body)
 }
 
-/// The gained capability classes as a tree: a marker per class — green `+` for
-/// one the old version lacked, amber `↑` for an existing class that grew — then
-/// its newly-gained traits as `└─` leaves. Replaces the old new/expanded split
-/// so both directions read in one section, hierarchy explicit.
+/// The gained traits, one row per namespace: a marker — green `+` for a
+/// capability class the old version lacked, amber `↑` for an existing class
+/// that grew — the tier of the strongest trait under it, the taxonomy path,
+/// and how many traits it covers. The path is the finding; the individual
+/// traits and their evidence are in the JSON and the evidence section.
+/// Worst tier first, alphabetical within a tier so siblings sit together.
 fn gained_grid(out: &mut String, a: &Assessment) {
-    const MAX_TRAITS: usize = 24;
-    // Group categories by namespace so a namespace shows once with all its
-    // gained traits beneath it — xz's three `binary/linking/runtime` traits are
-    // one class, not three. A group is `new` (green `+`) only when every trait
-    // in it is; a mix means the class already existed and grew (amber `↑`).
-    let mut ranked: Vec<(f32, String, bool, String, String)> = Vec::new();
+    const MAX_ROWS: usize = 12;
+    // namespace → (all classes new, worst tier, trait count)
+    let mut groups: Vec<(String, bool, Severity, usize)> = Vec::new();
     for c in &a.behavioral.categories {
-        let ns = if c.namespaces.is_empty() {
-            c.label.clone()
-        } else {
-            c.namespaces.join(" · ")
-        };
-        ranked.extend(c.new_ids.iter().map(|id| {
-            (
-                c.trait_scores.get(id).copied().unwrap_or_default(),
-                ns.clone(),
-                a.behavioral.is_new_category(c),
-                id.rsplit("::").next().unwrap_or(id).to_string(),
-                id.clone(),
-            )
-        }));
-        ranked.extend(c.escalated_ids.iter().map(|id| {
-            (
-                c.trait_scores.get(id).copied().unwrap_or_default(),
-                ns.clone(),
-                false,
-                id.rsplit("::").next().unwrap_or(id).to_string(),
-                id.clone(),
-            )
-        }));
-    }
-    ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.4.cmp(&b.4)));
-    let overflow = ranked.len().saturating_sub(MAX_TRAITS);
-    ranked.truncate(MAX_TRAITS);
-
-    let mut groups: Vec<(String, bool, Vec<String>)> = Vec::new();
-    for (_, ns, new, leaf, _) in ranked {
-        if let Some(g) = groups.iter_mut().find(|(n, ..)| *n == ns) {
-            g.1 = g.1 && new;
-            g.2.push(leaf);
-        } else {
-            groups.push((ns, new, vec![leaf]));
+        for id in c.new_ids.iter().chain(&c.escalated_ids) {
+            let ns = crate::rubric::namespace_of(id);
+            let sev = c.traits.get(id).map_or(c.severity, |n| n.severity);
+            match groups.iter_mut().find(|g| g.0 == ns) {
+                Some(g) => {
+                    g.1 = g.1 && a.behavioral.is_new_category(c);
+                    g.2 = g.2.max(sev);
+                    g.3 += 1;
+                }
+                None => groups.push((ns, a.behavioral.is_new_category(c), sev, 1)),
+            }
         }
     }
-    for (i, (ns, all_new, leaves)) in groups.iter().enumerate() {
+    groups.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    let overflow = groups.len().saturating_sub(MAX_ROWS);
+    groups.truncate(MAX_ROWS);
+    let nsw = groups
+        .iter()
+        .map(|g| g.0.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (i, (ns, all_new, sev, count)) in groups.iter().enumerate() {
         let cell = section_cell(i, "gained", PILL_PLUM);
-        let marker = if *all_new {
-            "+".truecolor(95, 175, 95)
-        } else {
-            "↑".truecolor(255, 176, 46)
-        };
+        let marker = if *all_new { '+' } else { '↑' };
+        let mut body = ns.bold().to_string();
+        if *count > 1 {
+            let _ = write!(
+                body,
+                "{}   {}",
+                " ".repeat(nsw - ns.chars().count()),
+                format!("{count} traits").truecolor(102, 117, 127)
+            );
+        }
         out.push_str(&grid_line(
             &cell,
-            &format!("{marker}  "),
-            &ns.as_str().bold().to_string(),
+            &format!("{}{}", sign(Some(marker)), dots(*sev)),
+            &body,
         ));
-        for leaf in leaves {
-            leaf_line(out, &leaf.truecolor(76, 178, 255).to_string());
-        }
     }
     if overflow > 0 {
-        leaf_line(
-            out,
-            &format!("+{overflow} more lower-scoring traits")
+        out.push_str(&grid_line(
+            &blank_cell(),
+            &format!("{}{}", sign(None), dots(Severity::None)),
+            &format!("+{overflow} more namespaces")
                 .truecolor(102, 117, 127)
                 .to_string(),
-        );
+        ));
     }
 }
 
@@ -441,7 +682,7 @@ fn leaf_line(out: &mut String, painted: &str) {
         "{:indent$}{} {painted}",
         "",
         "└─".truecolor(70, 80, 89),
-        indent = PILL_COL + 4
+        indent = INDENT
     );
 }
 
@@ -452,7 +693,7 @@ fn removed_grid(out: &mut String, a: &Analysis<'_>) {
         let cell = section_cell(i, "removed", PILL_TEAL);
         out.push_str(&grid_line(
             &cell,
-            &format!("{}  ", "−".truecolor(95, 175, 95)),
+            &format!("{}    ", sign(Some('−'))),
             &group.namespace.as_str().bold().to_string(),
         ));
         for leaf in &group.traits {
@@ -461,7 +702,7 @@ fn removed_grid(out: &mut String, a: &Analysis<'_>) {
     }
 }
 
-fn bar(value: f32) -> String {
+fn bar(value: f32, severity: Severity) -> String {
     // The clamp lands the value in 0..=BAR before the cast, and a float->int
     // `as` saturates rather than wrapping, so a NaN or infinite probability
     // yields an in-range cell count instead of a panic or a bogus repeat().
@@ -473,20 +714,9 @@ fn bar(value: f32) -> String {
     let filled = (value * BAR as f32).round().clamp(0.0, BAR as f32) as usize;
     format!(
         "{}{}",
-        paint(crate::analysis::risk_band(value), &"█".repeat(filled)),
+        paint(severity, &"█".repeat(filled)),
         "░".repeat(BAR - filled).truecolor(70, 80, 89),
     )
-}
-
-/// The plain word for an ML probability: benign / elevated / suspicious /
-/// malware. Shared with the markdown report.
-pub(crate) fn risk_label(p: f32) -> &'static str {
-    match crate::analysis::risk_band(p) {
-        Severity::Critical => "malware",
-        Severity::High => "suspicious",
-        Severity::Medium | Severity::Low => "elevated",
-        Severity::None => "benign",
-    }
 }
 
 // ── the detail grid ──────────────────────────────────────────────────────
@@ -524,18 +754,14 @@ fn signature_grid(out: &mut String, a: &Assessment) {
     let descw = descs.iter().map(|d| d.chars().count()).max().unwrap_or(0);
     for (i, m) in shown.iter().enumerate() {
         let cell = section_cell(i, "signature", PILL_HOT);
-        let marker = if m.is_new { "+" } else { "↑" };
+        let marker = if m.is_new { '+' } else { '↑' };
         let name = crate::rubric::short_name(&m.id);
         let text = if descs[i].is_empty() {
             &name
         } else {
             &descs[i]
         };
-        let mut body = format!(
-            "{} {}",
-            marker.truecolor(120, 134, 144),
-            pad_visible(text, text, descw),
-        );
+        let mut body = pad_visible(text, text, descw);
         if !descs[i].is_empty() {
             body.push_str(&format!(" {}", name.truecolor(102, 117, 127)));
         }
@@ -544,12 +770,16 @@ fn signature_grid(out: &mut String, a: &Assessment) {
         {
             body.push_str(&format!("   {}", paint(Severity::Critical, cve)));
         }
-        out.push_str(&grid_line(&cell, &dots(m.severity), &body));
+        out.push_str(&grid_line(
+            &cell,
+            &format!("{}{}", sign(Some(marker)), dots(m.severity)),
+            &body,
+        ));
     }
     if n > MAX {
         out.push_str(&grid_line(
             &blank_cell(),
-            &"·  ".truecolor(102, 117, 127).to_string(),
+            &format!("{}{}", sign(None), dots(Severity::None)),
             &format!("+{} more", n - MAX)
                 .truecolor(102, 117, 127)
                 .to_string(),
@@ -571,14 +801,19 @@ fn identity_grid(out: &mut String, a: &Assessment) {
             "→".truecolor(70, 80, 89),
             new.bold()
         );
-        out.push_str(&grid_line(&cell, &dots(a.identity.severity), &body));
+        out.push_str(&grid_line(
+            &cell,
+            &format!("{}{}", sign(Some('~')), dots(a.identity.severity)),
+            &body,
+        ));
     }
 }
 
-/// The evidence section as diff-style hunks: each hunk is headed by its
-/// top rule (criticality × confidence) and location, then a short excerpt
-/// with matched lines bright, context dim, and `+` marking lines absent
-/// from the old version.
+/// The evidence section as diff-style hunks under one `evidence` label: each
+/// hunk is headed by its top rule (criticality × confidence) and `file:where`,
+/// then a short excerpt indented beneath — matched lines bright, context dim,
+/// `+` marking lines absent from the old version. A blank line separates
+/// hunks so each excerpt reads with its own header.
 fn evidence_hunks(hunks: &[&Hunk], diff: &DiffReportV1) -> String {
     let locw = hunks
         .iter()
@@ -594,9 +829,16 @@ fn evidence_hunks(hunks: &[&Hunk], diff: &DiffReportV1) -> String {
         .map(|h| crate::clip(&h.desc, DESC_W).chars().count())
         .max()
         .unwrap_or(0);
+    // A file's own metric movers caption its evidence only in a container
+    // diff; for a single file they would restate the metrics section.
+    let archive = diff.files.iter().any(|f| f.path.contains("!!"));
     let mut out = String::new();
     let mut i = 0;
+    let mut row = 0;
     while i < hunks.len() {
+        out.push('\n');
+        let cell = section_cell(row, "evidence", PILL_OCEAN);
+        row += 1;
         if hunks[i].additions {
             // One header per changed file — a severity bar, the path (directory
             // dim, basename bright), and the file's strongest rule as caption.
@@ -611,24 +853,26 @@ fn evidence_hunks(hunks: &[&Hunk], diff: &DiffReportV1) -> String {
                 .map(|h| format!("   {}", paint(sev, &crate::clip(&h.desc, DESC_W))))
                 .unwrap_or_default();
             let (dir, base) = split_path(name);
-            let _ = write!(
-                out,
-                "\n  {} {}{}{cap}\n",
-                paint(sev, "▌"),
+            let head = format!(
+                "{}{}{cap}",
                 dir.truecolor(70, 80, 89),
                 base.truecolor(232, 237, 242).bold(),
             );
-            // Per-file scalar metrics (sizes, entropy, ratios) — the ones that
-            // don't sum across files — live here, next to their file.
-            if let Some(ms) = file_metrics_summary(diff, name) {
-                let _ = writeln!(out, "   {}", ms.truecolor(102, 117, 127));
+            out.push_str(&grid_line(
+                &cell,
+                &format!("{}{}", sign(Some('+')), dots(sev)),
+                &head,
+            ));
+            if archive {
+                metrics_caption(&mut out, diff, name);
             }
             for (k, h) in hunks[i..run.end].iter().enumerate() {
                 if k > 0 {
                     // The gap marker sits in the locator lane, no rail.
                     let _ = writeln!(
                         out,
-                        "  {}",
+                        "{:INDENT$}{}",
+                        "",
                         format!("{:>locw$}", "⋯", locw = locw).truecolor(70, 80, 89),
                     );
                 }
@@ -636,26 +880,57 @@ fn evidence_hunks(hunks: &[&Hunk], diff: &DiffReportV1) -> String {
             }
             i = run.end;
         } else {
-            let name = hunks[i].display_name();
-            let desc = crate::clip(&hunks[i].desc, DESC_W);
-            let _ = write!(
-                out,
-                "\n   {} {}   {}\n",
-                dots(hunks[i].severity),
-                pad_visible(&paint(hunks[i].severity, &desc), &desc, descw),
-                hunks[i].location.truecolor(102, 117, 127),
+            let h = hunks[i];
+            let name = h.display_name();
+            let desc = crate::clip(&h.desc, DESC_W);
+            // A binary hunk's location is its file alone; the byte offset of
+            // the top match says where in it.
+            let location = if h.binary {
+                format!("{name}:{:#x}", h.loc)
+            } else {
+                h.location.clone()
+            };
+            let head = format!(
+                "{}   {}",
+                pad_visible(&paint(h.severity, &desc), &desc, descw),
+                location.truecolor(102, 117, 127),
             );
-            // The first hunk of a (binary) file carries its scalar metrics.
-            if (i == 0 || hunks[i - 1].display_name() != name)
-                && let Some(ms) = file_metrics_summary(diff, name)
-            {
-                let _ = writeln!(out, "   {}", ms.truecolor(102, 117, 127));
+            out.push_str(&grid_line(
+                &cell,
+                &format!("{}{}", sign(Some('+')), dots(h.severity)),
+                &head,
+            ));
+            if archive && (i == 0 || hunks[i - 1].display_name() != name) {
+                metrics_caption(&mut out, diff, name);
             }
-            push_hunk_lines(&mut out, hunks[i], locw);
+            push_hunk_lines(&mut out, h, locw);
             i += 1;
         }
     }
     out
+}
+
+/// A file's scalar metric movers (sizes, entropy, ratios — the ones that don't
+/// sum across files), captioned under its evidence header and wrapped so the
+/// list never runs off the pane.
+fn metrics_caption(out: &mut String, diff: &DiffReportV1, name: &str) {
+    const LEAD: &str = "metrics  ";
+    let Some(items) = file_metrics_summary(diff, name) else {
+        return;
+    };
+    for (k, line) in wrap_items(&items, PROSE_W - LEAD.len())
+        .into_iter()
+        .enumerate()
+    {
+        let lead = if k == 0 { LEAD } else { "         " };
+        let _ = writeln!(
+            out,
+            "{:INDENT$}{}{}",
+            "",
+            lead.truecolor(102, 117, 127),
+            line.truecolor(102, 117, 127)
+        );
+    }
 }
 
 /// `Unreal3.2/include/struct.h` → (`Unreal3.2/include/`, `struct.h`); a bare
@@ -669,15 +944,19 @@ fn split_path(p: &str) -> (&str, &str) {
     }
 }
 
-/// Push a hunk's code rows: `locator + code`, the `+` gutter doubling as the
-/// rail. Matched lines bright, dim context behind them, long lines wrapped
-/// across bare continuation rows.
+/// Push a hunk's code rows: `locator + code`, the `+` gutter marking the
+/// lines absent from the old version against dim context. A binary hunk has
+/// no context — every byte shown is new, which its header's sign already
+/// says — so its rows carry no gutter. Matched lines bright, long lines
+/// wrapped across bare continuation rows.
 fn push_hunk_lines(out: &mut String, h: &Hunk, locw: usize) {
     for l in &h.lines {
         let gutter = match l.added {
-            Some(true) => "+".truecolor(95, 175, 95).to_string(),
-            _ => " ".to_string(),
+            _ if h.binary => " ".to_string(),
+            Some(true) => " +".truecolor(95, 175, 95).to_string(),
+            _ => "  ".to_string(),
         };
+        let gutter_w = if h.binary { 1 } else { 2 };
         let paint_code = |s: &str| {
             if l.is_match {
                 s.truecolor(205, 214, 221).to_string()
@@ -689,12 +968,18 @@ fn push_hunk_lines(out: &mut String, h: &Hunk, locw: usize) {
             let row = if i == 0 {
                 let loc = format!("{:>locw$}", l.locator, locw = locw);
                 format!(
-                    "  {} {gutter} {}",
+                    "{:INDENT$}{}{gutter} {}",
+                    "",
                     loc.truecolor(70, 80, 89),
                     paint_code(&row_text)
                 )
             } else {
-                format!("  {}   {}", " ".repeat(locw), paint_code(&row_text))
+                format!(
+                    "{:INDENT$}{} {}",
+                    "",
+                    " ".repeat(locw + gutter_w),
+                    paint_code(&row_text)
+                )
             };
             out.push_str(row.trim_end());
             out.push('\n');
@@ -717,14 +1002,16 @@ pub(crate) fn evidence_note_text(hunks: &[&Hunk]) -> &'static str {
     }
 }
 
-/// Split code into display rows of at most [`crate::evidence::CODE_W`] chars.
+/// Split code into display rows of at most [`CODE_COLS`] chars.
 fn wrap_code(s: &str) -> Vec<String> {
-    const W: usize = crate::evidence::CODE_W;
     let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= W {
+    if chars.len() <= CODE_COLS {
         return vec![s.to_string()];
     }
-    chars.chunks(W).map(|c| c.iter().collect()).collect()
+    chars
+        .chunks(CODE_COLS)
+        .map(|c| c.iter().collect())
+        .collect()
 }
 
 // ── grid + pill primitives ───────────────────────────────────────────────
@@ -754,14 +1041,14 @@ fn observations_section(atoms: &[&crate::analysis::Atom]) -> String {
         let cell = section_cell(i, "observed", PILL_SLATE);
         out.push_str(&grid_line(
             &cell,
-            &dots(Severity::None),
+            &format!("{}{}", sign(None), dots(Severity::None)),
             &crate::printable(label).truecolor(150, 160, 168).to_string(),
         ));
     }
     if extra > 0 {
         out.push_str(&grid_line(
             &blank_cell(),
-            &dots(Severity::None),
+            &format!("{}{}", sign(None), dots(Severity::None)),
             &format!("+{extra} more")
                 .truecolor(102, 117, 127)
                 .to_string(),
@@ -790,9 +1077,18 @@ fn dependencies_section(deps: &[crate::deps::DepProfile]) -> String {
         };
         out.push_str(&grid_line(
             &cell,
-            &dots(d.severity),
+            &format!("{}{}", sign(None), dots(d.severity)),
             &format!("{name} {tail}"),
         ));
+        let _ = writeln!(
+            out,
+            "{indent}{} (new: {})",
+            d.comparison,
+            d.new_severity.as_str()
+        );
+        if let Some(baseline) = &d.baseline {
+            let _ = writeln!(out, "{indent}baseline: {}", crate::printable(baseline));
+        }
         for h in &d.highlights {
             let _ = writeln!(out, "{indent}{}", paint(d.severity, h));
         }
@@ -800,12 +1096,29 @@ fn dependencies_section(deps: &[crate::deps::DepProfile]) -> String {
     out
 }
 
-/// One grid row: ` {label}{marker}{body}`. `marker` is a 3-wide severity glyph
-/// (`●  `) or a tree/change sign for the rows that carry one, and empty for the
-/// plain label rows — so a marker, when present, lands in the content column and
-/// its body sits just past it.
+/// One grid row: ` {label}{marker}{body}`. `marker` is the change sign
+/// ([`sign`]) followed by a 4-wide severity glyph (`●●● `) for the rows that
+/// carry them, and empty for the plain label rows — so a marker, when present,
+/// lands in the content column and its body sits just past it.
 fn grid_line(cell: &str, marker: &str, body: &str) -> String {
     format!(" {cell}{marker}{body}\n")
+}
+
+/// The 2-wide change-sign cell that opens a finding row, so what *happened*
+/// reads before how bad it is: green `+` for something newly present, `−` for
+/// something gone (green: it is remediation), grey `~` for existing structure
+/// altered in place, amber `↑` for something that was there and grew. `None`
+/// keeps the column for rows that carry no change.
+fn sign(s: Option<char>) -> String {
+    match s {
+        Some('+') | Some('−') => format!(
+            "{} ",
+            s.unwrap_or_default().to_string().truecolor(95, 175, 95)
+        ),
+        Some('↑') => format!("{} ", "↑".truecolor(255, 176, 46)),
+        Some(c) => format!("{} ", c.to_string().truecolor(120, 134, 144)),
+        None => "  ".to_string(),
+    }
 }
 
 /// A section label: colored text, left-aligned in the label column — no
@@ -905,7 +1218,7 @@ fn stats_rows(diff: &DiffReportV1) -> Vec<String> {
         .max()
         .unwrap_or(1);
     raw.into_iter()
-        .map(|(o, n, label, note)| {
+        .flat_map(|(o, n, label, note)| {
             let d = n - o;
             let delta = if d > 0 {
                 format!("(+{d})").truecolor(95, 175, 95).to_string()
@@ -919,10 +1232,21 @@ fn stats_rows(diff: &DiffReportV1) -> Vec<String> {
                 format!("{n:>w$}").truecolor(140, 150, 158),
                 format!("{label:<8}").truecolor(150, 160, 168),
             );
-            if !note.is_empty() {
+            // The gained names ride the row when short; a long list, wrapped,
+            // sits beneath it so the count column stays aligned.
+            let counted = 2 * w + 20 + 2 + note.chars().count();
+            if !note.is_empty() && counted <= PROSE_W {
                 let _ = write!(body, "  {}", note.truecolor(120, 134, 144));
+                vec![body]
+            } else {
+                std::iter::once(body)
+                    .chain(
+                        wrap_words(&note, PROSE_W)
+                            .into_iter()
+                            .map(|line| format!("   {}", line.truecolor(120, 134, 144))),
+                    )
+                    .collect()
             }
-            body
         })
         .collect()
 }
@@ -947,10 +1271,10 @@ fn names_note(names: &[String]) -> String {
 }
 
 /// The scalar metric deltas for one changed file — sizes, entropy, ratios,
-/// per-file counts — as `label old→new (Δ%)`, joined with ` · `. These are the
-/// metrics that don't aggregate across files, so they ride the file's own
+/// per-file counts — as `label old→new (Δ%)` items, strongest first. These are
+/// the metrics that don't aggregate across files, so they ride the file's own
 /// evidence header. `None` when the file has no scalar movers.
-pub(crate) fn file_metrics_summary(diff: &DiffReportV1, member: &str) -> Option<String> {
+pub(crate) fn file_metrics_summary(diff: &DiffReportV1, member: &str) -> Option<Vec<String>> {
     const CAP: usize = 6;
     // `member` arrives from a hunk, whose name was neutralized for display, so
     // the diff's raw path has to be neutralized the same way before comparing —
@@ -975,73 +1299,48 @@ pub(crate) fn file_metrics_summary(diff: &DiffReportV1, member: &str) -> Option<
             changed.next().is_none().then_some(only)
         })?;
     let m = entry.scopes.metrics.as_ref()?;
-    let mut movers: Vec<(f64, String, String)> = Vec::new();
-    for c in &m.changed {
-        let p = c.new.path.as_str();
-        // `size_bytes` restates other movers; the rest are archive noise or are
-        // named in the structure section.
-        if p.contains("mtime")
-            || p.contains("timing")
-            || p.contains("dependencies")
-            || p.contains("has_direct_loader_dep")
-            || p.contains("load_segment")
-            || p.ends_with("size_bytes")
-        {
-            continue;
-        }
-        let (Some(o), Some(n)) = (c.old.value.as_f64(), c.new.value.as_f64()) else {
-            continue;
-        };
-        if o == n {
-            continue;
-        }
-        // Name the metric by its leaf, with the few cryptic ones spelled out.
-        let label = match p.rsplit(['.', '/']).next().unwrap_or(p) {
-            "code_size" => "code",
-            "size" | "size_bytes" => "size",
-            "init_array_count" => "init_array",
-            "dynrela_count" | "relacount" => "relocs",
-            other => other,
-        };
-        let importance = crate::analysis::metric_change_importance(o, n);
-        let delta = if o != 0.0 {
-            format!("{:+.0}%", (n - o) / o * 100.0)
-        } else {
-            "new".to_string()
-        };
-        movers.push((
-            importance,
-            label.to_string(),
-            format!(
-                "{}→{} ({delta})",
-                crate::analysis::compact_metric_number(o),
-                crate::analysis::compact_metric_number(n)
-            ),
-        ));
-    }
+    let mut movers: Vec<crate::analysis::MetricMove> = m
+        .changed
+        .iter()
+        .filter_map(|c| {
+            // Name the metric by its leaf, with the few cryptic ones spelled out.
+            let p = c.new.path.as_str();
+            let label = match p.rsplit(['.', '/']).next().unwrap_or(p) {
+                "code_size" => "code",
+                "size" | "size_bytes" => "size",
+                "init_array_count" => "init_array",
+                "dynrela_count" | "relacount" => "relocs",
+                other => other,
+            };
+            crate::analysis::metric_move(c, None, label.to_string())
+        })
+        .collect();
     // `total_cmp`, not `partial_cmp(…).unwrap_or(Equal)`: the latter is not a
     // total order when a metric ratio is NaN, and `sort_by` is permitted to
     // panic on an inconsistent comparator.
-    movers.sort_by(|a, b| b.0.total_cmp(&a.0));
+    movers.sort_by(|a, b| b.importance.total_cmp(&a.importance));
     // One row per label — `relacount` and `dynrela_count` both read `relocs`,
     // so keep the larger mover, not both.
     let mut seen = std::collections::HashSet::new();
-    movers.retain(|(_, label, _)| seen.insert(label.clone()));
+    movers.retain(|m| seen.insert(m.label.clone()));
     movers.truncate(CAP);
     (!movers.is_empty()).then(|| {
         movers
-            .into_iter()
-            .map(|(_, label, v)| format!("{label} {v}"))
-            .collect::<Vec<_>>()
-            .join(" · ")
+            .iter()
+            .map(crate::analysis::MetricMove::describe)
+            .collect()
     })
 }
 
-const PILL_PLUM: (u8, u8, u8) = (60, 30, 75);
-const PILL_HOT: (u8, u8, u8) = (127, 43, 43);
-const PILL_TEAL: (u8, u8, u8) = (0, 60, 55);
-const PILL_OCEAN: (u8, u8, u8) = (12, 58, 75);
-const PILL_SLATE: (u8, u8, u8) = (55, 55, 58);
+// Section-label accents. These are drawn as *text*, so they must read on a
+// black terminal as well as a white one: mid-brightness tints, each distinct
+// from the severity palette (coral, gold, azure, green) so a label never
+// reads as a verdict.
+const PILL_PLUM: (u8, u8, u8) = (177, 137, 224);
+const PILL_HOT: (u8, u8, u8) = (224, 108, 117);
+const PILL_TEAL: (u8, u8, u8) = (78, 201, 176);
+const PILL_OCEAN: (u8, u8, u8) = (86, 182, 194);
+const PILL_SLATE: (u8, u8, u8) = (160, 170, 180);
 
 /// The verdict word for a severity: HOSTILE / SUSPICIOUS / NOTABLE / CLEAN.
 /// Shared with every other renderer, so one vocabulary describes a verdict
@@ -1070,10 +1369,10 @@ fn badge(sev: Severity) -> String {
 
 fn dots(sev: Severity) -> String {
     let d = match sev {
-        Severity::Critical => "●●●",
-        Severity::High => "●● ",
-        Severity::Medium | Severity::Low => "●  ",
-        Severity::None => "·  ",
+        Severity::Critical => "●●● ",
+        Severity::High => "●●  ",
+        Severity::Medium | Severity::Low => "●   ",
+        Severity::None => "·   ",
     };
     paint(sev, d)
 }
@@ -1093,6 +1392,23 @@ mod tests {
     use cleave::types::{
         Changed, DiffReportV1, FileDiffEntry, FileStatus, MetricChange, ScopeDiff, ScopeDiffs,
     };
+
+    #[test]
+    fn risk_row_uses_calibrated_classification_not_probability_label() {
+        for classification in [
+            scan::Classification::Benign,
+            scan::Classification::Suspicious,
+            scan::Classification::Hostile,
+        ] {
+            let row = super::risk_row(crate::risk::Risk {
+                old: 0.8005945,
+                new: 0.90685314,
+                new_classification: classification,
+            });
+            assert!(row.contains(&classification.to_string()));
+            assert!(!row.contains("malware"));
+        }
+    }
 
     #[test]
     fn metric_summary_keeps_the_six_largest_relative_moves() {
@@ -1138,10 +1454,10 @@ mod tests {
         };
 
         let summary = file_metrics_summary(&diff, "sample").unwrap();
-        assert!(summary.starts_with("largest "));
-        assert!(summary.contains("sixth "));
-        assert!(!summary.contains("seventh "));
-        assert!(!summary.contains("smallest "));
-        assert_eq!(summary.matches(" · ").count(), 5);
+        assert_eq!(summary.len(), 6);
+        assert!(summary[0].starts_with("largest "));
+        assert!(summary[5].starts_with("sixth "));
+        assert!(!summary.iter().any(|s| s.starts_with("seventh ")));
+        assert!(!summary.iter().any(|s| s.starts_with("smallest ")));
     }
 }
