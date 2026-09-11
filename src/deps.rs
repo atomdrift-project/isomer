@@ -279,8 +279,9 @@ fn exact_version(spec: &str) -> Option<String> {
 }
 
 /// The runtime dependencies a diff added, read from every changed manifest's kv
-/// scope. Only `dependencies.<name>` direct children — a deeper path is a
-/// sub-field of the version spec, and dev/build trees don't ship to end users.
+/// scope. Uses the same runtime dependency roots as the risk rubric:
+/// `dependencies`, `optionalDependencies`, and `peerDependencies`. Deeper paths
+/// are sub-fields of a version spec; dev/build trees do not ship to end users.
 fn changes(diff: &DiffReportV1) -> Vec<(Option<Added>, Added)> {
     let mut out = Vec::new();
     for file in &diff.files {
@@ -348,6 +349,9 @@ fn ecosystem(path: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::Severity;
+    use cleave::types::{
+        DiffReportV1, DiffSummary, FileDiffEntry, FileStatus, KvChange, ScopeDiff, ScopeDiffs,
+    };
 
     fn risk(severity: Severity, categories: &[(&str, Severity)]) -> RiskProfile {
         RiskProfile {
@@ -467,6 +471,53 @@ mod tests {
         for range in ["^0.1.0", "~1.2.3", ">=1.2.3 <2", "1.x", "*", "latest"] {
             assert_eq!(exact_version(range), None, "{range} is not an exact pin");
         }
+    }
+
+    #[test]
+    fn dependency_profiles_include_every_runtime_platform_tree() {
+        let changes = [
+            ("dependencies.core", "1.0.0"),
+            ("optionalDependencies.tool-linux-x64", "1.0.0"),
+            ("optionalDependencies.tool-darwin-arm64", "1.0.0"),
+            ("peerDependencies.adapter", "^2.0.0"),
+            ("devDependencies.test-only", "1.0.0"),
+            ("dependencies.core.version", "1.0.0"),
+        ]
+        .into_iter()
+        .map(|(path, version)| KvChange {
+            path: path.to_string(),
+            namespace: path.split('.').next().unwrap_or_default().to_string(),
+            value: serde_json::Value::String(version.to_string()),
+        })
+        .collect();
+        let diff = DiffReportV1 {
+            old_root: "old".to_string(),
+            new_root: "new".to_string(),
+            summary: DiffSummary::default(),
+            scopes: ScopeDiffs::default(),
+            files: vec![FileDiffEntry {
+                path: "package.json".to_string(),
+                file_type: Some("package.json".to_string()),
+                status: FileStatus::Changed,
+                identity: None,
+                scopes: ScopeDiffs {
+                    kv: Some(ScopeDiff {
+                        added: changes,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                old_formula: None,
+                new_formula: None,
+            }],
+        };
+
+        let dependencies = added(&diff);
+        let names: Vec<&str> = dependencies.iter().map(|dep| dep.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["core", "tool-linux-x64", "tool-darwin-arm64", "adapter"]
+        );
     }
 
     #[test]

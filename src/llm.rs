@@ -105,15 +105,31 @@ pub(crate) fn config(cli: &Cli) -> Option<InterpretConfig> {
         .clone()
         .or_else(|| std::env::var("ISOMER_LLM_KEY").ok())
         .filter(|k| !k.is_empty());
-    let model = cli
+    let pinned = cli
         .llm_model
         .clone()
-        .or_else(|| std::env::var("ISOMER_LLM_MODEL").ok())
-        .or_else(|| scan::interpret::discover_model(&base_url, api_key.as_deref()).ok())
+        .or_else(|| std::env::var("ISOMER_LLM_MODEL").ok());
+    let model = match pinned {
+        Some(model) => model,
         // scan deliberately has no guessed model name: an explicit value or
         // the endpoint's advertised model is reliable, while a made-up
         // fallback only converts discovery failure into a server-side 404.
-        .unwrap_or_default();
+        // Discovery's error says which of its several failure modes this was
+        // (unreachable host, a base URL missing its /v1, a rejected key, an
+        // empty model list), and they need different fixes, so report it and
+        // skip interpretation — the LLM read is a best-effort signal, and a
+        // failed chat is already treated the same way.
+        None => match scan::interpret::discover_model(&base_url, api_key.as_deref()) {
+            Ok(model) => model,
+            Err(e) => {
+                eprintln!(
+                    "isomer: no LLM model available from {base_url}: {e:#}. Fix the endpoint, \
+                     or name a model with --llm-model (env: ISOMER_LLM_MODEL)"
+                );
+                return None;
+            }
+        },
+    };
     let timeout = Duration::from_secs(
         cli.llm_timeout
             .unwrap_or(scan::interpret::DEFAULT_TIMEOUT_SECS),

@@ -291,10 +291,10 @@ pub(crate) fn additions_at<'a>(hunks: &[&'a Hunk], start: usize) -> Additions<'a
 
 /// The distilled hunks as plain text for the LLM payload — strongest rule
 /// first, one per rule, each a small diff excerpt (`+` new, `>` matched, ` `
-/// context). This replaces the dump-every-match [`render`] on the LLM path:
-/// there, one broad trait matching dozens of benign files (unrealircd's
-/// `substr: SYSTEM`) produced dozens of windows and buried the real change,
-/// which then read to the model as a false positive.
+/// context). This replaces the old dump-every-match window `render` on the
+/// LLM path: there, one broad trait matching dozens of benign files
+/// (unrealircd's `substr: SYSTEM`) produced dozens of windows and buried the
+/// real change, which then read to the model as a false positive.
 pub(crate) fn render_hunks(hunks: &[&Hunk]) -> String {
     let mut s = String::new();
     let mut i = 0;
@@ -542,7 +542,7 @@ fn addition_hunks(
 }
 
 /// One contiguous added-line run (`[start, end)`, 0-based) as a hunk. Capped at
-/// [`MAX_RUN_LINES`] with a `+N more added` tail so a large legitimate edit
+/// `MAX_RUN_LINES` with a `+N more added` tail so a large legitimate edit
 /// cannot flood the evidence.
 fn addition_run(
     new_lines: &[&str],
