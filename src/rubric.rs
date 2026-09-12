@@ -795,6 +795,7 @@ fn meaningful_identity_changes(
         crate::printable(
             &i.unique_ids
                 .iter()
+                .filter(|(key, _)| !content_derived_id(key))
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect::<Vec<_>>()
                 .join(", "),
@@ -905,6 +906,24 @@ fn meaningful_identity_changes(
     push("publisher id", ids(o), ids(n));
     push("package name", claim(&o.name), claim(&n.name));
     out
+}
+
+/// Whether a unique id is a hash of the artifact's own bytes rather than a
+/// claim about who published it.
+///
+/// A Mach-O `cdhash` is the code directory's digest and an OCI digest is the
+/// image's: both change with every recompile or rebuild. Comparing them reports
+/// "these are different bytes" — which is the one thing a differential already
+/// knows — as a publisher takeover, at High, on every legitimate rebuild. The
+/// party-bearing ids beside them (a signing certificate's thumbprint, an
+/// extension id, a developer public key, the build user) are exactly what this
+/// axis is for, so the test names the two content digests and compares
+/// everything else, including ids filefacts has not grown yet.
+///
+/// Nothing is lost on the detection side: a binary re-signed by a different
+/// party also moves `signer` and `team id`, which are compared directly.
+fn content_derived_id(key: &str) -> bool {
+    matches!(key, "cdhash" | "oci_digest")
 }
 
 /// Whether filefacts found no identity beyond an unverified basename (and an

@@ -25,10 +25,24 @@ from other trait namespaces. It records old/new weight and directional gains
 and losses, weighted by criticality × confidence, taking the maximum per ID
 to avoid counting inherited or repeated matches twice. Unchanged traits remain
 in the denominator. This measures capability presence, not where it executes
-or relationships between capabilities; it is diagnostic-only, not a new gate.
+or relationships between capabilities.
 `population` describes the analyzed pairs (whole archives, but only touched
 files for directory comparisons); `complete: false` indicates an analysis
 failure. Neither field guarantees coverage beyond the scanner's output.
+
+The same profile also drives one gate, reported as `verdict.behavior_mass`:
+the *quantity* of behavior a release introduced, judged with no reference to
+which behavior it was. The behavioral axis grades the worst capability a
+change gained, so it stays silent when an implant arrives as a pile of
+individually-ordinary ones. Two readings of the profile can raise the gate —
+the criticality-weighted mass, and the same thing with every trait ID worth
+exactly one (`ids_gained`, `id_share`), which is the reading that still works
+when no rule grades the payload. All of it is bounded: the gained mass must
+dominate what was lost (an injection, not an exchange or a remediation), the
+change must be concentrated (the same compact-change bound the other shape
+rules use), and the floors scale with what the version bump promised — a patch
+release earns the least room, a major release the most. `behavior_mass` is
+emitted on every run, including passing ones, so the headroom is visible.
 
 The sample audit retains this profile, the archive-normalized `judged_summary`,
 raw aggregate scope totals, and topology, without retaining bulky per-file
@@ -192,6 +206,14 @@ Run `make validate-samples` for the slower end-to-end audit against the supply-c
 attack corpus's artifact tree, `~/data/supplychain-attack-data` by default. Simulations
 check decision logic; the corpus audit also checks extraction, trait matching, and model
 integration.
+
+Seven comparisons in the corpus do not go green, and none of them is a scorer
+defect. Five are attacks whose shipped bytes do not carry the distinction the
+corpus asks for — a pair whose two sides are the same file, a capture taken
+either side of the change, a release whose payload lived in a dependency. Two are
+accurate findings against a label that did not expect one.
+`docs/CORPUS_ADJUDICATIONS.md` records each with the evidence, so they are not
+re-derived every run and not "fixed" by loosening a gate.
 
 The comparisons come from the corpus. Each record in the tree ships a `pairs.yaml`
 naming every comparison it supports and what a detector should conclude from each, so the

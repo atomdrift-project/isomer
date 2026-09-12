@@ -512,8 +512,12 @@ mod tests {
             }],
         };
 
-        let dependencies = added(&diff);
-        let names: Vec<&str> = dependencies.iter().map(|dep| dep.name.as_str()).collect();
+        let dependencies = super::changes(&diff);
+        assert!(dependencies.iter().all(|(old, _)| old.is_none()));
+        let names: Vec<&str> = dependencies
+            .iter()
+            .map(|(_, dep)| dep.name.as_str())
+            .collect();
         assert_eq!(
             names,
             ["core", "tool-linux-x64", "tool-darwin-arm64", "adapter"]

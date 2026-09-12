@@ -112,6 +112,37 @@ dodges every trait still fires:
    match — this is the signature-independent detector. The trait path is the
    bonus for known shapes.
 
+## Measuring signature independence (rule ablation)
+
+The corpus cannot, on its own, show whether a detection would survive a *novel*
+attack: every attack in it is old enough that traits-dev already names it. What
+it can show is what happens when those rules are taken away. Judge each attack
+comparison again with progressively more of the rule set ablated from the
+traits it gained:
+
+| level | what is removed | detected |
+|---|---|---|
+| L0 | nothing | 934 / 941 |
+| L1 | known-bad signatures (`third_party/*`, `well-known/malware/*`) | 934 / 941 |
+| L2 | L1 + hostile `objectives/*` composites — the campaign-shaped rules | 930 / 941 |
+| L3 | L2 + every `objectives/*` trait | 916 / 941 |
+| L4 | L3 + suspicious `micro-behaviors/*`: only ordinary capability left | 860 / 941 |
+
+(941 attack transitions measured 2026-09-12; "detected" means at least one of
+the behavioral, structure, identity, model, or behavior-quantity axes still
+reaches the gate. L4's survivors are almost entirely the model's, and the model
+would itself degrade if the rules it was trained on vanished, so read L4 as an
+upper bound.)
+
+The reading that matters: **losing every rule that names an attack costs 2% of
+detection** (L0 -> L3). What carries it is the capability taxonomy itself plus
+the structure and quantity axes — not the campaign rules.
+
+L2 and below cannot be evaluated for the behavior-*quantity* axis from retained
+diagnostics, because ablating a trait also shrinks the denominator it is
+measured against; that is exactly the regime the axis's counted branch
+(`ids_gained` / `id_share`, criticality-blind) exists for.
+
 ## The floor: source-vs-artifact
 
 Binary forensics raises the bar and catches lazy copycats (most of them). A

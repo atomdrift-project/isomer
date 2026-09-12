@@ -307,10 +307,25 @@ pub(crate) struct Verdict<'a> {
     pub signature: Signature<'a>,
     pub identity: Identity<'a>,
     pub structure: Structure,
+    /// How much of the artifact's behavioral fingerprint this release
+    /// introduced, and whether that quantity alone raised the gate.
+    pub behavior_mass: BehaviorMass,
     /// MITRE ATT&CK and MBC ids the change moved. Ids only — isomer ships no
     /// catalog mapping them to prose, and a consumer that has one can join on
     /// these.
     pub frameworks: Frameworks<'a>,
+}
+
+/// The behavior-quantity axis: weighed mass and blind id counts, each with
+/// the share of the artifact they represent, plus the severity they earned.
+/// Reported always, so a passing run shows the headroom it had.
+#[derive(Serialize)]
+pub(crate) struct BehaviorMass {
+    pub severity: &'static str,
+    pub mass: f32,
+    pub share: f32,
+    pub ids_gained: u32,
+    pub id_share: f32,
 }
 
 #[derive(Serialize)]
@@ -514,6 +529,13 @@ mod tests {
                 structure: Structure {
                     severity: "high",
                     facts: Vec::new(),
+                },
+                behavior_mass: BehaviorMass {
+                    severity: "none",
+                    mass: 0.8,
+                    share: 0.47,
+                    ids_gained: 1,
+                    id_share: 0.5,
                 },
             },
             features: FeatureSet {

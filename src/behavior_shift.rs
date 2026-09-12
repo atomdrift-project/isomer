@@ -28,7 +28,7 @@ pub(crate) struct Profiles {
     pub incomplete: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct Shift {
     pub population: &'static str,
     pub complete: bool,
@@ -36,7 +36,52 @@ pub(crate) struct Shift {
     pub other_traits: Weights,
 }
 
-#[derive(Debug, Default, Serialize)]
+impl Shift {
+    /// Share of the artifact's behavioral mass that this change introduced.
+    ///
+    /// The denominator is the larger of the two sides, so a release that keeps
+    /// everything it had and adds as much again reads as `0.5`, and one whose
+    /// behavior is wholly new reads as `1.0`. Removal does not enter: a
+    /// remediation that strips a backdoor moves [`Weights::lost`], not this.
+    pub(crate) fn injected_share(&self) -> f32 {
+        let denominator = self.behavior.old.max(self.behavior.new);
+        if denominator > 0.0 {
+            (self.behavior.gained / denominator).min(1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Criticality-weighted mass of behavior the new side gained.
+    pub(crate) fn injected_mass(&self) -> f32 {
+        self.behavior.gained
+    }
+
+    /// Share of the artifact's *distinct behaviors* that are new, counting
+    /// each trait id once and grading none of them.
+    ///
+    /// This is the criticality-blind twin of [`Self::injected_share`], and the
+    /// one that still reads true when the payload matches no rule worth a
+    /// severity: a library that could do 40 things and now does 100 has been
+    /// rebuilt around something, whatever any rule thinks of the parts.
+    pub(crate) fn injected_id_share(&self) -> f32 {
+        let denominator = self.behavior.ids_old.max(self.behavior.ids_new);
+        if denominator > 0 {
+            // Both counts are small enough that f32 represents them exactly;
+            // the ratio is a display/threshold value, not an accumulator.
+            self.behavior.ids_gained as f32 / denominator as f32
+        } else {
+            0.0
+        }
+    }
+
+    /// Count of distinct behaviors the new side gained.
+    pub(crate) fn injected_ids(&self) -> u32 {
+        self.behavior.ids_gained
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct Weights {
     pub old: f32,
     pub new: f32,
@@ -44,6 +89,13 @@ pub(crate) struct Weights {
     pub lost: f32,
     /// Weighted symmetric change / larger fingerprint, capped like Cleave ROC.
     pub roc: f32,
+    /// The same three quantities counted in *distinct trait ids*, with no
+    /// criticality weighting at all. Weight answers "how bad is the worst
+    /// thing that arrived"; these answer "how much of what this artifact does
+    /// is new" — the reading that survives when no rule grades the payload.
+    pub ids_old: u32,
+    pub ids_new: u32,
+    pub ids_gained: u32,
 }
 
 fn behavioral(id: &str) -> bool {
@@ -75,6 +127,9 @@ impl Profiles {
             weights.new += new;
             weights.gained += (new - old).max(0.0);
             weights.lost += (old - new).max(0.0);
+            weights.ids_old += u32::from(old > 0.0);
+            weights.ids_new += u32::from(new > 0.0);
+            weights.ids_gained += u32::from(old == 0.0 && new > 0.0);
         }
         for weights in [&mut result.behavior, &mut result.other_traits] {
             let denominator = weights.old.max(weights.new);
@@ -102,6 +157,31 @@ mod tests {
         assert_eq!(shift.behavior.new, 6.0);
         assert_eq!(shift.behavior.roc, 1.0 / 3.0);
         assert_eq!(shift.other_traits.roc, 1.0);
+    }
+
+    /// Counting ids is the criticality-blind reading: one `notable` capability
+    /// and one `hostile` objective each move the count by one, though their
+    /// weights differ by two orders of magnitude. That is the point — it is
+    /// the measure that still works when nothing grades the payload.
+    #[test]
+    fn ids_are_counted_without_regard_to_weight() {
+        let mut profiles = Profiles::default();
+        profiles.old.observe("micro-behaviors/fs/read", 1.0);
+        profiles.new.observe("micro-behaviors/fs/read", 1.0);
+        profiles.new.observe("micro-behaviors/net/connect", 1.0);
+        profiles.new.observe("objectives/exfiltration/send", 120.0);
+        // Not behavioral: neither weight nor count may enter the behavior row.
+        profiles.new.observe("metadata/version", 100.0);
+        let shift = profiles.shift();
+        assert_eq!(shift.behavior.ids_old, 1);
+        assert_eq!(shift.behavior.ids_new, 3);
+        assert_eq!(shift.behavior.ids_gained, 2);
+        assert_eq!(shift.injected_ids(), 2);
+        assert!((shift.injected_id_share() - 2.0 / 3.0).abs() < 1e-6);
+        assert_eq!(shift.other_traits.ids_gained, 1);
+        // The weighed reading of the same change is dominated by the one
+        // hostile id; the counted one is not.
+        assert!(shift.injected_share() > 0.98);
     }
 
     #[test]

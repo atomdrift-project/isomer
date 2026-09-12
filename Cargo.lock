@@ -280,7 +280,7 @@ dependencies = [
 [[package]]
 name = "atomdrift-scan"
 version = "2.11.0"
-source = "git+https://github.com/atomdrift-project/scan.git#f68a7cebc6b0fb160f0f8a36ca0df6e09380cdc2"
+source = "git+https://github.com/atomdrift-project/scan.git#a2930e100d5a14cd1aab228af7e97ccd54f83e52"
 dependencies = [
  "anyhow",
  "axum",
@@ -1967,7 +1967,6 @@ dependencies = [
 [[package]]
 name = "fletch"
 version = "1.2.1"
-source = "git+https://github.com/atomdrift-project/fletch.git#8e3d5631fe55d2c4b76857421428c38f20068518"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1981,6 +1980,7 @@ dependencies = [
  "pep440_rs",
  "reqwest 0.12.28",
  "roxmltree",
+ "semver",
  "serde",
  "serde_json",
  "sha1 0.11.0",
@@ -1991,6 +1991,7 @@ dependencies = [
  "tracing",
  "url",
  "xz2",
+ "zip 2.4.2",
  "zstd",
 ]
 

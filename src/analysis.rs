@@ -219,6 +219,13 @@ pub(crate) struct Analysis<'a> {
     pub naming: Naming,
     pub prop: Proportionality,
     pub risk: Option<crate::risk::Risk>,
+    /// How much of the artifact's behavioral fingerprint this change moved,
+    /// weighed by criticality. Computed once: the gate reads it through
+    /// [`capability_mass_escalation`] and the JSON feature block reports it.
+    pub shift: crate::behavior_shift::Shift,
+    /// What the quantity of introduced behavior earned on its own, before the
+    /// remediation suppression the verdict applies. Reported as-measured.
+    pub behavior_mass: Severity,
     /// A source-archive build macro gained a joined shell-evaluation shape.
     /// Shared by the deterministic gate, terminal view, and LLM context.
     pub source_build_anomaly: bool,
@@ -324,6 +331,7 @@ impl<'a> Analysis<'a> {
         // new class is distinguishable from one that merely gained a trait)
         // and the ATT&CK / MBC annotations each side carries.
         let survey = crate::evidence::survey(&pairs, options);
+        let shift = survey.trait_profiles.shift();
         let mut assessment = crate::rubric::assess(&judged_diff, &survey.base_classes);
         crate::binary::enrich(&pairs, &judged_diff, &mut assessment);
         let naming = Naming::resolve(old, new, cli, &judged_diff);
@@ -380,10 +388,20 @@ impl<'a> Analysis<'a> {
         } else {
             assessment.new_severity()
         };
+        // Quantity of introduced behavior, independent of which behavior it
+        // was. Suppressed under remediation for the same reason as the shape
+        // rules: a release that takes an implant out is judged on what it
+        // removed, and the replacement code it ships is not an injection.
+        let mass_escalation = capability_mass_escalation(
+            &shift,
+            &judged_diff.summary,
+            naming.bump,
+            old.is_file() && new.is_file(),
+        );
         let shape_new = if is_remediation {
             Severity::None
         } else {
-            shape_escalation
+            shape_escalation.max(mass_escalation)
         };
         // The human-facing deterministic verdict must include the same
         // escalation signals as the gate. Otherwise a shape-only attack can
@@ -420,6 +438,8 @@ impl<'a> Analysis<'a> {
             naming,
             prop,
             risk,
+            shift,
+            behavior_mass: mass_escalation,
             source_build_anomaly,
             source_payload_refresh,
             remediation,
@@ -874,6 +894,9 @@ impl<'a> Analysis<'a> {
         if let Some(note) = self.prop.drift.escalation_note() {
             return note.to_string();
         }
+        if let Some(note) = self.mass_note() {
+            return note;
+        }
         if let Some(skew) = &self.prop.skew {
             return skew.clone();
         }
@@ -912,6 +935,24 @@ impl<'a> Analysis<'a> {
             return format!("{}: {}", f.label, f.sentence());
         }
         "no behavioral change".to_string()
+    }
+
+    /// The behavior-quantity read, when it is the reason the gate rose: how
+    /// much of what the artifact can do arrived with this release. Stated as a
+    /// share so the number means the same thing for a one-file library and a
+    /// thousand-member package.
+    pub(crate) fn mass_note(&self) -> Option<String> {
+        if self.remediation.is_some() || self.behavior_mass < Severity::High {
+            return None;
+        }
+        let release = self
+            .naming
+            .bump
+            .map_or_else(|| "this change".to_string(), crate::version::Bump::describe);
+        Some(format!(
+            "{release} introduced {:.0}% of the behavior this artifact now has",
+            self.shift.injected_share() * 100.0,
+        ))
     }
 
     /// The scalar metrics that moved most across the whole change, ranked.
@@ -1626,7 +1667,7 @@ impl<'a> Analysis<'a> {
             .find_map(|f| f.identity.as_ref())
             .map_or((None, None), |idd| (idd.old.as_ref(), idd.new.as_ref()));
         let mut features = feature_set(self.display_diff());
-        features.trait_shift = Some(self.survey.trait_profiles.shift());
+        features.trait_shift = Some(self.shift.clone());
 
         let envelope = j::Envelope {
             v: "2",
@@ -1699,6 +1740,13 @@ impl<'a> Analysis<'a> {
                 structure: j::Structure {
                     severity: a.structure.severity.as_str(),
                     facts,
+                },
+                behavior_mass: j::BehaviorMass {
+                    severity: self.behavior_mass.as_str(),
+                    mass: self.shift.injected_mass(),
+                    share: self.shift.injected_share(),
+                    ids_gained: self.shift.injected_ids(),
+                    id_share: self.shift.injected_id_share(),
                 },
             },
             features,
@@ -3262,6 +3310,89 @@ fn change_shape_escalation(
         || runtime_graft
         || executable_capability_bundle >= Severity::High
     {
+        Severity::High
+    } else {
+        Severity::None
+    }
+}
+
+/// Raise a gate on the *quantity* of behavior a release introduced, with no
+/// reference to which behavior it was.
+///
+/// The behavioral axis grades the worst capability a change gained, so it is
+/// silent when an implant arrives as a pile of individually-ordinary ones — an
+/// HTTP client, a file write, an environment read, a base64 decode — none of
+/// which is suspicious alone. What such a change cannot hide is its effect on
+/// the artifact's behavioral fingerprint: after the release, a large share of
+/// everything the package can do was not there before.
+///
+/// [`crate::behavior_shift`] measures that two ways, and either can raise the
+/// gate:
+///
+/// * **weighed** — cleave's criticality x confidence summed over the trait ids
+///   the new side gained, against the larger side's mass;
+/// * **counted** — the same thing with every trait id worth exactly one,
+///   grading none of them. This is the reading that survives the case this
+///   tool exists for: a payload no rule knows contributes nothing to the
+///   weighed mass but still doubles the number of distinct things the artifact
+///   does.
+///
+/// Three bounds keep it honest:
+///
+/// * **Injection, not exchange.** The gained mass must dominate what was lost.
+///   A remediation or a rewrite swaps one behavior set for another and is
+///   judged on what it removed; an implant adds. (Of 941 attack transitions
+///   measured against the supply-chain corpus, 938 are net-additive by this
+///   test.)
+/// * **Concentration.** Only a compact change qualifies — the same
+///   [`compact_change`] bound the other shape rules use. A thousand-file
+///   framework release moves a large mass legitimately; an implant is a few
+///   files.
+/// * **Release promise.** The bars scale with the version bump, because that
+///   is the claim the publisher made. A patch release promising bug fixes
+///   earns the least room; a major release may arrive with new behavior.
+///
+/// It applies only where both sides were analyzed whole — two files or two
+/// archives. A directory comparison profiles the touched files rather than
+/// the artifact, so its shares would describe the diff, not the release.
+///
+/// The floors sit above every benign transition in the supply-chain corpus,
+/// so this raises a gate only when a release's behavior is substantially
+/// *new*, not merely large.
+fn capability_mass_escalation(
+    shift: &crate::behavior_shift::Shift,
+    summary: &DiffSummary,
+    bump: Option<Bump>,
+    whole_artifact: bool,
+) -> Severity {
+    // The shares below say "of everything this artifact does", which is only
+    // true when both sides were analyzed whole. A directory comparison
+    // profiles the touched files alone, so a new module reads as most of the
+    // fingerprint; that is a statement about the diff, not the artifact.
+    if !whole_artifact {
+        return Severity::None;
+    }
+    // A partial walk cannot establish how much of the fingerprint is new: the
+    // unanalyzed side reads as empty, which inflates every share below.
+    if !shift.complete || !compact_change(summary) {
+        return Severity::None;
+    }
+    // An exchange is not an injection. Judged on mass rather than ids so that
+    // trading a hostile implant for ordinary code still reads as removal.
+    if shift.behavior.lost > shift.behavior.gained * 0.5 {
+        return Severity::None;
+    }
+    let (mass_floor, share_floor, ids_floor, id_share_floor) = match bump.map(|b| b.kind) {
+        // No version to read is the same promise as a patch: nothing here
+        // licenses a new behavioral profile. A downgrade promises less still.
+        Some(BumpKind::Same | BumpKind::Patch | BumpKind::Prerelease | BumpKind::Downgrade)
+        | None => (24.0, 0.40, 24, 0.50),
+        Some(BumpKind::Minor) => (40.0, 0.55, 40, 0.60),
+        Some(BumpKind::Major) => (60.0, 0.70, 60, 0.75),
+    };
+    let weighed = shift.injected_mass() >= mass_floor && shift.injected_share() >= share_floor;
+    let counted = shift.injected_ids() >= ids_floor && shift.injected_id_share() >= id_share_floor;
+    if weighed || counted {
         Severity::High
     } else {
         Severity::None

@@ -11,9 +11,10 @@ use cleave::types::{
 };
 
 use super::{
-    Naming, Proportionality, Remediation, capability_shape, change_shape_escalation,
-    deterministic_verdicts, normalized_archive_diff, remediation_cleanup_context,
-    significant_risk_escalation, source_download_write_execute_anomaly,
+    Naming, Proportionality, Remediation, capability_mass_escalation, capability_shape,
+    change_shape_escalation, deterministic_verdicts, normalized_archive_diff,
+    remediation_cleanup_context, significant_risk_escalation,
+    source_download_write_execute_anomaly,
 };
 use crate::Severity;
 use crate::risk::Risk;
@@ -583,6 +584,55 @@ fn signer_changes_and_author_stripping_still_block() {
         file.identity = Some(identity_change(old, new));
         assert_eq!(
             assess(&report(vec![file]), &HashSet::new()).new_severity(),
+            Severity::High
+        );
+    }
+}
+
+/// A rebuilt binary is not a publisher takeover. `cdhash` and the OCI digest
+/// are hashes of the artifact's own bytes, so they move on every recompile;
+/// only ids that name a party may raise the identity axis.
+#[test]
+fn content_hashes_are_not_publisher_identity() {
+    for (old, new) in [
+        (
+            serde_json::json!({"unique_ids": {"cdhash": "a044378c"}}),
+            serde_json::json!({"unique_ids": {"cdhash": "f51e65bb"}}),
+        ),
+        (
+            serde_json::json!({"unique_ids": {"oci_digest": "sha256:aaa"}}),
+            serde_json::json!({"unique_ids": {"oci_digest": "sha256:bbb"}}),
+        ),
+    ] {
+        let mut file = source("app", &[]);
+        file.status = FileStatus::Changed;
+        file.identity = Some(identity_change(old, new));
+        assert_eq!(
+            assess(&report(vec![file]), &HashSet::new())
+                .identity
+                .severity,
+            Severity::None
+        );
+    }
+    // An id that names a party still gates, including one this build has
+    // never seen: only the two content digests are excluded.
+    for (old, new) in [
+        (
+            serde_json::json!({"unique_ids": {"authenticode_thumbprint_sha256": "aa"}}),
+            serde_json::json!({"unique_ids": {"authenticode_thumbprint_sha256": "bb"}}),
+        ),
+        (
+            serde_json::json!({"unique_ids": {"some_future_publisher_id": "aa"}}),
+            serde_json::json!({"unique_ids": {"some_future_publisher_id": "bb"}}),
+        ),
+    ] {
+        let mut file = source("app", &[]);
+        file.status = FileStatus::Changed;
+        file.identity = Some(identity_change(old, new));
+        assert_eq!(
+            assess(&report(vec![file]), &HashSet::new())
+                .identity
+                .severity,
             Severity::High
         );
     }
@@ -1289,5 +1339,122 @@ fn preexisting_escalated_behavior_is_not_new_release_pressure() {
             false
         ),
         (Severity::High, Severity::None)
+    );
+}
+
+/// Behavior *quantity*, with no reference to which behavior it was: a patch
+/// release in which most of what the package can do is new is an implant
+/// shape, even when every gained trait is merely notable and no rule names
+/// the attack. The bars scale with what the version bump promised.
+#[test]
+fn injected_behavior_mass_is_judged_against_the_release_promise() {
+    use crate::behavior_shift::Profiles;
+
+    // Thirty ordinary capabilities appear beside the eight the library had.
+    // Nothing here is suspicious on its own; the fingerprint is mostly new.
+    let mut profiles = Profiles::default();
+    for i in 0..8 {
+        let id = format!("micro-behaviors/fs/file/read::read-{i}");
+        profiles.old.observe(&id, 1.0);
+        profiles.new.observe(&id, 1.0);
+    }
+    for i in 0..30 {
+        profiles.new.observe(
+            &format!("micro-behaviors/communications/http::req-{i}"),
+            1.0,
+        );
+    }
+    let shift = profiles.shift();
+    let mut diff = report(vec![]);
+    diff.summary.files_changed = 2;
+    diff.summary.files_added = 1;
+    diff.summary.files_removed = 0;
+
+    let patch = Some(Bump {
+        kind: BumpKind::Patch,
+        steps: 1,
+    });
+    assert_eq!(
+        capability_mass_escalation(&shift, &diff.summary, patch, true),
+        Severity::High
+    );
+    // A major release is allowed to arrive with new behavior: same mass, no
+    // escalation. Proportionality, not the quantity alone, is the signal.
+    assert_eq!(
+        capability_mass_escalation(
+            &shift,
+            &diff.summary,
+            Some(Bump {
+                kind: BumpKind::Major,
+                steps: 1
+            }),
+            true
+        ),
+        Severity::None
+    );
+    // A release that touches the whole tree moves a large mass legitimately;
+    // the rule is about a concentrated change.
+    let mut broad = diff.summary.clone();
+    broad.files_changed = 400;
+    assert_eq!(
+        capability_mass_escalation(&shift, &broad, patch, true),
+        Severity::None
+    );
+    // Removal is a remediation's signature, not an injection: the same
+    // fingerprint movement in the other direction does not escalate.
+    let mut removal = Profiles::default();
+    for i in 0..30 {
+        removal.old.observe(
+            &format!("micro-behaviors/communications/http::req-{i}"),
+            1.0,
+        );
+    }
+    for i in 0..8 {
+        let id = format!("micro-behaviors/fs/file/read::read-{i}");
+        removal.old.observe(&id, 1.0);
+        removal.new.observe(&id, 1.0);
+    }
+    assert_eq!(
+        capability_mass_escalation(&removal.shift(), &diff.summary, patch, true),
+        Severity::None
+    );
+    // An exchange is not an injection either: a release that trades one set of
+    // behaviors for an equally large new set is a rewrite, and the quantity
+    // rule leaves it to the axes that judge *what* arrived.
+    let mut exchange = Profiles::default();
+    for i in 0..30 {
+        exchange
+            .old
+            .observe(&format!("micro-behaviors/fs/file/read::read-{i}"), 1.0);
+        exchange.new.observe(
+            &format!("micro-behaviors/communications/http::req-{i}"),
+            1.0,
+        );
+    }
+    assert_eq!(
+        capability_mass_escalation(&exchange.shift(), &diff.summary, patch, true),
+        Severity::None
+    );
+    // The counted branch is the one that survives an unrecognized payload:
+    // every gained id graded `notable` contributes 1.0 of mass, so a patch
+    // that doubles the number of distinct things a package does escalates
+    // even though nothing in it is suspicious on its own.
+    assert!(shift.injected_ids() >= 24);
+    assert!(shift.injected_id_share() >= 0.50);
+    // An incomplete walk cannot establish the share: the unanalyzed side
+    // reads as empty, which would make every comparison look wholly new.
+    let mut partial = Profiles {
+        incomplete: true,
+        ..Profiles::default()
+    };
+    for i in 0..30 {
+        partial.new.observe(
+            &format!("micro-behaviors/communications/http::req-{i}"),
+            1.0,
+        );
+    }
+    assert_eq!(
+        capability_mass_escalation(&partial.shift(), &diff.summary, patch, true),
+        Severity::None
     );
 }
