@@ -157,12 +157,12 @@ incremental = true
 
 [patch.crates-io]
 # Mirrors cleave's patch section — patches only apply at the workspace root,
-# so isomer must carry them itself. tree-sitter 0.27 is unpublished
-# (crates.io tops out at 0.26.x) and cleave requires it; both tree-sitter
+# so isomer must carry them itself. tree-sitter 0.28 is unpublished
+# (crates.io tops out at 0.27.x) and cleave requires it; both tree-sitter
 # crates must come from the same source. Keep the rev in lockstep with
 # cleave/scan; remove when a crates.io release lands.
-tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
-tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
+tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 
 # Temporary development override: exercise the local extraction changes across
 # Isomer, Cleave, and scan. Replace with a published git pin before release.
