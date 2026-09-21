@@ -11,8 +11,9 @@
 
 use std::fmt::Write as _;
 
+use crate::Severity;
 use crate::analysis::Analysis;
-use crate::{Cli, Severity};
+use crate::options::Options;
 
 /// Hidden HTML comment identifying an isomer report, so the posting step can
 /// find the comment it wrote last time. Part of the action's contract — do not
@@ -28,16 +29,16 @@ const MAX_BODY: usize = 60_000;
 const MAX_HUNKS: usize = 6;
 
 /// Render the report body.
-pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
+pub(crate) fn report(a: &Analysis<'_>, opts: &Options) -> String {
     let mut s = String::with_capacity(4096);
     let _ = writeln!(s, "{MARKER}");
     let _ = writeln!(s, "### {}", heading(a));
     let _ = writeln!(s);
 
-    if !a.speaks(cli) {
+    if !a.speaks(opts) {
         // Nothing to say — but the comment may already exist from an earlier,
         // worse push, so it has to say *that* rather than going blank.
-        let _ = writeln!(s, "{}", clean_body(a, cli));
+        let _ = writeln!(s, "{}", clean_body(a, opts));
         return s;
     }
 
@@ -57,7 +58,7 @@ pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
     // it — the differential hunks are the root cause a reviewer acts on.
     stats(&mut s, a);
     evidence(&mut s, a);
-    let _ = write!(s, "\n---\n{}\n", footer(a, cli));
+    let _ = write!(s, "\n---\n{}\n", footer(a, opts));
 
     if s.len() > MAX_BODY {
         // Cut on a line boundary within the char boundary. A mid-line cut can
@@ -114,7 +115,7 @@ pub(crate) fn one_line(a: &Analysis<'_>) -> String {
 
 /// The body for a change isomer has nothing to say about. Kept short and
 /// affirmative: this is the state a reviewer should see most of the time.
-fn clean_body(a: &Analysis<'_>, cli: &Cli) -> String {
+fn clean_body(a: &Analysis<'_>, opts: &Options) -> String {
     let scale = crate::terminal::change_scale(a.display_diff());
     let scope = if scale.is_empty() {
         String::new()
@@ -123,24 +124,24 @@ fn clean_body(a: &Analysis<'_>, cli: &Cli) -> String {
     };
     format!(
         "No newly-introduced capabilities, known-bad signatures, or publisher drift{scope}.\n{}",
-        footer(a, cli)
+        footer(a, opts)
     )
 }
 
-fn footer(a: &Analysis<'_>, cli: &Cli) -> String {
+fn footer(a: &Analysis<'_>, opts: &Options) -> String {
     let gate = if a.clean {
-        format!("passes `--fail-on {}`", cli.fail_on.as_str())
+        format!("passes `--fail-on {}`", opts.fail_on.as_str())
     } else {
         format!(
             "**fails `--fail-on {}`** — gated severity `{}`",
-            cli.fail_on.as_str(),
+            opts.fail_on.as_str(),
             a.gated.as_str()
         )
     };
     format!(
         "<sub>isomer {} · gate `{}` · {gate}</sub>",
         env!("CARGO_PKG_VERSION"),
-        match cli.gate {
+        match opts.gate {
             crate::Gate::New => "new",
             crate::Gate::Any => "any",
         },

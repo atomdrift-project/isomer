@@ -272,14 +272,6 @@ fn malformed_and_unsupported_inputs_are_errors_not_clean() {
 }
 
 #[test]
-fn ordinary_fs_cli_needs_no_structural_switch() {
-    use clap::Parser;
-    let cli = crate::Cli::try_parse_from(["isomer", "fs", "a", "b"]).unwrap();
-    assert!(matches!(cli.command, crate::Command::Fs { .. }));
-    assert!(crate::Cli::try_parse_from(["isomer", "fs", "a", "b", "--structural-only"]).is_err());
-}
-
-#[test]
 fn normal_assessment_keeps_traits_and_adds_structural_evidence() {
     use cleave::types::{DiffReportV1, DiffSummary, FileDiffEntry, FileStatus, ScopeDiffs};
     for (fixture, file_type) in [

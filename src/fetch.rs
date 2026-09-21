@@ -15,28 +15,28 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tempfile::TempDir;
 
-use crate::Cli;
 use crate::analysis::{self, Analysis};
+use crate::options::Options;
 
 /// Fetch two published versions of one artifact and judge the delta between
 /// them, exactly as `fs` judges two local trees. `verb` names the surface
 /// (`purl` / `oci`) in the report.
-pub(crate) fn compare(verb: &'static str, old: &str, new: &str, cli: &Cli) -> Result<bool> {
-    if cli.offline {
+pub fn compare(verb: &'static str, old: &str, new: &str, opts: &Options) -> Result<bool> {
+    if opts.offline {
         anyhow::bail!("`isomer {verb}` fetches from a registry; not available under --offline");
     }
     // One temp dir holds both sides; it is removed when `dir` drops, after the
     // report is rendered.
     let dir = tempfile::tempdir().context("creating scratch dir for fetched artifacts")?;
-    let progress = cli.progress();
+    let progress = opts.progress;
     let old_path = fetch_to(&dir, old, progress).with_context(|| format!("fetching base {old}"))?;
     let new_path = fetch_to(&dir, new, progress).with_context(|| format!("fetching head {new}"))?;
 
     let options = cleave::AnalysisOptions::default();
     let report = analysis::diff(&old_path, &new_path, &options)?;
-    let mut a = Analysis::new(verb, &old_path, &new_path, &options, &report, cli)?;
-    a.finish(cli);
-    crate::write_stdout(&a.render(cli.format, cli)?)?;
+    let mut a = Analysis::new(verb, &old_path, &new_path, &options, &report, opts)?;
+    a.finish(opts);
+    crate::write_stdout(&a.render(opts.format, opts)?)?;
     Ok(a.clean)
 }
 
@@ -72,7 +72,8 @@ pub(crate) fn fetch_bytes(purl: &str, progress: bool) -> Result<(Vec<u8>, String
 /// (`nginx:1.25`, `ghcr.io/owner/img:tag`) becomes `pkg:oci/<image>@<tag>`, the
 /// registry riding along as a `repository_url` qualifier; an argument already
 /// in `pkg:` form is passed through unchanged.
-pub(crate) fn oci_purl(image: &str) -> String {
+#[must_use]
+pub fn oci_purl(image: &str) -> String {
     let image = image.trim();
     if image.starts_with("pkg:") {
         return image.to_string();

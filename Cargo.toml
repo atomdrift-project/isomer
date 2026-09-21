@@ -7,6 +7,18 @@ license = "Apache-2.0"
 description = "Supply-chain attack detection at a molecular level"
 repository = "https://github.com/atomdrift-project/isomer"
 
+# isomer is a library with a thin command line over it: `main.rs` parses the
+# arguments and calls the verbs, everything else lives in the lib so another
+# crate can call it directly. Both targets are spelled out because adding a
+# lib.rs would otherwise leave the bin's path to inference.
+[lib]
+name = "isomer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "isomer"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
@@ -21,7 +33,9 @@ colored = "3.1"
 # so it unifies to one version in the graph.
 filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` lets a judgement carry its JSON envelope pre-serialized, so a
+# caller embedding it in a larger document neither parses nor re-encodes it.
+serde_json = { version = "1", features = ["raw_value"] }
 node-semver = "2.2"
 
 # atomdrift-scan (lib name `scan`) supplies the azoth ML model for risk

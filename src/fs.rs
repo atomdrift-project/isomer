@@ -8,12 +8,12 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::Cli;
 use crate::analysis::{self, Analysis};
+use crate::options::Options;
 
 /// Diff `old` against `new`, emit the report, and return whether the delta is
 /// clean at `--fail-on`.
-pub(crate) fn run(old: &Path, new: &Path, cli: &Cli) -> Result<bool> {
+pub fn run(old: &Path, new: &Path, opts: &Options) -> Result<bool> {
     // Source archives often carry meaningful non-program members: build
     // macros, test fixtures, and opaque payloads. Keep them in the
     // differential so source-only attacks are not reduced to the subset of
@@ -26,8 +26,8 @@ pub(crate) fn run(old: &Path, new: &Path, cli: &Cli) -> Result<bool> {
         ..cleave::AnalysisOptions::default()
     };
     let report = analysis::diff(old, new, &options)?;
-    let mut a = Analysis::new("fs", old, new, &options, &report, cli)?;
-    a.finish(cli);
-    crate::write_stdout(&a.render(cli.format, cli)?)?;
+    let mut a = Analysis::new("fs", old, new, &options, &report, opts)?;
+    a.finish(opts);
+    crate::write_stdout(&a.render(opts.format, opts)?)?;
     Ok(a.clean)
 }

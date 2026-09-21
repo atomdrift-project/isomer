@@ -59,8 +59,12 @@ impl Comparison {
     }
 }
 
-pub(crate) fn enabled(cli: &crate::Cli) -> bool {
-    !cli.offline && !cli.no_follow
+/// Whether current registry metadata is consulted at all. `--offline`
+/// forbids the network outright; `--no-follow` keeps it for the artifact
+/// fetch but skips the metadata checks.
+#[must_use]
+pub fn enabled(opts: &crate::options::Options) -> bool {
+    !opts.offline && !opts.no_follow
 }
 
 fn compare(subject: String, old: Option<Observation>, new: Option<Observation>) -> Comparison {
@@ -522,22 +526,6 @@ mod tests {
                 );
                 assert!(row.severity() >= row.new_severity);
             }
-        }
-    }
-
-    #[test]
-    fn registry_follow_defaults_on_but_offline_and_opt_out_disable_it() {
-        use clap::Parser;
-        for (flags, expected) in [
-            (vec![], true),
-            (vec!["--offline"], false),
-            (vec!["--no-follow"], false),
-        ] {
-            let args = [vec!["isomer"], flags, vec!["fs", "before", "after"]].concat();
-            assert_eq!(
-                enabled(&crate::Cli::try_parse_from(args).unwrap()),
-                expected
-            );
         }
     }
 

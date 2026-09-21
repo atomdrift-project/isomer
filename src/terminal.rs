@@ -18,11 +18,12 @@ use std::fmt::Write as _;
 use cleave::types::DiffReportV1;
 use colored::Colorize;
 
+use crate::Severity;
 use crate::analysis::{Analysis, Naming};
 use crate::evidence::Hunk;
+use crate::options::Options;
 use crate::risk::Risk;
 use crate::rubric::Assessment;
-use crate::{Cli, Severity};
 
 const BAR: usize = 20;
 /// Visible width of the section-pill cell (longest pill + a trailing space).
@@ -44,9 +45,9 @@ const PROSE_W: usize = 74;
 const CODE_COLS: usize = 74;
 
 /// The complete terminal report for one analysis.
-pub(crate) fn report(a: &Analysis<'_>, cli: &Cli) -> String {
+pub(crate) fn report(a: &Analysis<'_>, opts: &Options) -> String {
     let mut out = String::new();
-    if a.speaks(cli) {
+    if a.speaks(opts) {
         render(&mut out, a);
         // The proof: diff-style hunks for the gained traits, each owned by its
         // strongest rule and drawn from the files the diff actually changed.

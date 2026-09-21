@@ -9,7 +9,8 @@ use std::time::Duration;
 use anyhow::Result;
 use scan::interpret::InterpretConfig;
 
-use crate::{Cli, Severity};
+use crate::Severity;
+use crate::options::Options;
 
 /// Short reply; scan's grader uses 64. We want a phrase, not a story.
 const MAX_TOKENS: u32 = 80;
@@ -37,10 +38,14 @@ Reply with ONLY compact JSON, with exactly these keys: {"verdict":"benign|suspic
 
 /// The model's interpretation of a diff. The masthead shows the `nature`
 /// phrase; `verdict` also feeds the severity via [`Interpretation::severity`].
-#[derive(Debug, Clone)]
-pub(crate) struct Interpretation {
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Interpretation {
+    /// The model's call: `benign`, `suspicious` or `malicious`, as it
+    /// answered. Not normalized — an unparsed reply is reported as it came.
     pub verdict: String,
+    /// At most eight words naming what the change does.
     pub nature: String,
+    /// The model that answered.
     pub model: String,
 }
 
@@ -49,7 +54,8 @@ impl Interpretation {
     /// call, `suspicious` a high one, anything else (benign, empty, unparsed)
     /// no signal. Only ever *raises* the hand-coded verdict — see the fold in
     /// [`crate::analysis::Analysis::new`].
-    pub(crate) fn severity(&self) -> Severity {
+    #[must_use]
+    pub fn severity(&self) -> Severity {
         match self.verdict.trim().to_ascii_lowercase().as_str() {
             "malicious" => Severity::Critical,
             "suspicious" => Severity::High,
@@ -77,22 +83,22 @@ impl Interpretation {
 /// changed source file. Splitting it out this way rather than reordering the
 /// checks matters: [`config`] can autodetect the model, which is a round trip,
 /// and a run with nothing to say must not probe the endpoint.
-pub(crate) fn requested(cli: &Cli) -> bool {
-    !cli.offline && (cli.llm.is_some() || std::env::var("ISOMER_LLM").is_ok())
+pub(crate) fn requested(opts: &Options) -> bool {
+    !opts.offline && (opts.llm.is_some() || std::env::var("ISOMER_LLM").is_ok())
 }
 
 /// Build the LLM config from `--llm` (or `ISOMER_LLM`) and the `--llm-*` flags.
 /// `None` when interpretation was not requested. The model is autodetected from
 /// the endpoint when `--llm-model` is not pinned.
-pub(crate) fn config(cli: &Cli) -> Option<InterpretConfig> {
+pub(crate) fn config(opts: &Options) -> Option<InterpretConfig> {
     // `--offline` promises no LLM, and it has to be enforced here rather than at
     // the call site: model autodetection below is itself a network round trip,
     // and `ISOMER_LLM` in the environment would otherwise reach the endpoint
     // with no flag on the command line at all.
-    if cli.offline {
+    if opts.offline {
         return None;
     }
-    let target = cli
+    let target = opts
         .llm
         .clone()
         .or_else(|| std::env::var("ISOMER_LLM").ok())?;
@@ -100,12 +106,12 @@ pub(crate) fn config(cli: &Cli) -> Option<InterpretConfig> {
         "" | "local" => scan::interpret::DEFAULT_BASE_URL.to_string(),
         url => url.to_string(),
     };
-    let api_key = cli
+    let api_key = opts
         .llm_key
         .clone()
         .or_else(|| std::env::var("ISOMER_LLM_KEY").ok())
         .filter(|k| !k.is_empty());
-    let pinned = cli
+    let pinned = opts
         .llm_model
         .clone()
         .or_else(|| std::env::var("ISOMER_LLM_MODEL").ok());
@@ -131,7 +137,7 @@ pub(crate) fn config(cli: &Cli) -> Option<InterpretConfig> {
         },
     };
     let timeout = Duration::from_secs(
-        cli.llm_timeout
+        opts.llm_timeout
             .unwrap_or(scan::interpret::DEFAULT_TIMEOUT_SECS),
     );
     Some(InterpretConfig {

@@ -25,15 +25,25 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
+use crate::Format;
 use crate::analysis::{self, Analysis};
-use crate::{Cli, Format};
+use crate::options::Options;
 
 /// Arguments to the `ci` verb.
-pub(crate) struct Args {
+#[derive(Debug)]
+pub struct Args {
+    /// Base commit. `None` derives it from the CI event, then narrows to the
+    /// merge base with head.
     pub base: Option<String>,
+    /// Head commit. `None` derives it from the CI event, falling back to
+    /// `HEAD` when the event's commit is absent from a shallow checkout.
     pub head: Option<String>,
+    /// Repository to inspect.
     pub repo: PathBuf,
+    /// Also write `report.{json,sarif,md}` to this directory.
     pub out_dir: Option<PathBuf>,
+    /// Refuse to run when the change touches more files than this, rather than
+    /// analyzing a subset and reporting it as the whole.
     pub max_files: usize,
     /// Build outputs of the base commit, laid over the base tree.
     pub base_artifacts: Option<PathBuf>,
@@ -47,7 +57,7 @@ pub(crate) struct Args {
 const MAX_BLOB: u64 = 128 << 20;
 
 /// Analyze the change this CI run is for.
-pub(crate) fn run(cli: &Cli, args: &Args) -> Result<bool> {
+pub fn run(opts: &Options, args: &Args) -> Result<bool> {
     let repo = args.repo.as_path();
     let refs = Refs::resolve(repo, args)?;
     eprintln!(
@@ -93,7 +103,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<bool> {
 
     let options = cleave::AnalysisOptions::default();
     let report = analysis::diff(&old, &new, &options)?;
-    let mut a = Analysis::new("ci", &old, &new, &options, &report, cli)?;
+    let mut a = Analysis::new("ci", &old, &new, &options, &report, opts)?;
     // `fs` names the artifact it compared; `ci` compares two states of a
     // repository, where the scratch dir the files were staged in is no name.
     a.naming.name = subject(repo);
@@ -104,9 +114,9 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> Result<bool> {
     });
     // After the naming and scope above, so the model reads the same case the
     // four sinks below render.
-    a.finish(cli);
+    a.finish(opts);
 
-    emit(&a, cli, args.out_dir.as_deref(), &refs.base)?;
+    emit(&a, opts, args.out_dir.as_deref(), &refs.base)?;
     Ok(a.clean)
 }
 
@@ -616,16 +626,16 @@ fn discard(dest: &Path) -> Result<()> {
 // ── sinks ───────────────────────────────────────────────────────────────────
 
 /// Write the verdict everywhere this environment can show it.
-fn emit(a: &Analysis<'_>, cli: &Cli, out_dir: Option<&Path>, base: &str) -> Result<()> {
+fn emit(a: &Analysis<'_>, opts: &Options, out_dir: Option<&Path>, base: &str) -> Result<()> {
     // stdout keeps whatever the caller asked for, so `isomer ci --format json`
     // still pipes cleanly.
-    crate::write_stdout(&a.render(cli.format, cli)?)?;
+    crate::write_stdout(&a.render(opts.format, opts)?)?;
 
-    let markdown = a.render(Format::Markdown, cli)?;
+    let markdown = a.render(Format::Markdown, opts)?;
     if let Some(dir) = out_dir {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let json = a.render(Format::Json, cli)?;
-        let sarif = a.render(Format::Sarif, cli)?;
+        let json = a.render(Format::Json, opts)?;
+        let sarif = a.render(Format::Sarif, opts)?;
         for (name, body) in [
             ("report.json", &json),
             ("report.sarif", &sarif),

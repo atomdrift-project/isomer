@@ -22,9 +22,10 @@ use cleave::types::{
 };
 
 use crate::evidence::Hunk;
+use crate::options::Options;
 use crate::rubric::{Assessment, in_trait_hierarchy, trait_namespace};
 use crate::version::{Bump, BumpKind, Version};
-use crate::{Cli, Format, Gate, Severity};
+use crate::{Format, Gate, Severity};
 
 /// Run cleave's differential analysis over a pair of paths.
 pub(crate) fn diff(
@@ -312,7 +313,7 @@ impl<'a> Analysis<'a> {
         new: &'a Path,
         options: &'a cleave::AnalysisOptions,
         report: &'a AnalysisReport,
-        cli: &Cli,
+        opts: &Options,
     ) -> Result<Self> {
         let diff = report
             .diff
@@ -334,7 +335,7 @@ impl<'a> Analysis<'a> {
         let shift = survey.trait_profiles.shift();
         let mut assessment = crate::rubric::assess(&judged_diff, &survey.base_classes);
         crate::binary::enrich(&pairs, &judged_diff, &mut assessment);
-        let naming = Naming::resolve(old, new, cli, &judged_diff);
+        let naming = Naming::resolve(old, new, opts, &judged_diff);
         let prop = Proportionality::eval(
             &assessment,
             &naming,
@@ -421,7 +422,7 @@ impl<'a> Analysis<'a> {
             escalation.max(shape_new),
             is_remediation,
         );
-        let gated = match cli.gate {
+        let gated = match opts.gate {
             Gate::New => new_verdict,
             Gate::Any => verdict,
         };
@@ -446,7 +447,7 @@ impl<'a> Analysis<'a> {
             verdict,
             new_verdict,
             gated,
-            clean: !gated.fails(cli.fail_on),
+            clean: !gated.fails(opts.fail_on),
             deterministic_verdict: verdict,
             interp: None,
             risk_llm_raised: false,
@@ -469,8 +470,8 @@ impl<'a> Analysis<'a> {
     /// ordering used to live as an unwritten rule across three call sites:
     /// `ci` never folded the profiles in, so `isomer ci --deps` silently
     /// skipped interpretation altogether.
-    pub(crate) fn finish(&mut self, cli: &Cli) {
-        if crate::registry::enabled(cli) {
+    pub(crate) fn finish(&mut self, opts: &Options) {
+        if crate::registry::enabled(opts) {
             self.registry = crate::registry::audit(&self.pairs, self.diff, self.options);
             for row in &mut self.registry {
                 row.apply_release_policy(self.naming.bump);
@@ -490,41 +491,45 @@ impl<'a> Analysis<'a> {
             self.deterministic_verdict = self.deterministic_verdict.max(any);
             self.verdict = self.verdict.max(any);
             self.new_verdict = self.new_verdict.max(new);
-            self.gated = match cli.gate {
+            self.gated = match opts.gate {
                 Gate::New => self.new_verdict,
                 Gate::Any => self.verdict,
             };
-            self.clean = !self.gated.fails(cli.fail_on);
+            self.clean = !self.gated.fails(opts.fail_on);
         }
-        if cli.deps && !cli.offline {
-            let profiles = crate::deps::profiles(self.diff, self.options, cli.progress());
-            self.apply_dependency_profiles(profiles, cli);
+        if opts.deps && !opts.offline {
+            let profiles = crate::deps::profiles(self.diff, self.options, opts.progress);
+            self.apply_dependency_profiles(profiles, opts);
         }
-        self.interpret(cli);
+        self.interpret(opts);
     }
 
     /// Keep absolute current risk for `any`, but gate `new` on the comparative
     /// dependency profile when a predecessor is known. Independent evidence
     /// is never lowered by an equivalent or reduced dependency profile.
-    fn apply_dependency_profiles(&mut self, profiles: Vec<crate::deps::DepProfile>, cli: &Cli) {
+    fn apply_dependency_profiles(
+        &mut self,
+        profiles: Vec<crate::deps::DepProfile>,
+        opts: &Options,
+    ) {
         let severity = crate::deps::severity(&profiles);
         let new_severity = crate::deps::new_severity(&profiles);
         self.deps = profiles;
         self.deterministic_verdict = self.deterministic_verdict.max(severity);
         self.verdict = self.verdict.max(severity);
         self.new_verdict = self.new_verdict.max(new_severity);
-        self.gated = match cli.gate {
+        self.gated = match opts.gate {
             Gate::New => self.new_verdict,
             Gate::Any => self.verdict,
         };
-        self.clean = !self.gated.fails(cli.fail_on);
+        self.clean = !self.gated.fails(opts.fail_on);
     }
 
-    fn interpret(&mut self, cli: &Cli) {
-        if cli.format != Format::Interpret
-            && crate::llm::requested(cli)
-            && self.speaks(cli)
-            && let Some(cfg) = crate::llm::config(cli)
+    fn interpret(&mut self, opts: &Options) {
+        if opts.format != Format::Interpret
+            && crate::llm::requested(opts)
+            && self.speaks(opts)
+            && let Some(cfg) = crate::llm::config(opts)
         {
             self.interp = match crate::llm::interpret(&cfg, &self.llm_context()) {
                 Ok(i) => Some(i),
@@ -565,11 +570,11 @@ impl<'a> Analysis<'a> {
     }
 
     /// Render one output format.
-    pub(crate) fn render(&self, format: Format, cli: &Cli) -> Result<String> {
+    pub(crate) fn render(&self, format: Format, opts: &Options) -> Result<String> {
         match format {
-            Format::Terminal => Ok(crate::terminal::report(self, cli)),
-            Format::Json => Ok(format!("{}\n", self.json(cli)?)),
-            Format::Markdown => Ok(crate::markdown::report(self, cli)),
+            Format::Terminal => Ok(crate::terminal::report(self, opts)),
+            Format::Json => Ok(format!("{}\n", self.json(opts)?)),
+            Format::Markdown => Ok(crate::markdown::report(self, opts)),
             Format::Sarif => Ok(format!("{}\n", crate::sarif::report(self)?)),
             // Keep this byte-for-byte identical to the user message passed to
             // `llm::interpret`: no system prompt, verdict line, or added
@@ -593,8 +598,8 @@ impl<'a> Analysis<'a> {
     /// hostile or not. Saying so is also how a reviewer knows the scanner is
     /// alive between real incidents. A run with nothing to report still says
     /// nothing at all.
-    pub(crate) fn speaks(&self, cli: &Cli) -> bool {
-        self.gated.fails(cli.fail_on)
+    pub(crate) fn speaks(&self, opts: &Options) -> bool {
+        self.gated.fails(opts.fail_on)
             // Notable+ is the reporting floor; the tiers below it are atoms
             // and unremarkable observations (see `rubric::is_finding`).
             || self.assessment.severity >= Severity::Medium
@@ -1585,7 +1590,7 @@ impl<'a> Analysis<'a> {
     /// Build the `--format json` envelope. Compact and typed, mirroring
     /// `../scan`: a curated `verdict` and its evidence beside the full `raw`
     /// cleave diff. See [`crate::json`].
-    pub(crate) fn json(&self, cli: &Cli) -> Result<String> {
+    pub(crate) fn json(&self, opts: &Options) -> Result<String> {
         use crate::json as j;
         let a = &self.assessment;
         let categories = a
@@ -1687,11 +1692,11 @@ impl<'a> Analysis<'a> {
                 severity: self.verdict.as_str(),
                 new_severity: self.new_verdict.as_str(),
                 gate: j::Gate {
-                    on: match cli.gate {
+                    on: match opts.gate {
                         Gate::New => "new",
                         Gate::Any => "any",
                     },
-                    fail_on: cli.fail_on.as_str(),
+                    fail_on: opts.fail_on.as_str(),
                     severity: self.gated.as_str(),
                     fail: !self.clean,
                 },
@@ -2192,7 +2197,7 @@ pub(crate) struct Naming {
 }
 
 impl Naming {
-    fn resolve(old: &Path, new: &Path, cli: &Cli, diff: &DiffReportV1) -> Self {
+    fn resolve(old: &Path, new: &Path, opts: &Options, diff: &DiffReportV1) -> Self {
         let ob = basename(old);
         let nb = basename(new);
         // The artifact's own claimed version, when the filename carries none.
@@ -2228,13 +2233,13 @@ impl Naming {
         let (old_claim, new_claim) = claims(true)
             .or_else(|| claims(false))
             .unwrap_or((None, None));
-        let ov = cli
+        let ov = opts
             .base_version
             .as_deref()
             .and_then(Version::parse)
             .or_else(|| Version::detect(&ob))
             .or(old_claim);
-        let nv = cli
+        let nv = opts
             .head_version
             .as_deref()
             .and_then(Version::parse)

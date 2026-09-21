@@ -1,8 +1,7 @@
 //! isomer — supply-chain attack detection at a molecular level.
 //!
-//! Detects whether a change is malicious — introduced by a human, an AI, or
-//! the dependency supply chain — by comparing two states of a tree, git ref,
-//! package, or OCI image and judging the delta in context.
+//! The command line over the `isomer` library: parse the arguments, turn them
+//! into an `Options`, run the selected verb, and map its answer onto the exit code.
 //!
 //! Exit code contract (stable; CI gates on these):
 //! - `0` — clean: no findings at or above `--fail-on`
@@ -14,25 +13,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-mod analysis;
-mod behavior_shift;
-mod binary;
-mod ci;
-mod deps;
-mod evidence;
-mod fetch;
-mod frameworks;
-mod fs;
-mod json;
-mod llm;
-mod markdown;
-mod registry;
-mod rename;
-mod risk;
-mod rubric;
-mod sarif;
-mod terminal;
-mod version;
+use isomer::options::Options;
+use isomer::{Format, Gate, Severity, ci, fetch, fs};
 
 const EXIT_FINDINGS: u8 = 1;
 const EXIT_ERROR: u8 = 2;
@@ -107,60 +89,11 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-enum Severity {
-    None,
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-impl Severity {
-    /// Stable wire name for JSON output.
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Critical => "critical",
-        }
-    }
-
-    /// Whether a finding at this severity fails the run. `--fail-on none`
-    /// means report-only: nothing fails.
-    fn fails(self, threshold: Severity) -> bool {
-        threshold != Severity::None && self >= threshold
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum Format {
-    Terminal,
-    Json,
-    Sarif,
-    Markdown,
-    /// The exact user payload isomer would send to the LLM (without the system
-    /// prompt), for inspection/replay. Like scan, this is local-only and does
-    /// not contact the LLM endpoint.
-    Interpret,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Color {
     Auto,
     Always,
     Never,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum Gate {
-    /// Fail only on newly-introduced risk.
-    New,
-    /// Fail on any changed risk, including escalations of existing findings.
-    Any,
 }
 
 impl Cli {
@@ -169,6 +102,28 @@ impl Cli {
     /// quiet so its output is exactly the report.
     fn progress(&self) -> bool {
         self.format == Format::Terminal && std::io::IsTerminal::is_terminal(&std::io::stderr())
+    }
+}
+
+impl From<&Cli> for Options {
+    /// Everything the library needs from the command line, and nothing else.
+    /// The verb and its operands stay behind in [`Command`].
+    fn from(cli: &Cli) -> Self {
+        Self {
+            fail_on: cli.fail_on,
+            gate: cli.gate,
+            format: cli.format,
+            offline: cli.offline,
+            no_follow: cli.no_follow,
+            deps: cli.deps,
+            progress: cli.progress(),
+            llm: cli.llm.clone(),
+            llm_model: cli.llm_model.clone(),
+            llm_key: cli.llm_key.clone(),
+            llm_timeout: cli.llm_timeout,
+            base_version: cli.base_version.clone(),
+            head_version: cli.head_version.clone(),
+        }
     }
 }
 
@@ -283,75 +238,10 @@ fn disable_analysis_cache_if_requested() {
     }
 }
 
-/// Neutralize control characters in untrusted, sample-derived display text — a
-/// matched evidence line, a dependency or action name lifted from the artifact.
-/// Left raw, an ANSI escape (`\x1b…`) in a malicious sample could spoof the
-/// terminal: clear the screen, fake a `CLEAN` verdict, or hide the real one from
-/// the analyst who trusts this output. Applied where the string is built, so the
-/// terminal render and the JSON envelope share one clean copy. Byte-for-byte
-/// fidelity of the *matched bytes* stays available in `--format json`'s hex for
-/// binaries; here the goal is a display that cannot lie about what it shows.
-pub(crate) fn printable(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control() || reorders(c) {
-                '·'
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
-/// Characters that change how the *rest* of a line renders while being
-/// invisible themselves — the Trojan Source family (CVE-2021-42574).
-///
-/// A bidi override makes a file display one thing and execute another, which is
-/// exactly the deception isomer exists to expose: evidence that reproduced one
-/// would show an analyst the attacker's preferred reading of the very line
-/// being flagged. `char::is_control` does not cover these — they are format
-/// (Cf) characters, not control (Cc) — so they are named here.
-///
-/// Only the explicit overrides, isolates, and zero-width padding are
-/// neutralized. Ordinary right-to-left script renders normally, and ZWJ/ZWNJ
-/// are left alone because Indic, Arabic, and emoji sequences need them and
-/// neither reorders text.
-const fn reorders(c: char) -> bool {
-    matches!(c,
-        '\u{200b}'                  // zero-width space
-        | '\u{200e}' | '\u{200f}'   // LRM, RLM
-        | '\u{202a}'..='\u{202e}'   // LRE, RLE, PDF, LRO, RLO
-        | '\u{2066}'..='\u{2069}'   // LRI, RLI, FSI, PDI
-        | '\u{feff}'                // BOM appearing mid-text
-    )
-}
-
-/// Clip display text to `max` *characters*, marking the cut with an ellipsis.
-/// Char-aware, so a multi-byte character is never split in half — and named
-/// apart from `String::truncate`, which counts bytes and would panic here.
-pub(crate) fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{kept}…")
-}
-
-/// Broken-pipe-safe write: a closed downstream pipe (e.g. `| head`) is a normal
-/// exit, not a panic. `println!` would panic here.
-pub(crate) fn write_stdout(s: &str) -> anyhow::Result<()> {
-    use std::io::{self, Write};
-    let mut out = io::stdout().lock();
-    match out.write_all(s.as_bytes()).and_then(|()| out.flush()) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
 /// Runs the selected verb; returns whether the delta is clean at `--fail-on`.
 fn run(cli: &Cli) -> anyhow::Result<bool> {
     refresh_rules(cli);
+    let opts = Options::from(cli);
     match &cli.command {
         Command::Ci {
             base,
@@ -362,7 +252,7 @@ fn run(cli: &Cli) -> anyhow::Result<bool> {
             base_artifacts,
             head_artifacts,
         } => ci::run(
-            cli,
+            &opts,
             &ci::Args {
                 base: base.clone(),
                 head: head.clone(),
@@ -373,11 +263,11 @@ fn run(cli: &Cli) -> anyhow::Result<bool> {
                 head_artifacts: head_artifacts.clone(),
             },
         ),
-        Command::Fs { old, new } => fs::run(Path::new(old), Path::new(new), cli),
+        Command::Fs { old, new } => fs::run(Path::new(old), Path::new(new), &opts),
         Command::Git { .. } => anyhow::bail!("`isomer git` is not implemented yet"),
-        Command::Purl { old, new } => fetch::compare("purl", old, new, cli),
+        Command::Purl { old, new } => fetch::compare("purl", old, new, &opts),
         Command::Oci { old, new } => {
-            fetch::compare("oci", &fetch::oci_purl(old), &fetch::oci_purl(new), cli)
+            fetch::compare("oci", &fetch::oci_purl(old), &fetch::oci_purl(new), &opts)
         }
     }
 }
@@ -407,33 +297,45 @@ fn refresh_rules(cli: &Cli) {
 mod tests {
     use super::*;
 
-    /// A sample is free to embed terminal escapes; the report must not replay
-    /// them into the terminal of the analyst reading the verdict.
     #[test]
-    fn escapes_cannot_reach_the_terminal() {
-        let spoof = "\u{1b}[2J\u{1b}[H  CLEAN  no findings";
-        assert!(!printable(spoof).contains('\u{1b}'));
-        assert!(!printable("a\rb\nc").contains(['\r', '\n']));
-        assert_eq!(printable("ordinary text"), "ordinary text");
+    fn ordinary_fs_cli_needs_no_structural_switch() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["isomer", "fs", "a", "b"]).unwrap();
+        assert!(matches!(cli.command, Command::Fs { .. }));
+        assert!(Cli::try_parse_from(["isomer", "fs", "a", "b", "--structural-only"]).is_err());
     }
 
-    /// Trojan Source (CVE-2021-42574): a bidi override reorders the rest of the
-    /// line, so the evidence an analyst reads is not the code that runs.
     #[test]
-    fn bidi_overrides_cannot_reorder_evidence() {
-        // U+202E is what makes the reversed tail read as an innocuous comment;
-        // rustc denies the literal character in source for the same reason, so
-        // it is written here as an escape.
-        let trojan = "execSync(\"id\"); /* \u{202e} evil ; )\"di\"(cnyScexe \u{202c} */";
-        let safe = printable(trojan);
-        for c in [
-            '\u{202e}', '\u{202c}', '\u{202a}', '\u{2066}', '\u{200f}', '\u{feff}',
+    fn a_bare_command_line_and_the_library_defaults_agree() {
+        // `Options::default()` states the defaults for a caller that is not a
+        // command line. Two sources of truth for one default is one too many:
+        // if a `default_value_t` moves and `Options::default` does not, a
+        // library caller and a bare `isomer` run would silently judge the same
+        // pair differently. This is the only scope holding both.
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["isomer", "fs", "a", "b"]).unwrap();
+        let mut from_argv = Options::from(&cli);
+        // `progress` is the one field with no flag behind it: it is computed
+        // from the format and whether stderr is a terminal, so it legitimately
+        // differs between a piped test run and an interactive one.
+        from_argv.progress = Options::default().progress;
+        assert_eq!(from_argv, Options::default());
+    }
+
+    #[test]
+    fn registry_follow_defaults_on_but_offline_and_opt_out_disable_it() {
+        use clap::Parser;
+        for (flags, expected) in [
+            (vec![], true),
+            (vec!["--offline"], false),
+            (vec!["--no-follow"], false),
         ] {
-            assert!(!safe.contains(c), "{c:?} survived");
+            let args = [vec!["isomer"], flags, vec!["fs", "before", "after"]].concat();
+            assert_eq!(
+                isomer::registry::enabled(&Options::from(&Cli::try_parse_from(args).unwrap())),
+                expected
+            );
         }
-        // Right-to-left *script* is legitimate content and must survive intact,
-        // as must ZWJ/ZWNJ, which real scripts and emoji depend on.
-        assert_eq!(printable("مرحبا שלום"), "مرحبا שלום");
-        assert_eq!(printable("a\u{200d}b\u{200c}c"), "a\u{200d}b\u{200c}c");
     }
 }
