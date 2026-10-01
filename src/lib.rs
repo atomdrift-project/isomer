@@ -5,35 +5,45 @@
 //! package, or OCI image and judging the delta in context.
 //!
 //! The `isomer` binary is a thin wrapper over this library: it parses the
-//! command line into [`options::Options`] and calls one of the verbs
-//! ([`ci::run`], [`fs::run`], [`fetch::compare`]).
-
-use clap::ValueEnum;
+//! command line into [`options::Options`], calls one of the verbs
+//! ([`ci::run`], [`fs::run`], [`fetch::purl`], [`fetch::oci`]), and prints the
+//! [`Outcome`] it gets back. The library itself never writes to stdout, and
+//! reports what it skipped or degraded through the [`log`] facade, so the
+//! caller decides whether and where those lines appear.
+//!
+//! The `cli` feature (on by default) is the command line's: it derives clap's
+//! `ValueEnum` on the enums `--fail-on`, `--gate` and `--format` parse into.
 
 /// This isomer build, for a caller recording which engine judged a comparison.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub mod analysis;
-pub mod behavior_shift;
-pub mod binary;
+pub(crate) mod analysis;
+pub(crate) mod behavior_shift;
+pub(crate) mod binary;
 pub mod ci;
-pub mod deps;
-pub mod evidence;
+pub(crate) mod deps;
+pub(crate) mod evidence;
 pub mod fetch;
-pub mod frameworks;
+pub(crate) mod frameworks;
 pub mod fs;
-pub mod json;
+pub(crate) mod json;
 pub mod judgement;
 pub mod llm;
-pub mod markdown;
+pub(crate) mod markdown;
+mod member;
 pub mod options;
-pub mod registry;
-pub mod rename;
-pub mod risk;
-pub mod rubric;
-pub mod sarif;
-pub mod terminal;
-pub mod version;
+mod purl;
+pub(crate) mod registry;
+pub(crate) mod rename;
+pub(crate) mod risk;
+pub(crate) mod rubric;
+pub(crate) mod sarif;
+mod taxonomy;
+pub(crate) mod terminal;
+#[cfg(test)]
+mod testkit;
+pub(crate) mod version;
+mod view;
 
 /// How serious a finding is, ordered worst-highest so the verdict for a set of
 /// findings is its maximum. `Medium`, `High`, and `Critical` are what the
@@ -44,7 +54,8 @@ pub mod version;
 /// variant becomes clap's per-value help, which would rewrite `--fail-on`'s
 /// `--help` rendering.
 #[allow(missing_docs)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     None,
@@ -76,8 +87,8 @@ impl Severity {
 
     /// This severity as one of scan's three classification bands.
     ///
-    /// The inverse of [`risk::Risk::model_severity`], which is how a model
-    /// class enters this scale in the first place: `Suspicious` arrives as
+    /// The inverse of the mapping that brings a model class onto this scale
+    /// in the first place: `Suspicious` arrives as
     /// `High` and `Hostile` as `Critical`, so they leave the same way.
     ///
     /// Everything below `High` is benign, `Medium` included. `Medium` is the
@@ -95,7 +106,13 @@ impl Severity {
     }
 }
 
-/// Which report [`analysis::Analysis::render`] emits: a terminal verdict, the
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Which report a verb renders into its [`Outcome`]: a terminal verdict, the
 /// JSON envelope, SARIF for code scanning, Markdown for a step summary or pull
 /// request comment, or the raw LLM payload.
 ///
@@ -103,7 +120,8 @@ impl Severity {
 /// on a `ValueEnum` variant becomes clap's per-value help and the other four
 /// deliberately render bare in `--format`'s `--help`.
 #[allow(missing_docs)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 pub enum Format {
     Terminal,
     Json,
@@ -116,12 +134,25 @@ pub enum Format {
 }
 
 /// What the exit code gates on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[serde(rename_all = "lowercase")]
 pub enum Gate {
     /// Fail only on newly-introduced risk.
     New,
     /// Fail on any changed risk, including escalations of existing findings.
     Any,
+}
+
+impl Gate {
+    /// Stable wire name, as `--gate` spells it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Any => "any",
+        }
+    }
 }
 
 /// Neutralize control characters in untrusted, sample-derived display text — a
@@ -181,16 +212,17 @@ pub fn clip(s: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
-/// Broken-pipe-safe write: a closed downstream pipe (e.g. `| head`) is a normal
-/// exit, not a panic. `println!` would panic here.
-pub fn write_stdout(s: &str) -> anyhow::Result<()> {
-    use std::io::{self, Write};
-    let mut out = io::stdout().lock();
-    match out.write_all(s.as_bytes()).and_then(|()| out.flush()) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+/// What a verb produced. The verbs never print: the report comes back here and
+/// the caller decides where it goes, which for the binary is stdout.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct Outcome {
+    /// Exactly what `isomer` writes to stdout for this run: the report in the
+    /// requested format, and under GitHub Actions the workflow commands that
+    /// annotate the job. Empty when there was nothing to judge.
+    pub report: String,
+    /// Whether the run passes at [`options::Options::fail_on`].
+    pub clean: bool,
 }
 
 #[cfg(test)]

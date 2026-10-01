@@ -25,9 +25,9 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-use crate::Format;
-use crate::analysis::{self, Analysis};
+use crate::analysis::{Analysis, Comparison, Framing, Scope, Verb};
 use crate::options::Options;
+use crate::{Format, Outcome};
 
 /// Arguments to the `ci` verb.
 #[derive(Debug)]
@@ -49,6 +49,121 @@ pub struct Args {
     pub base_artifacts: Option<PathBuf>,
     /// Build outputs of the head commit, laid over the head tree.
     pub head_artifacts: Option<PathBuf>,
+    /// What the CI provider says about this run. The caller captures it —
+    /// [`CiEnv::from_process`] for the real environment — so the library
+    /// itself never reads process-global state.
+    pub env: CiEnv,
+}
+
+/// What `ci` reads from the CI provider: the commit range, the pull request,
+/// and where the job's step summary and outputs go.
+///
+/// Captured once, up front. The event payload used to be read and parsed
+/// twice by two functions that each swallowed a malformed file differently.
+#[derive(Debug, Default, Clone)]
+pub struct CiEnv {
+    /// GitHub's event payload (`GITHUB_EVENT_PATH`), parsed.
+    pub github_event: Option<serde_json::Value>,
+    /// `GITHUB_REPOSITORY` or, failing that, GitLab's `CI_PROJECT_PATH`.
+    pub repository: Option<String>,
+    /// GitLab's `CI_MERGE_REQUEST_IID`.
+    pub merge_request_iid: Option<u64>,
+    /// GitLab's `CI_MERGE_REQUEST_DIFF_BASE_SHA`.
+    pub merge_request_base: Option<String>,
+    /// GitLab's `CI_COMMIT_SHA`.
+    pub commit: Option<String>,
+    /// GitLab's `CI_COMMIT_BEFORE_SHA`.
+    pub commit_before: Option<String>,
+    /// Running under GitHub Actions (`GITHUB_ACTIONS`), so workflow commands
+    /// on stdout are read as annotations.
+    pub github_actions: bool,
+    /// `GITHUB_STEP_SUMMARY`.
+    pub step_summary: Option<PathBuf>,
+    /// `GITHUB_OUTPUT`.
+    pub output: Option<PathBuf>,
+}
+
+impl CiEnv {
+    /// Read the CI provider's variables from this process's environment.
+    ///
+    /// A set-but-empty variable counts as unset. An event payload that cannot
+    /// be read or parsed is reported and ignored: the range can still come
+    /// from `--base`/`--head`, and failing the run over a file the job only
+    /// consults for a pull request number would be the wrong trade.
+    #[must_use]
+    pub fn from_process() -> Self {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let github_event = var("GITHUB_EVENT_PATH").and_then(|path| {
+            let parsed = std::fs::read_to_string(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|text| Ok(serde_json::from_str(&text)?));
+            match parsed {
+                Ok(event) => Some(event),
+                Err(e) => {
+                    log::warn!("ignoring GitHub event payload {path}: {e:#}");
+                    None
+                }
+            }
+        });
+        Self {
+            github_event,
+            repository: var("GITHUB_REPOSITORY").or_else(|| var("CI_PROJECT_PATH")),
+            merge_request_iid: var("CI_MERGE_REQUEST_IID").and_then(|n| n.parse().ok()),
+            merge_request_base: var("CI_MERGE_REQUEST_DIFF_BASE_SHA"),
+            commit: var("CI_COMMIT_SHA"),
+            commit_before: var("CI_COMMIT_BEFORE_SHA"),
+            github_actions: std::env::var_os("GITHUB_ACTIONS").is_some(),
+            step_summary: std::env::var_os("GITHUB_STEP_SUMMARY").map(PathBuf::from),
+            output: std::env::var_os("GITHUB_OUTPUT").map(PathBuf::from),
+        }
+    }
+
+    /// The commit range this run is for, from the event payload or GitLab's
+    /// variables.
+    fn commit_range(&self) -> Option<(String, String)> {
+        // GitHub Actions: the event payload is the authoritative source for
+        // both pull requests and pushes.
+        if let Some(event) = &self.github_event {
+            let str_at = |p: &[&str]| -> Option<String> {
+                p.iter()
+                    .try_fold(event, |cur, key| cur.get(key))?
+                    .as_str()
+                    .map(str::to_owned)
+            };
+            if let (Some(b), Some(h)) = (
+                str_at(&["pull_request", "base", "sha"]),
+                str_at(&["pull_request", "head", "sha"]),
+            ) {
+                return Some((b, h));
+            }
+            if let (Some(b), Some(h)) = (str_at(&["before"]), str_at(&["after"]))
+                && !is_null_sha(&b)
+            {
+                return Some((b, h));
+            }
+        }
+        // GitLab CI.
+        if let (Some(b), Some(h)) = (&self.merge_request_base, &self.commit) {
+            return Some((b.clone(), h.clone()));
+        }
+        if let (Some(b), Some(h)) = (&self.commit_before, &self.commit)
+            && !is_null_sha(b)
+        {
+            return Some((b.clone(), h.clone()));
+        }
+        None
+    }
+
+    /// The pull/merge request number, when this run is for one.
+    fn pr_number(&self) -> Option<u64> {
+        self.merge_request_iid.or_else(|| {
+            self.github_event
+                .as_ref()?
+                .get("pull_request")?
+                .get("number")?
+                .as_u64()
+        })
+    }
 }
 
 /// A blob larger than this is not extracted. Nothing legitimate in a source
@@ -57,14 +172,20 @@ pub struct Args {
 const MAX_BLOB: u64 = 128 << 20;
 
 /// Analyze the change this CI run is for.
-pub fn run(opts: &Options, args: &Args) -> Result<bool> {
+///
+/// The step summary and action outputs are written as the run goes, to the
+/// files [`CiEnv`] names; everything meant for the step's stdout comes back in
+/// the [`Outcome`].
+pub fn run(opts: &Options, args: &Args) -> Result<Outcome> {
+    opts.validate()?;
     let repo = args.repo.as_path();
+    let env = &args.env;
+    let mut sinks = Sinks {
+        env,
+        stdout: String::new(),
+    };
     let refs = Refs::resolve(repo, args)?;
-    eprintln!(
-        "isomer: comparing {}..{}",
-        short(&refs.base),
-        short(&refs.head)
-    );
+    log::info!("comparing {}..{}", short(&refs.base), short(&refs.head));
 
     let changes = changed_files(repo, &refs, args.max_files)?;
     // Build outputs are judged even when no source file changed: a change to a
@@ -74,9 +195,9 @@ pub fn run(opts: &Options, args: &Args) -> Result<bool> {
     if changes.is_empty() && !artifacts {
         // Nothing to judge. Say so on the sinks that always exist and pass;
         // a pull request that touches no analyzable file is not a finding.
-        eprintln!("isomer: no analyzable files changed");
-        summary("### ✅ isomer\n\nNo analyzable files changed.\n");
-        outputs(&[
+        log::info!("no analyzable files changed");
+        sinks.summary("### ✅ isomer\n\nNo analyzable files changed.\n");
+        sinks.outputs(&[
             ("verdict", "CLEAN"),
             ("severity", "none"),
             ("new-severity", "none"),
@@ -84,7 +205,10 @@ pub fn run(opts: &Options, args: &Args) -> Result<bool> {
             ("findings", "0"),
             ("base-sha", &refs.base),
         ]);
-        return Ok(true);
+        return Ok(Outcome {
+            report: sinks.stdout,
+            clean: true,
+        });
     }
 
     let work = tempfile::Builder::new()
@@ -94,6 +218,7 @@ pub fn run(opts: &Options, args: &Args) -> Result<bool> {
     let (old, new) = (work.path().join("base"), work.path().join("head"));
     materialize(repo, &refs, &changes, &old, &new)?;
     let compared = overlay_builds(
+        &mut sinks,
         args.base_artifacts.as_deref(),
         args.head_artifacts.as_deref(),
         &old,
@@ -101,23 +226,25 @@ pub fn run(opts: &Options, args: &Args) -> Result<bool> {
         args.max_files,
     )?;
 
-    let options = cleave::AnalysisOptions::default();
-    let report = analysis::diff(&old, &new, &options)?;
-    let mut a = Analysis::new("ci", &old, &new, &options, &report, opts)?;
+    let comparison = Comparison::run(&old, &new)?;
     // `fs` names the artifact it compared; `ci` compares two states of a
     // repository, where the scratch dir the files were staged in is no name.
-    a.naming.name = subject(repo);
-    a.scope = Some(if compared {
-        analysis::Scope::SourceAndBuild
-    } else {
-        analysis::Scope::Source
-    });
-    // After the naming and scope above, so the model reads the same case the
-    // four sinks below render.
-    a.finish(opts);
+    // Both are settled before the model reads the case the sinks render.
+    let framing = Framing {
+        name: Some(subject(env, repo)),
+        scope: Some(if compared {
+            Scope::SourceAndBuild
+        } else {
+            Scope::Source
+        }),
+    };
+    let a = comparison.judge(Verb::Ci, &old, &new, opts, framing)?;
 
-    emit(&a, opts, args.out_dir.as_deref(), &refs.base)?;
-    Ok(a.clean)
+    emit(&a, opts, &mut sinks, args.out_dir.as_deref(), &refs.base)?;
+    Ok(Outcome {
+        report: sinks.stdout,
+        clean: a.clean(),
+    })
 }
 
 // ── build outputs ───────────────────────────────────────────────────────────
@@ -141,6 +268,7 @@ pub fn run(opts: &Options, args: &Args) -> Result<bool> {
 /// and the report has to say `source only` rather than claim a comparison it
 /// never made.
 fn overlay_builds(
+    sinks: &mut Sinks<'_>,
     base: Option<&Path>,
     head: Option<&Path>,
     old: &Path,
@@ -152,7 +280,7 @@ fn overlay_builds(
         // build that failed. Every artifact would read as added or deleted
         // wholesale, which is noise wearing the costume of a finding.
         if base.is_some() || head.is_some() {
-            warn("only one side's build outputs were supplied; the comparison needs both");
+            sinks.warn("only one side's build outputs were supplied; the comparison needs both");
         }
         return Ok(false);
     };
@@ -161,7 +289,7 @@ fn overlay_builds(
             // The workflow asked for a comparison and the artifacts are not
             // there. An axis that silently did not run reads exactly like an
             // axis that ran and found nothing.
-            warn(&format!(
+            sinks.warn(&format!(
                 "{} does not exist — build outputs were NOT compared",
                 dir.display()
             ));
@@ -174,7 +302,7 @@ fn overlay_builds(
     let head_files =
         crate::rename::list(head).with_context(|| format!("reading {}", head.display()))?;
     if base_files.is_empty() || head_files.is_empty() {
-        warn("build output directories are empty — build outputs were NOT compared");
+        sinks.warn("build output directories are empty — build outputs were NOT compared");
         return Ok(false);
     }
     if base_files.len() + head_files.len() > max {
@@ -189,25 +317,24 @@ fn overlay_builds(
     // Paired files share the head's name, because that is the one that exists
     // going forward and the one a reviewer will look for.
     let pairs = crate::rename::pair(&base_files, &head_files);
-    let mut staged_as: Vec<Option<&str>> = vec![None; base_files.len()];
+    let mut staged_as: Vec<Option<&Path>> = vec![None; base_files.len()];
     let mut renamed = 0usize;
     for &(b, h) in &pairs {
-        staged_as[b] = Some(head_files[h].as_str());
+        staged_as[b] = Some(head_files[h].as_path());
         if base_files[b] != head_files[h] {
             renamed += 1;
         }
     }
 
-    for (i, rel) in base_files.iter().enumerate() {
-        let dest = staged_as[i].unwrap_or(rel.as_str());
-        stage(&base.join(rel), &old.join(dest))?;
+    for (rel, staged) in base_files.iter().zip(staged_as) {
+        stage(&base.join(rel), &old.join(staged.unwrap_or(rel)))?;
     }
     for rel in &head_files {
         stage(&head.join(rel), &new.join(rel))?;
     }
 
-    eprintln!(
-        "isomer: {} build output(s) from {}, {} from {}{}",
+    log::info!(
+        "{} build output(s) from {}, {} from {}{}",
         base_files.len(),
         base.display(),
         head_files.len(),
@@ -223,8 +350,9 @@ fn overlay_builds(
 /// Copy one build output into the tree, bounded the way an extracted blob is.
 ///
 /// The bound is enforced on the bytes actually read, not on a stat taken first:
-/// a file that grows between the two — or a FIFO whose length reads as zero —
-/// would otherwise copy without limit.
+/// a file that grows between the two would otherwise copy without limit.
+/// Special files never get here — [`crate::rename::list`] lists regular files
+/// only, since opening a FIFO with no writer blocks before any read.
 fn stage(src: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -242,8 +370,8 @@ fn stage(src: &Path, dest: &Path) -> Result<()> {
     if copied > MAX_BLOB {
         drop(output);
         discard(dest)?;
-        eprintln!(
-            "isomer: skipped {} — larger than {} MiB",
+        log::warn!(
+            "skipped {} — larger than {} MiB",
             src.display(),
             MAX_BLOB >> 20
         );
@@ -253,7 +381,11 @@ fn stage(src: &Path, dest: &Path) -> Result<()> {
 
 // ── what changed ────────────────────────────────────────────────────────────
 
-/// The two commits to compare.
+/// The two commits to compare, as full object names.
+///
+/// Resolved once, up front: every later git call addresses a fixed SHA, so a
+/// ref that moves mid-run — or a revision spelled like an option — can no
+/// longer change what is read.
 struct Refs {
     base: String,
     head: String,
@@ -263,46 +395,68 @@ impl Refs {
     /// Explicit flags win; otherwise read the CI environment. The base is
     /// narrowed to the merge base so the report covers this change alone.
     fn resolve(repo: &Path, args: &Args) -> Result<Self> {
-        let (mut base, mut head) = match (&args.base, &args.head) {
-            (Some(b), Some(h)) => (b.clone(), h.clone()),
-            (b, h) => {
-                let env = from_env().context(
-                    "could not derive the commit range from the environment. \
-                     Pass --base and --head, or run inside GitHub Actions or GitLab CI",
-                )?;
-                (b.clone().unwrap_or(env.0), h.clone().unwrap_or(env.1))
+        let derived = if args.base.is_some() && args.head.is_some() {
+            None
+        } else {
+            Some(args.env.commit_range().context(
+                "could not derive the commit range from the environment. \
+                 Pass --base and --head, or run inside GitHub Actions or GitLab CI",
+            )?)
+        };
+        // Before either value reaches git. Neither source is under our
+        // control: `--base`/`--head` come from whatever wrapper invoked us,
+        // and the rest from a CI environment. See [`checked_rev`].
+        let (base, head) = match (&args.base, &args.head, derived) {
+            (Some(b), Some(h), _) => (b.clone(), Source::Flag(h.clone())),
+            (b, h, Some((env_base, env_head))) => (
+                b.clone().unwrap_or(env_base),
+                h.clone()
+                    .map_or(Source::Environment(env_head), Source::Flag),
+            ),
+            // `derived` is only `None` when both flags were given.
+            (_, _, None) => bail!("--base and --head must be given together"),
+        };
+        let base = checked_rev(base, "base")?;
+
+        let head = match head {
+            Source::Flag(rev) => {
+                let rev = checked_rev(rev, "head")?;
+                resolve_commit(repo, &rev)?.with_context(|| {
+                    format!(
+                        "head revision {} is not in this checkout",
+                        crate::printable(&rev)
+                    )
+                })?
+            }
+            // A shallow checkout of a pull request often has the merge commit
+            // but not the head commit the event names. `HEAD` is then the
+            // right — and only — answer. An explicit `--head` gets no such
+            // fallback: a typo there must not silently analyze something else.
+            Source::Environment(rev) => {
+                let rev = checked_rev(rev, "head")?;
+                match resolve_commit(repo, &rev)? {
+                    Some(sha) => sha,
+                    None => {
+                        log::warn!("{} is not in this checkout; using HEAD", short(&rev));
+                        resolve_commit(repo, "HEAD")?.context("HEAD does not name a commit")?
+                    }
+                }
             }
         };
-        // Before either value reaches git. Both sides travel as *positional*
-        // arguments, and neither source is under our control: `--base`/`--head`
-        // come from whatever wrapper invoked us, and the rest from a CI
-        // environment. See [`checked_rev`].
-        base = checked_rev(base, "base")?;
-        head = checked_rev(head, "head")?;
-
-        // A shallow checkout of a pull request often has the merge commit but
-        // not the head commit the event names. `HEAD` is then the right — and
-        // only — answer.
-        if !exists(repo, &head) {
-            eprintln!(
-                "isomer: {} is not in this checkout; using HEAD",
-                short(&head)
-            );
-            head = "HEAD".to_string();
-        }
-        if !exists(repo, &base) {
+        let Some(mut base) = resolve_commit(repo, &base)? else {
             bail!(
                 "base commit {} is not in this checkout. Fetch it first:\n    \
-                 git fetch --depth=50 origin {base}",
+                 git fetch --depth=50 origin {}",
                 short(&base),
+                crate::printable(&base),
             );
-        }
+        };
         // The fork point, so commits that landed on the base branch after this
         // change was branched are not attributed to it.
         match git(repo, &["merge-base", &base, &head]) {
-            Ok(out) => base = String::from_utf8_lossy(&out).trim().to_string(),
-            Err(e) => eprintln!(
-                "isomer: no merge base ({e}); comparing against {} directly",
+            Ok(out) => base = String::from_utf8_lossy(&out).trim().to_owned(),
+            Err(e) => log::warn!(
+                "no merge base ({e}); comparing against {} directly",
                 short(&base)
             ),
         }
@@ -310,13 +464,20 @@ impl Refs {
     }
 }
 
+/// Where a head revision came from, which decides what a missing one means.
+enum Source {
+    /// `--head`: the caller named it, so it must exist.
+    Flag(String),
+    /// The CI event, which a shallow checkout may not contain.
+    Environment(String),
+}
+
 /// What the report is about: `owner/repo#42` for a pull request, the repo
 /// slug for a push, the directory name when running outside CI.
-fn subject(repo: &Path) -> String {
-    let slug = std::env::var("GITHUB_REPOSITORY")
-        .ok()
-        .or_else(|| std::env::var("CI_PROJECT_PATH").ok())
-        .filter(|s| !s.is_empty())
+fn subject(env: &CiEnv, repo: &Path) -> String {
+    let slug = env
+        .repository
+        .clone()
         .or_else(|| {
             std::fs::canonicalize(repo)
                 .ok()?
@@ -324,66 +485,11 @@ fn subject(repo: &Path) -> String {
                 .map(|n| n.to_string_lossy().into_owned())
         })
         .unwrap_or_default();
-    match pr_number() {
+    match env.pr_number() {
         Some(n) if !slug.is_empty() => format!("{slug}#{n}"),
         Some(n) => format!("#{n}"),
         None => slug,
     }
-}
-
-/// The pull/merge request number, when this run is for one.
-fn pr_number() -> Option<u64> {
-    if let Ok(n) = std::env::var("CI_MERGE_REQUEST_IID")
-        && let Ok(n) = n.parse()
-    {
-        return Some(n);
-    }
-    let text = std::fs::read_to_string(std::env::var("GITHUB_EVENT_PATH").ok()?).ok()?;
-    serde_json::from_str::<serde_json::Value>(&text)
-        .ok()?
-        .get("pull_request")?
-        .get("number")?
-        .as_u64()
-}
-
-/// Read the commit range from the CI provider's environment.
-fn from_env() -> Option<(String, String)> {
-    // GitHub Actions: the event payload is the authoritative source for both
-    // pull requests and pushes.
-    if let Ok(path) = std::env::var("GITHUB_EVENT_PATH")
-        && let Ok(text) = std::fs::read_to_string(&path)
-        && let Ok(event) = serde_json::from_str::<serde_json::Value>(&text)
-    {
-        let str_at = |v: &serde_json::Value, p: &[&str]| -> Option<String> {
-            let mut cur = v;
-            for key in p {
-                cur = cur.get(key)?;
-            }
-            cur.as_str().map(str::to_string)
-        };
-        if let (Some(b), Some(h)) = (
-            str_at(&event, &["pull_request", "base", "sha"]),
-            str_at(&event, &["pull_request", "head", "sha"]),
-        ) {
-            return Some((b, h));
-        }
-        if let (Some(b), Some(h)) = (str_at(&event, &["before"]), str_at(&event, &["after"]))
-            && !is_null_sha(&b)
-        {
-            return Some((b, h));
-        }
-    }
-    // GitLab CI.
-    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    if let (Some(b), Some(h)) = (var("CI_MERGE_REQUEST_DIFF_BASE_SHA"), var("CI_COMMIT_SHA")) {
-        return Some((b, h));
-    }
-    if let (Some(b), Some(h)) = (var("CI_COMMIT_BEFORE_SHA"), var("CI_COMMIT_SHA"))
-        && !is_null_sha(&b)
-    {
-        return Some((b, h));
-    }
-    None
 }
 
 /// Reject a revision that git would read as an option rather than a commit.
@@ -465,6 +571,11 @@ impl Change {
 /// vendored library is indistinguishable from vendoring a hostile one. git
 /// resolves this far more cheaply than we could: identical blobs match by hash,
 /// and `diff.renameLimit` already bounds the similarity search.
+///
+/// Scoped to `repo` with the `.` pathspec: `git -C subdir diff` otherwise lists
+/// every change in the enclosing repository, and `--repo` (the action's
+/// `working-directory`) would narrow nothing. Paths stay relative to the
+/// repository root, which is how `<commit>:<path>` addresses a blob.
 fn changed_files(repo: &Path, refs: &Refs, max: usize) -> Result<Vec<Change>> {
     let out = git(
         repo,
@@ -475,6 +586,8 @@ fn changed_files(repo: &Path, refs: &Refs, max: usize) -> Result<Vec<Change>> {
             "-z",
             &refs.base,
             &refs.head,
+            "--",
+            ".",
         ],
     )?;
     parse_name_status(&out, max)
@@ -493,11 +606,14 @@ fn changed_files(repo: &Path, refs: &Refs, max: usize) -> Result<Vec<Change>> {
 fn parse_name_status(out: &[u8], max: usize) -> Result<Vec<Change>> {
     let mut fields = out.split(|b| *b == 0).filter(|f| !f.is_empty());
     let mut changes = Vec::new();
+    // A record cut short is a listing we did not understand, not the end of
+    // one: dropping it would analyze a subset and report it as the whole.
+    let truncated = || anyhow::anyhow!("truncated `git diff --name-status` listing");
     while let Some(status) = fields.next() {
         let kind = status.first().copied().unwrap_or(b'M');
-        let Some(first) = fields.next() else { break };
+        let first = fields.next().ok_or_else(truncated)?;
         let (from, to) = if matches!(kind, b'R' | b'C') {
-            let Some(second) = fields.next() else { break };
+            let second = fields.next().ok_or_else(truncated)?;
             (os_path(first), os_path(second))
         } else {
             let p = os_path(first);
@@ -558,61 +674,75 @@ fn materialize(repo: &Path, refs: &Refs, changes: &[Change], old: &Path, new: &P
 
 /// Stream one blob out of a commit and onto disk.
 fn extract(repo: &Path, commit: &str, path: &Path, dest: &Path) -> Result<()> {
+    extract_bounded(repo, commit, path, dest, MAX_BLOB)
+}
+
+/// [`extract`], with the size bound as a parameter so a test can exceed it
+/// without writing 128 MiB.
+fn extract_bounded(repo: &Path, commit: &str, path: &Path, dest: &Path, limit: u64) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     // `<commit>:<path>` is git's blob address. The path travels as one argv
     // element, so no quoting or encoding can make it name a different file.
+    // `cat-file` is the plumbing read: raw bytes, no porcelain conversion.
     let mut spec = std::ffi::OsString::from(format!("{commit}:"));
     spec.push(path);
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("show")
+    let mut child = git_command(repo)
+        .args(["cat-file", "blob"])
         .arg(&spec)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("running git show")?;
+        .context("running git cat-file")?;
     let Some(mut stdout) = child.stdout.take() else {
-        bail!("git show produced no output stream");
+        bail!("git cat-file produced no output stream");
     };
 
-    let mut file =
-        std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+    let file = std::fs::File::create(dest);
     // Bounded copy: a hostile blob cannot exhaust memory or disk here.
-    let copied = std::io::copy(
-        &mut std::io::Read::take(&mut stdout, MAX_BLOB + 1),
-        &mut file,
-    )
-    .with_context(|| format!("extracting {}", path.display()))?;
-    drop(file);
-    // `wait_with_output` drains the stderr pipe. A plain `wait` would deadlock
-    // against a child blocked writing into a full pipe nobody reads, and it
-    // would throw away git's own account of the failure.
-    let out = child.wait_with_output().context("waiting for git show")?;
+    let copied = file.map_err(anyhow::Error::from).and_then(|mut file| {
+        Ok(std::io::copy(
+            &mut std::io::Read::take(&mut stdout, limit + 1),
+            &mut file,
+        )?)
+    });
+    // Close our end of the pipe before waiting. Past the bound, git is still
+    // blocked writing the rest of the blob; held open, `wait_with_output` would
+    // drain stderr forever against a child that can never finish. Closed, git
+    // takes EPIPE and exits.
+    drop(stdout);
+    // `wait_with_output` drains the stderr pipe, so git's own account of a
+    // failure is kept — and reaped even when the copy above failed.
+    let out = child
+        .wait_with_output()
+        .context("waiting for git cat-file")?;
+    let copied = copied.with_context(|| format!("extracting {}", path.display()))?;
+    // Checked before the exit status: an oversized blob is the case where we
+    // closed the pipe on git, so its failure is ours, not the blob's.
+    if copied > limit {
+        discard(dest)?;
+        log::warn!(
+            "skipped {} — larger than {} MiB",
+            path.display(),
+            limit >> 20
+        );
+        return Ok(());
+    }
     if !out.status.success() {
         // A blob that cannot be read is not a silent skip: drop the partial file
         // so the side simply has no content, and say why. If even that fails,
         // the run must not continue — a truncated prefix analyzed as a whole
         // file is a wrong answer, not a missing one.
         discard(dest)?;
-        eprintln!(
-            "isomer: could not read {}@{}: {}",
+        log::warn!(
+            "could not read {}@{}: {}",
             path.display(),
             short(commit),
             crate::printable(String::from_utf8_lossy(&out.stderr).trim())
         );
         return Ok(());
-    }
-    if copied > MAX_BLOB {
-        discard(dest)?;
-        eprintln!(
-            "isomer: skipped {} — larger than {} MiB",
-            path.display(),
-            MAX_BLOB >> 20
-        );
     }
     Ok(())
 }
@@ -626,16 +756,22 @@ fn discard(dest: &Path) -> Result<()> {
 // ── sinks ───────────────────────────────────────────────────────────────────
 
 /// Write the verdict everywhere this environment can show it.
-fn emit(a: &Analysis<'_>, opts: &Options, out_dir: Option<&Path>, base: &str) -> Result<()> {
+fn emit(
+    a: &Analysis<'_>,
+    opts: &Options,
+    sinks: &mut Sinks<'_>,
+    out_dir: Option<&Path>,
+    base: &str,
+) -> Result<()> {
     // stdout keeps whatever the caller asked for, so `isomer ci --format json`
     // still pipes cleanly.
-    crate::write_stdout(&a.render(opts.format, opts)?)?;
+    sinks.stdout.push_str(&a.render(opts.format)?);
 
-    let markdown = a.render(Format::Markdown, opts)?;
+    let markdown = a.render(Format::Markdown)?;
     if let Some(dir) = out_dir {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let json = a.render(Format::Json, opts)?;
-        let sarif = a.render(Format::Sarif, opts)?;
+        let json = a.render(Format::Json)?;
+        let sarif = a.render(Format::Sarif)?;
         for (name, body) in [
             ("report.json", &json),
             ("report.sarif", &sarif),
@@ -652,83 +788,94 @@ fn emit(a: &Analysis<'_>, opts: &Options, out_dir: Option<&Path>, base: &str) ->
     //
     // Which is exactly why a clean run must not spend it. One line when there
     // is nothing to report; everything when there is.
-    if a.clean {
-        summary(&crate::markdown::one_line(a));
+    if a.clean() {
+        sinks.summary(&crate::markdown::one_line(a));
     } else {
-        summary(&markdown);
+        sinks.summary(&markdown);
     }
 
-    let verdict = crate::terminal::verdict_word(a.verdict);
+    let verdict = crate::view::verdict_word(a.verdict);
     let findings = a.assessment.finding_count();
-    outputs(&[
+    sinks.outputs(&[
         ("verdict", verdict),
         ("severity", a.verdict.as_str()),
         ("new-severity", a.new_verdict.as_str()),
-        ("fail", if a.clean { "false" } else { "true" }),
+        ("fail", if a.clean() { "false" } else { "true" }),
         ("findings", &findings.to_string()),
-        // The fork point, not the base branch tip — so a workflow that builds
-        // this commit to produce `--base-artifacts` measures both halves of the
-        // report from the same place.
+        // The fork point, not the base branch tip — so a workflow that
+        // builds this commit to produce `--base-artifacts` measures both
+        // halves of the report from the same place.
         ("base-sha", base),
     ]);
 
     // A failing check needs a reason visible in the job log without scrolling.
     // Workflow commands are read from the step's stdout, so this shares the
-    // report's stream — but it goes through `write_stdout`, since `println!`
-    // panics on a closed pipe and a piped `isomer ci` is ordinary usage.
-    if std::env::var_os("GITHUB_ACTIONS").is_some() && !a.clean {
-        crate::write_stdout(&format!(
+    // report's stream.
+    if sinks.env.github_actions && !a.clean() {
+        sinks.stdout.push_str(&format!(
             "::error title=isomer: {verdict}::{}\n",
             escape_annotation(&a.headline())
-        ))?;
+        ));
     }
     Ok(())
 }
 
-/// Report an axis that could not run, where CI will actually show it.
+/// Where `ci` reports.
 ///
-/// Degrading quietly is the one failure this tool cannot afford: a scan missing
-/// its artifact comparison must not read like a scan that made it and found
-/// nothing.
-fn warn(message: &str) {
-    eprintln!("isomer: {message}");
-    if std::env::var_os("GITHUB_ACTIONS").is_some() {
-        // Broken-pipe-safe, and best-effort: a warning that cannot be written
-        // must not take down the run it was only annotating.
-        let _ = crate::write_stdout(&format!(
-            "::warning title=isomer::{}\n",
-            escape_annotation(message)
-        ));
-    }
+/// GitHub reads workflow commands from the step's stdout, so they collect in
+/// `stdout` beside the report and reach the log in the order they were raised.
+/// The step summary and the outputs file are the environment's to name, and
+/// are written as the run goes.
+struct Sinks<'a> {
+    env: &'a CiEnv,
+    stdout: String,
 }
 
-/// Append markdown to the GitHub step summary, when running there.
-fn summary(body: &str) {
-    let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") else {
-        return;
-    };
-    if let Err(e) = append(Path::new(&path), body) {
-        eprintln!("isomer: could not write step summary: {e:#}");
+impl Sinks<'_> {
+    /// Report an axis that could not run, where CI will actually show it.
+    ///
+    /// Degrading quietly is the one failure this tool cannot afford: a scan
+    /// missing its artifact comparison must not read like a scan that made it
+    /// and found nothing.
+    fn warn(&mut self, message: &str) {
+        log::warn!("{message}");
+        if self.env.github_actions {
+            self.stdout.push_str(&format!(
+                "::warning title=isomer::{}\n",
+                escape_annotation(message)
+            ));
+        }
     }
-}
 
-/// Publish `name=value` pairs as action outputs, when running there.
-///
-/// The CLI writes these itself so the action needs no JSON parsing — keeping
-/// the action a thin, auditable wrapper is worth twenty lines here.
-fn outputs(pairs: &[(&str, &str)]) {
-    let Some(path) = std::env::var_os("GITHUB_OUTPUT") else {
-        return;
-    };
-    // `k=v` is line-delimited, so a newline inside a value would forge further
-    // outputs. `base-sha` carries a caller-supplied `--base`, so this is
-    // attacker-reachable; strip the delimiters rather than trust the source.
-    let body: String = pairs
-        .iter()
-        .map(|(k, v)| format!("{k}={}\n", v.replace(['\r', '\n'], " ")))
-        .collect();
-    if let Err(e) = append(Path::new(&path), &body) {
-        eprintln!("isomer: could not write outputs: {e:#}");
+    /// Append markdown to the GitHub step summary, when running there.
+    fn summary(&self, body: &str) {
+        let Some(path) = &self.env.step_summary else {
+            return;
+        };
+        if let Err(e) = append(path, body) {
+            log::warn!("could not write step summary: {e:#}");
+        }
+    }
+
+    /// Publish `name=value` pairs as action outputs, when running there.
+    ///
+    /// The CLI writes these itself so the action needs no JSON parsing —
+    /// keeping the action a thin, auditable wrapper is worth twenty lines here.
+    fn outputs(&self, pairs: &[(&str, &str)]) {
+        let Some(path) = &self.env.output else {
+            return;
+        };
+        // `k=v` is line-delimited, so a newline inside a value would forge
+        // further outputs. `base-sha` carries a caller-supplied `--base`, so
+        // this is attacker-reachable; strip the delimiters rather than trust
+        // the source.
+        let body: String = pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={}\n", v.replace(['\r', '\n'], " ")))
+            .collect();
+        if let Err(e) = append(path, &body) {
+            log::warn!("could not write outputs: {e:#}");
+        }
     }
 }
 
@@ -755,10 +902,30 @@ fn escape_annotation(s: &str) -> String {
 
 // ── git plumbing ────────────────────────────────────────────────────────────
 
+/// `git -C <repo>`, isolated from the caller's repository environment.
+///
+/// `GIT_DIR` and its relatives override `-C`. Inherited from a hook or a
+/// wrapper script, they would point every command below at some other
+/// repository while the report named this one.
+fn git_command(repo: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.arg("-C").arg(repo);
+    cmd
+}
+
 fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let out = git_command(repo)
         .args(args)
         .output()
         .with_context(|| format!("running git {}", args.join(" ")))?;
@@ -772,22 +939,34 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Whether a commit-ish resolves in this checkout.
-fn exists(repo: &Path, rev: &str) -> bool {
-    git(
-        repo,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{rev}^{{commit}}"),
-        ],
-    )
-    .is_ok()
+/// The full object name of the commit `rev` names in this checkout.
+///
+/// `Ok(None)` means git ran and the revision names no commit here. Any other
+/// failure — git missing, `repo` not a repository — is an error, not an
+/// absent commit: reporting it as "fetch the base first" sends the reader
+/// after the wrong problem.
+fn resolve_commit(repo: &Path, rev: &str) -> Result<Option<String>> {
+    let out = git_command(repo)
+        .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+        .arg(format!("{rev}^{{commit}}"))
+        .output()
+        .context("running git rev-parse")?;
+    match out.status.code() {
+        Some(0) => Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_owned())),
+        // `--verify --quiet` exits 1, silently, for a name that resolves to
+        // nothing.
+        Some(1) => Ok(None),
+        _ => bail!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
 }
 
-fn short(sha: &str) -> String {
-    sha.chars().take(12).collect()
+/// A revision abbreviated for a log line. Sanitized, because a revision that
+/// never resolved is still caller- or environment-supplied text.
+fn short(rev: &str) -> String {
+    crate::printable(&rev.chars().take(12).collect::<String>())
 }
 
 /// A git path as the operating system sees it. On Unix a path is bytes, and
@@ -868,11 +1047,12 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_listing_does_not_invent_a_change() {
-        // A rename whose second path never arrived must be dropped, not paired
-        // with whatever follows.
-        let c = parse_name_status(b"R100\0only/one.js\0", 100).expect("parses");
-        assert!(c.is_empty());
+    fn a_truncated_listing_is_refused() {
+        // A rename whose second path never arrived must neither be paired with
+        // whatever follows nor silently dropped: either way the scan would
+        // cover less than the change.
+        assert!(parse_name_status(b"R100\0only/one.js\0", 100).is_err());
+        assert!(parse_name_status(b"M\0", 100).is_err());
     }
 
     #[test]
@@ -899,5 +1079,123 @@ mod tests {
     fn short_sha_is_bounded() {
         assert_eq!(short("0123456789abcdef0123"), "0123456789ab");
         assert_eq!(short("abc"), "abc");
+    }
+
+    /// A scratch repository with one commit per entry of `commits`, each a
+    /// list of `(path, contents)` writes. Returns the directory and the SHAs.
+    fn repo(commits: &[&[(&str, &[u8])]]) -> (tempfile::TempDir, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = git_command(dir.path())
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            out.stdout
+        };
+        run(&["init", "-q"]);
+        let mut shas = Vec::new();
+        for files in commits {
+            for (path, body) in *files {
+                let p = dir.path().join(path);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, body).unwrap();
+            }
+            run(&["add", "-A"]);
+            run(&["commit", "-q", "--allow-empty", "-m", "c"]);
+            shas.push(
+                String::from_utf8(run(&["rev-parse", "HEAD"]))
+                    .unwrap()
+                    .trim()
+                    .to_owned(),
+            );
+        }
+        (dir, shas)
+    }
+
+    /// Past the bound, git is still writing; the read side must let it go
+    /// rather than wait on it forever. Larger than any pipe buffer, so the old
+    /// code hung here.
+    #[test]
+    fn an_oversized_blob_is_skipped_without_hanging() {
+        let big = vec![b'x'; 4 << 20];
+        let (dir, shas) = repo(&[&[("big.bin", &big), ("small.txt", b"ok")]]);
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("big.bin");
+        extract_bounded(dir.path(), &shas[0], Path::new("big.bin"), &dest, 1024).unwrap();
+        assert!(!dest.exists(), "an oversized blob must not be staged");
+        let dest = out.path().join("small.txt");
+        extract_bounded(dir.path(), &shas[0], Path::new("small.txt"), &dest, 1024).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ok");
+    }
+
+    /// `--repo` (the action's `working-directory`) narrows the scan; without a
+    /// pathspec, git lists the whole repository's changes from a subdirectory.
+    #[test]
+    fn the_diff_is_scoped_to_the_repo_directory() {
+        let (dir, shas) = repo(&[
+            &[("a/x.js", b"1"), ("b/y.js", b"1")],
+            &[("a/x.js", b"2"), ("b/y.js", b"2")],
+        ]);
+        let refs = Refs {
+            base: shas[0].clone(),
+            head: shas[1].clone(),
+        };
+        let changes = changed_files(&dir.path().join("a"), &refs, 100).unwrap();
+        let staged: Vec<_> = changes.iter().map(Change::staged).collect();
+        assert_eq!(staged, vec![Path::new("a/x.js")]);
+    }
+
+    #[test]
+    fn a_missing_commit_is_absent_but_a_broken_repository_is_an_error() {
+        let (dir, shas) = repo(&[&[("f", b"1")]]);
+        assert_eq!(
+            resolve_commit(dir.path(), "HEAD").unwrap().as_deref(),
+            Some(shas[0].as_str())
+        );
+        assert_eq!(resolve_commit(dir.path(), "no-such-ref").unwrap(), None);
+        let not_a_repo = tempfile::tempdir().unwrap();
+        assert!(resolve_commit(not_a_repo.path(), "HEAD").is_err());
+    }
+
+    /// An explicit `--head` that does not resolve is the caller's mistake; only
+    /// a head derived from the CI event may fall back to `HEAD`.
+    #[test]
+    fn an_explicit_head_never_falls_back_to_head() {
+        let (dir, shas) = repo(&[&[("f", b"1")], &[("f", b"2")]]);
+        let args = |head: Option<&str>, env: CiEnv| Args {
+            base: Some(shas[0].clone()),
+            head: head.map(str::to_owned),
+            repo: dir.path().to_path_buf(),
+            out_dir: None,
+            max_files: 10,
+            base_artifacts: None,
+            head_artifacts: None,
+            env,
+        };
+        assert!(Refs::resolve(dir.path(), &args(Some("typo"), CiEnv::default())).is_err());
+
+        let env = CiEnv {
+            merge_request_base: Some(shas[0].clone()),
+            commit: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            ..CiEnv::default()
+        };
+        let refs = Refs::resolve(
+            dir.path(),
+            &Args {
+                base: None,
+                ..args(None, env)
+            },
+        )
+        .unwrap();
+        assert_eq!(refs.head, shas[1]);
     }
 }

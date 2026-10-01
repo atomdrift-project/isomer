@@ -18,10 +18,17 @@ path = "src/lib.rs"
 [[bin]]
 name = "isomer"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# The command line: clap's derives on the enums its flags parse into. A caller
+# that never parses argv can build the library without it.
+cli = ["dep:clap"]
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive", "wrap_help"] }
+clap = { version = "4", features = ["derive", "env", "wrap_help"], optional = true }
 # default-features = false drops cleave's jemalloc default (matches scan).
 # The git source is declared without a rev, like scan's dependencies; the
 # resolved commit remains pinned in Cargo.lock and cargo update advances it.
@@ -29,18 +36,29 @@ cleave = { git = "https://github.com/atomdrift-project/cleave.git", default-feat
 # Same major as cleave's, so the theme's painters and our override agree on
 # one global colorize state.
 colored = "3.1"
+# Diagnostics — an axis that degraded, an input that was skipped — go through
+# the facade, so the binary prints them and a library caller routes them.
+log = "0.4"
 # Identity types, for the signer/publisher delta. Same source as cleave/scan
 # so it unifies to one version in the graph.
 filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
+# Package URLs are built with fletch's canonical encoder rather than by string
+# formatting, so every coordinate isomer compares is spelled one way. Same
+# source as scan's, so it unifies to the commit Cargo.lock already pins.
+fletch = { git = "https://github.com/atomdrift-project/fletch.git" }
 serde = { version = "1", features = ["derive"] }
 # `raw_value` lets a judgement carry its JSON envelope pre-serialized, so a
 # caller embedding it in a larger document neither parses nor re-encodes it.
 serde_json = { version = "1", features = ["raw_value"] }
 node-semver = "2.2"
+# SARIF artifact URIs must be percent-encoded; already in the graph via url.
+percent-encoding = "2"
+# Terminal columns: CJK and emoji are two wide. Already in the graph.
+unicode-width = "0.2"
 
 # atomdrift-scan (lib name `scan`) supplies the azoth ML model for risk
-# scoring each side of the diff, and will later drive purl/oci fetching,
-# bloom skipping, and hopper mirroring. The resolved commit is pinned in
+# scoring each side of the diff, the trait and model bundles, and the one-shot
+# registry fetch behind `purl` and `oci`. The resolved commit is pinned in
 # Cargo.lock and advances with cargo update, like cleave above.
 atomdrift-scan = { git = "https://github.com/atomdrift-project/scan.git" }
 
@@ -112,8 +130,7 @@ debug = "line-tables-only"
 # Optimize every dependency in debug builds, isomer's own code excepted. A
 # debug cleave spends ~13s per invocation parsing traits and compiling regexes
 # before it looks at the first byte — 11x the release binary — which makes
-# `cargo run` and the integration tests (they spawn target/debug/isomer)
-# painful. Dependencies compile once and cache, so this is paid on the first
+# `cargo run` painful. Dependencies compile once and cache, so this is paid on the first
 # build only, while edits to src/ still relink in a second or two.
 [profile.dev.package."*"]
 opt-level = 3
@@ -163,11 +180,3 @@ incremental = true
 # cleave/scan; remove when a crates.io release lands.
 tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
-
-# Temporary development override: exercise the local extraction changes across
-# Isomer, Cleave, and scan. Replace with a published git pin before release.
-
-# Temporary development override: use the local fletch checkout, whose range
-# and lockfile resolution APIs are required by the local scan checkout.
-
-# Exercise local archive-cache and proximity-evidence fixes during the audit.

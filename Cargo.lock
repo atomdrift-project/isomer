@@ -2712,10 +2712,14 @@ dependencies = [
  "cleave",
  "colored",
  "filefacts",
+ "fletch",
+ "log",
  "node-semver",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tempfile",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]

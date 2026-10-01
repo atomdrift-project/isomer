@@ -6,8 +6,8 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
-use scan::interpret::InterpretConfig;
+use anyhow::{Context, Result, bail};
+use scan::interpret::{InterpretConfig, LlmEndpoint};
 
 use crate::Severity;
 use crate::options::Options;
@@ -47,29 +47,42 @@ pub struct Interpretation {
     pub nature: String,
     /// The model that answered.
     pub model: String,
+    /// [`Self::verdict`] read once, when the reply was parsed.
+    #[serde(skip)]
+    severity: Severity,
 }
 
 impl Interpretation {
-    /// The model's `verdict` as a detection signal: `malicious` is a hostile
-    /// call, `suspicious` a high one, anything else (benign, empty, unparsed)
-    /// no signal. Only ever *raises* the hand-coded verdict — see the fold in
-    /// [`crate::analysis::Analysis::new`].
-    #[must_use]
-    pub fn severity(&self) -> Severity {
-        match self.verdict.trim().to_ascii_lowercase().as_str() {
+    fn new(verdict: String, nature: String, model: &str) -> Self {
+        let severity = match verdict.trim().to_ascii_lowercase().as_str() {
             "malicious" => Severity::Critical,
             "suspicious" => Severity::High,
             _ => Severity::None,
+        };
+        Self {
+            verdict,
+            nature,
+            model: model.to_owned(),
+            severity,
         }
+    }
+
+    /// The model's `verdict` as a detection signal: `malicious` is a hostile
+    /// call, `suspicious` a high one, anything else (benign, empty, unparsed)
+    /// no signal. Only ever *raises* the hand-coded verdict — see the fold in
+    /// in `Analysis::interpret`.
+    #[must_use]
+    pub fn severity(&self) -> Severity {
+        self.severity
     }
 
     /// The ML-risk floor this verdict implies, so an escalated call pulls the
     /// risk bar into the matching band (malware ≥ 0.90, suspicious ≥ 0.50)
     /// rather than leaving the number below the verdict. `0.0` = no floor.
     pub(crate) fn risk_floor(&self) -> f32 {
-        match self.severity() {
-            Severity::Critical => 0.90,
-            Severity::High => 0.50,
+        match self.severity {
+            Severity::Critical => crate::analysis::MALWARE_BAND,
+            Severity::High => crate::analysis::SUSPICIOUS_BAND,
             _ => 0.0,
         }
     }
@@ -84,68 +97,98 @@ impl Interpretation {
 /// checks matters: [`config`] can autodetect the model, which is a round trip,
 /// and a run with nothing to say must not probe the endpoint.
 pub(crate) fn requested(opts: &Options) -> bool {
-    !opts.offline && (opts.llm.is_some() || std::env::var("ISOMER_LLM").is_ok())
+    !opts.offline && opts.llm.is_some()
 }
 
-/// Build the LLM config from `--llm` (or `ISOMER_LLM`) and the `--llm-*` flags.
-/// `None` when interpretation was not requested. The model is autodetected from
-/// the endpoint when `--llm-model` is not pinned.
-pub(crate) fn config(opts: &Options) -> Option<InterpretConfig> {
-    // `--offline` promises no LLM, and it has to be enforced here rather than at
-    // the call site: model autodetection below is itself a network round trip,
-    // and `ISOMER_LLM` in the environment would otherwise reach the endpoint
-    // with no flag on the command line at all.
+/// Build the LLM config from [`Options::llm`] and the `llm_*` settings.
+///
+/// `Ok(None)` when interpretation was not requested; an error when it was but
+/// no endpoint is usable. The target resolves through scan's own reading of
+/// `--llm` — `local`, `openrouter`, or a base URL, comma-separated for a
+/// failover chain — so the two tools accept the same spellings. A model that
+/// is not pinned is asked of the endpoint.
+pub(crate) fn config(opts: &Options) -> Result<Option<InterpretConfig>> {
+    use scan::interpret::{DEFAULT_BASE_URL, DEFAULT_TIMEOUT_SECS, llm_models, llm_targets};
+
+    // `--offline` promises no LLM, and it has to be enforced here rather than
+    // at the call site: model autodetection below is itself a network round
+    // trip.
     if opts.offline {
-        return None;
+        return Ok(None);
     }
-    let target = opts
-        .llm
-        .clone()
-        .or_else(|| std::env::var("ISOMER_LLM").ok())?;
-    let base_url = match target.trim() {
-        "" | "local" => scan::interpret::DEFAULT_BASE_URL.to_string(),
-        url => url.to_string(),
+    let Some(target) = opts.llm.as_deref() else {
+        return Ok(None);
     };
-    let api_key = opts
-        .llm_key
-        .clone()
-        .or_else(|| std::env::var("ISOMER_LLM_KEY").ok())
-        .filter(|k| !k.is_empty());
-    let pinned = opts
-        .llm_model
-        .clone()
-        .or_else(|| std::env::var("ISOMER_LLM_MODEL").ok());
+    // An empty target is the bare flag: the local endpoint.
+    let targets = if target.trim().is_empty() {
+        vec![DEFAULT_BASE_URL.to_owned()]
+    } else {
+        llm_targets(target)
+    };
+    if targets.is_empty() {
+        bail!("--llm (env: ISOMER_LLM) names no endpoint");
+    }
+    let models = llm_models(opts.llm_model.as_deref(), targets.len());
+    let api_key = opts.llm_key.as_ref().map(|k| k.expose().to_owned());
+
+    // One endpoint must work; the rest are a cushion. A problem with the only
+    // endpoint is the run's error; with one of several it costs that entry.
+    let single = targets.len() == 1;
+    let mut endpoints = Vec::with_capacity(targets.len());
+    for (base_url, pinned) in targets.into_iter().zip(models) {
+        match endpoint(base_url, pinned, api_key.clone()) {
+            Ok(endpoint) => endpoints.push(endpoint),
+            Err(e) if single => return Err(e),
+            Err(e) => log::warn!("skipping LLM endpoint: {e:#}"),
+        }
+    }
+    let mut endpoints = endpoints.into_iter();
+    let primary = endpoints
+        .next()
+        .context("no usable endpoint in --llm (env: ISOMER_LLM)")?;
+    Ok(Some(InterpretConfig {
+        base_url: primary.base_url,
+        model: primary.model,
+        api_key: primary.api_key,
+        timeout: Duration::from_secs(opts.llm_timeout.unwrap_or(DEFAULT_TIMEOUT_SECS)),
+        fallbacks: endpoints.collect(),
+        ..InterpretConfig::default()
+    }))
+}
+
+/// One resolved endpoint: its model pinned, or asked of it.
+fn endpoint(
+    base_url: String,
+    pinned: Option<String>,
+    api_key: Option<String>,
+) -> Result<LlmEndpoint> {
+    use scan::interpret::{OPENROUTER_DEFAULT_MODEL, discover_model, is_openrouter_endpoint};
+
+    let openrouter = is_openrouter_endpoint(&base_url);
+    if openrouter && api_key.is_none() {
+        bail!("{base_url}: OpenRouter requires a key: --llm-key (env: ISOMER_LLM_KEY)");
+    }
     let model = match pinned {
         Some(model) => model,
-        // scan deliberately has no guessed model name: an explicit value or
-        // the endpoint's advertised model is reliable, while a made-up
-        // fallback only converts discovery failure into a server-side 404.
-        // Discovery's error says which of its several failure modes this was
-        // (unreachable host, a base URL missing its /v1, a rejected key, an
-        // empty model list), and they need different fixes, so report it and
-        // skip interpretation — the LLM read is a best-effort signal, and a
-        // failed chat is already treated the same way.
-        None => match scan::interpret::discover_model(&base_url, api_key.as_deref()) {
-            Ok(model) => model,
-            Err(e) => {
-                eprintln!(
-                    "isomer: no LLM model available from {base_url}: {e:#}. Fix the endpoint, \
-                     or name a model with --llm-model (env: ISOMER_LLM_MODEL)"
-                );
-                return None;
-            }
-        },
+        // OpenRouter's catalog is large and billed, so nothing is guessed from
+        // it; its own `auto` alias picks per request.
+        None if openrouter => OPENROUTER_DEFAULT_MODEL.to_owned(),
+        // scan deliberately has no guessed model name for anything else: an
+        // explicit value or the endpoint's advertised model is reliable,
+        // while a made-up fallback only converts discovery failure into a
+        // server-side 404. Discovery's error says which of its several
+        // failure modes this was, and they need different fixes.
+        None => discover_model(&base_url, api_key.as_deref()).with_context(|| {
+            format!(
+                "no LLM model available from {base_url}. Fix the endpoint, or name a model \
+                 with --llm-model (env: ISOMER_LLM_MODEL)"
+            )
+        })?,
     };
-    let timeout = Duration::from_secs(
-        opts.llm_timeout
-            .unwrap_or(scan::interpret::DEFAULT_TIMEOUT_SECS),
-    );
-    Some(InterpretConfig {
+    Ok(LlmEndpoint {
         base_url,
         model,
         api_key,
-        timeout,
-        ..InterpretConfig::default()
     })
 }
 
@@ -153,6 +196,16 @@ pub(crate) fn config(opts: &Options) -> Option<InterpretConfig> {
 pub(crate) fn interpret(cfg: &InterpretConfig, context: &str) -> Result<Interpretation> {
     let reply = scan::interpret::chat(cfg, SYSTEM_PROMPT, context, MAX_TOKENS)?;
     Ok(parse(&reply, &cfg.model))
+}
+
+/// The reply's expected shape. Both keys optional: a model that drops one is
+/// still read for what it did say.
+#[derive(serde::Deserialize)]
+struct Reply {
+    #[serde(default)]
+    verdict: Option<String>,
+    #[serde(default)]
+    nature: Option<String>,
 }
 
 /// Parse `{verdict, nature}` from the model reply, tolerating extra prose around
@@ -168,22 +221,14 @@ fn parse(reply: &str, model: &str) -> Interpretation {
         .find('{')
         .and_then(|start| reply.get(start..))
         .and_then(|tail| tail.rfind('}').and_then(|end| tail.get(..=end)));
-    if let Some(obj) = json.and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok()) {
-        let field = |k: &str| crate::printable(obj.get(k).and_then(|v| v.as_str()).unwrap_or(""));
-        let nature = field("nature");
+    if let Some(parsed) = json.and_then(|j| serde_json::from_str::<Reply>(j).ok()) {
+        let nature = crate::printable(parsed.nature.as_deref().unwrap_or_default());
         if !nature.is_empty() {
-            return Interpretation {
-                verdict: field("verdict"),
-                nature,
-                model: model.to_string(),
-            };
+            let verdict = crate::printable(parsed.verdict.as_deref().unwrap_or_default());
+            return Interpretation::new(verdict, nature, model);
         }
     }
-    Interpretation {
-        verdict: String::new(),
-        nature: crate::printable(reply.trim()),
-        model: model.to_string(),
-    }
+    Interpretation::new(String::new(), crate::printable(reply.trim()), model)
 }
 
 #[cfg(test)]
@@ -200,6 +245,7 @@ mod tests {
         );
         assert_eq!(i.verdict, "malicious");
         assert_eq!(i.nature, "adds a reverse shell");
+        assert_eq!(i.severity(), Severity::Critical);
     }
 
     #[test]
@@ -227,5 +273,40 @@ mod tests {
             assert_eq!(i.verdict, "");
             assert_eq!(i.nature, reply);
         }
+    }
+
+    /// Targets resolve the way scan resolves them: named aliases, trailing
+    /// slashes, and comma-separated failover chains.
+    #[test]
+    fn llm_targets_follow_scans_spellings() {
+        let opts = |llm: &str, model: &str| Options {
+            llm: Some(llm.to_owned()),
+            llm_model: Some(model.to_owned()),
+            ..Options::default()
+        };
+        let cfg = config(&opts("http://host/v1/", "m")).unwrap().unwrap();
+        assert_eq!(cfg.base_url, "http://host/v1");
+        assert!(cfg.fallbacks.is_empty());
+
+        let cfg = config(&opts("http://a/v1,http://b/v1", "m1,m2"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.base_url, "http://a/v1");
+        assert_eq!(cfg.model, "m1");
+        assert_eq!(cfg.fallbacks.len(), 1);
+        assert_eq!(cfg.fallbacks[0].model, "m2");
+
+        // OpenRouter without a key is a configuration error, not a silent skip.
+        assert!(config(&opts("openrouter", "m")).is_err());
+        // Offline wins over everything.
+        assert!(
+            config(&Options {
+                offline: true,
+                ..opts("local", "m")
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert!(config(&Options::default()).unwrap().is_none());
     }
 }

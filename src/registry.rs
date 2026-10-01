@@ -3,15 +3,19 @@
 //! resolution change. Registry failures remain explicit coverage gaps.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::rc::Rc;
 
+use anyhow::{Context, Result};
 use serde::Serialize;
 
+use crate::purl::Ecosystem;
 use crate::{Severity, analysis::Pair, rubric::severity_from_crit};
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Finding {
     id: String,
-    pub(crate) description: String,
+    pub description: String,
     severity: Severity,
 }
 
@@ -24,11 +28,85 @@ pub(crate) struct Observation {
     document: Option<serde_json::Value>,
 }
 
+/// Which side of the comparison something was read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Side {
+    Before,
+    After,
+}
+
+impl fmt::Display for Side {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Before => "before",
+            Self::After => "after",
+        })
+    }
+}
+
+/// What a registry row is about. Rows pair across the two sides by subject, so
+/// a subject is a value, not a string: replacement pairing and coverage gaps
+/// ask *which manifest* a dependency was declared in, and asking that of a
+/// formatted key meant parsing it back apart.
+///
+/// Displayed — and serialized — as the path-like key the report has always
+/// shown: `<label>/dependency/<member>/<name>`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Subject {
+    /// A package identity the diff itself retained, by diff path.
+    DiffPackage { path: String },
+    /// A package identity a compared file carries, by archive member.
+    Package { label: String, member: String },
+    /// A dependency a compared file's manifest declares; `name` is its
+    /// versionless purl.
+    Dependency {
+        label: String,
+        member: String,
+        name: String,
+    },
+    /// A compared file whose references could not be discovered.
+    Unreadable { label: String, side: Side },
+}
+
+impl Subject {
+    /// The manifest a dependency was declared in — the scope a replacement is
+    /// paired within. `None` for anything that is not a dependency.
+    fn manifest(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Dependency { label, member, .. } => Some((label, member)),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Subject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DiffPackage { path } => write!(f, "package/{path}"),
+            Self::Package { label, member } => write!(f, "{label}/package/{member}"),
+            Self::Dependency {
+                label,
+                member,
+                name,
+            } => write!(f, "{label}/dependency/{member}/{name}"),
+            Self::Unreadable { label, side } => write!(f, "{label} ({side})"),
+        }
+    }
+}
+
+impl Serialize for Subject {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct Comparison {
-    pub subject: String,
-    pub old: Option<Observation>,
-    pub new: Option<Observation>,
+    pub subject: Subject,
+    /// Shared: one coordinate looked up once can stand on several rows, and a
+    /// registry document is too large to copy per row.
+    pub old: Option<Rc<Observation>>,
+    pub new: Option<Rc<Observation>>,
     pub new_severity: Severity,
     pub policy_reason: Option<String>,
 }
@@ -59,15 +137,11 @@ impl Comparison {
     }
 }
 
-/// Whether current registry metadata is consulted at all. `--offline`
-/// forbids the network outright; `--no-follow` keeps it for the artifact
-/// fetch but skips the metadata checks.
-#[must_use]
-pub fn enabled(opts: &crate::options::Options) -> bool {
-    !opts.offline && !opts.no_follow
-}
-
-fn compare(subject: String, old: Option<Observation>, new: Option<Observation>) -> Comparison {
+fn compare(
+    subject: Subject,
+    old: Option<Rc<Observation>>,
+    new: Option<Rc<Observation>>,
+) -> Comparison {
     // A failed baseline lookup cannot establish that a current finding is new.
     let baseline_known = old.as_ref().is_none_or(|o| o.error.is_none());
     let mut prior = BTreeMap::new();
@@ -96,16 +170,21 @@ fn compare(subject: String, old: Option<Observation>, new: Option<Observation>) 
     }
 }
 
+/// Subjects and the coordinate each names, for one side.
+type Coordinates = BTreeMap<Subject, String>;
+
 /// Registry-only following: no dependency payload downloads or URL execution.
 pub(crate) fn audit(
     pairs: &[Pair],
     diff: &cleave::types::DiffReportV1,
     options: &cleave::AnalysisOptions,
 ) -> Vec<Comparison> {
-    let mut old = BTreeMap::new();
-    let mut new = BTreeMap::new();
+    let mut old = Coordinates::new();
+    let mut new = Coordinates::new();
     let mut errors = Vec::new();
-    let mut unknown_baselines = Vec::new();
+    // Compared files whose base side could not be read: nothing they declare
+    // can be judged new.
+    let mut unknown_baselines: BTreeSet<&str> = BTreeSet::new();
     // The diff retains normalized identities even if an archive analysis
     // report omitted its root identity during retention.
     for file in &diff.files {
@@ -115,14 +194,14 @@ pub(crate) fn audit(
                     && let (Some(name), Some(version)) = (&id.name, &id.version)
                     && name.source == "npm.name"
                     && version.source == "npm.version"
+                    && let Ok(purl) =
+                        crate::purl::package(Ecosystem::Npm, &name.value, Some(&version.value))
                 {
                     output.insert(
-                        format!("package/{}", file.path),
-                        format!(
-                            "pkg:npm/{}@{}",
-                            name.value.replace('@', "%40"),
-                            version.value
-                        ),
+                        Subject::DiffPackage {
+                            path: file.path.clone(),
+                        },
+                        purl,
                     );
                 }
             }
@@ -130,39 +209,43 @@ pub(crate) fn audit(
     }
     for pair in pairs {
         for (side, path, output) in [
-            ("before", &pair.old, &mut old),
-            ("after", &pair.new, &mut new),
+            (Side::Before, &pair.old, &mut old),
+            (Side::After, &pair.new, &mut new),
         ] {
             let Some(path) = path else { continue };
             match cleave::analyze_file(path, options) {
                 Ok(report) => collect(&report, &pair.label, output),
                 Err(error) => {
-                    if side == "before" {
-                        unknown_baselines.push(format!("{}/dependency/", pair.label));
+                    if side == Side::Before {
+                        unknown_baselines.insert(&pair.label);
                     }
                     errors.push(compare(
-                        format!("{} ({side})", pair.label),
+                        Subject::Unreadable {
+                            label: pair.label.clone(),
+                            side,
+                        },
                         None,
-                        Some(Observation {
+                        Some(Rc::new(Observation {
                             coordinate: path.display().to_string(),
                             findings: vec![],
                             error: Some(format!(
                                 "could not discover registry references: {error:#}"
                             )),
                             document: None,
-                        }),
+                        })),
                     ));
                 }
             }
         }
     }
-    errors.extend(audit_with(&old, &new, |coordinate| {
+    errors.extend(audit_with(old, &new, |coordinate| {
         lookup(coordinate, options)
     }));
     for row in &mut errors {
-        if unknown_baselines
-            .iter()
-            .any(|prefix| row.subject.starts_with(prefix))
+        if row
+            .subject
+            .manifest()
+            .is_some_and(|(label, _)| unknown_baselines.contains(label))
         {
             row.new_severity = Severity::None;
         }
@@ -171,18 +254,22 @@ pub(crate) fn audit(
 }
 
 fn audit_with(
-    old: &BTreeMap<String, String>,
-    new: &BTreeMap<String, String>,
+    mut old: Coordinates,
+    new: &Coordinates,
     mut lookup: impl FnMut(&str) -> Observation,
 ) -> Vec<Comparison> {
-    let mut old = old.clone();
     pair_replacements(&mut old, new);
-    let mut cache = BTreeMap::new();
+    let mut cache: BTreeMap<&str, Rc<Observation>> = BTreeMap::new();
     for coordinate in old.values().chain(new.values()) {
         cache
-            .entry(coordinate.clone())
-            .or_insert_with(|| lookup(coordinate));
+            .entry(coordinate)
+            .or_insert_with(|| Rc::new(lookup(coordinate)));
     }
+    let observed = |side: &Coordinates, subject: &Subject| {
+        side.get(subject)
+            .and_then(|c| cache.get(c.as_str()))
+            .map(Rc::clone)
+    };
     old.keys()
         .chain(new.keys())
         .collect::<BTreeSet<_>>()
@@ -190,8 +277,8 @@ fn audit_with(
         .map(|subject| {
             compare(
                 subject.clone(),
-                old.get(subject).and_then(|c| cache.get(c)).cloned(),
-                new.get(subject).and_then(|c| cache.get(c)).cloned(),
+                observed(&old, subject),
+                observed(new, subject),
             )
         })
         .collect()
@@ -199,35 +286,45 @@ fn audit_with(
 
 /// Match a single removed/added dependency within the same retained manifest.
 /// Coordinates remain on the observations so the inferred pairing is visible.
-fn pair_replacements(old: &mut BTreeMap<String, String>, new: &BTreeMap<String, String>) {
-    let mut groups: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
-    for (side, map, other) in [(0, &*old, new), (1, new, &*old)] {
-        for subject in map.keys().filter(|key| !other.contains_key(*key)) {
-            if subject.contains("/dependency/")
-                && let Some((manifest, _)) = subject.rsplit_once("/pkg:")
-            {
-                let group = groups.entry(manifest.to_owned()).or_default();
-                if side == 0 {
-                    group.0.push(subject.clone());
-                } else {
-                    group.1.push(subject.clone());
-                }
-            }
+fn pair_replacements(old: &mut Coordinates, new: &Coordinates) {
+    /// One manifest's dependencies present on only one side: removed, added.
+    #[derive(Default)]
+    struct Unpaired<'a> {
+        removed: Vec<&'a Subject>,
+        added: Vec<&'a Subject>,
+    }
+    let mut groups: BTreeMap<(&str, &str), Unpaired<'_>> = BTreeMap::new();
+    for subject in old.keys().filter(|key| !new.contains_key(*key)) {
+        if let Some(manifest) = subject.manifest() {
+            groups.entry(manifest).or_default().removed.push(subject);
         }
     }
-    for (removed, added) in groups.values() {
-        if removed.len() == 1
-            && added.len() == 1
-            && let Some(coordinate) = old.remove(&removed[0])
-        {
-            old.insert(added[0].clone(), coordinate);
+    for subject in new.keys().filter(|key| !old.contains_key(*key)) {
+        if let Some(manifest) = subject.manifest() {
+            groups.entry(manifest).or_default().added.push(subject);
+        }
+    }
+    let moves: Vec<(Subject, Subject)> = groups
+        .into_values()
+        .filter_map(
+            |group| match (group.removed.as_slice(), group.added.as_slice()) {
+                ([removed], [added]) => Some(((*removed).clone(), (*added).clone())),
+                _ => None,
+            },
+        )
+        .collect();
+    for (removed, added) in moves {
+        if let Some(coordinate) = old.remove(&removed) {
+            old.insert(added, coordinate);
         }
     }
 }
 
-fn collect(report: &cleave::AnalysisReport, label: &str, out: &mut BTreeMap<String, String>) {
+fn collect(report: &cleave::AnalysisReport, label: &str, out: &mut Coordinates) {
     for file in &report.files {
-        let member = file.path.split_once("!!").map_or("", |(_, member)| member);
+        let member = crate::member::MemberPath::new(&file.path)
+            .member()
+            .unwrap_or_default();
         // Embedded package identities are authoritative over archive filenames.
         if matches!(
             file.file_type.as_str(),
@@ -235,10 +332,15 @@ fn collect(report: &cleave::AnalysisReport, label: &str, out: &mut BTreeMap<Stri
         ) && let Some(identity) = &file.identity
             && let (Some(name), Some(version)) = (&identity.name, &identity.version)
             && !crate::rubric::filename_only_identity(identity)
+            && let Ok(purl) =
+                crate::purl::package(Ecosystem::Npm, &name.value, Some(&version.value))
         {
             out.insert(
-                format!("{label}/package/{member}"),
-                format!("pkg:npm/{}@{}", name.value, version.value),
+                Subject::Package {
+                    label: label.to_owned(),
+                    member: member.to_owned(),
+                },
+                purl,
             );
         }
         if let Some(facts) = &file.filefacts {
@@ -249,6 +351,8 @@ fn collect(report: &cleave::AnalysisReport, label: &str, out: &mut BTreeMap<Stri
                 if let filefacts::RefLocator::Purl(purl) = &reference.locator {
                     // Restore npm ranges retained in declaration evidence;
                     // filefacts itself emits versionless locators for them.
+                    // A range is not a purl version, so it rides after the `@`
+                    // as written, and `lookup` resolves it before querying.
                     let name = purl
                         .rsplit_once('@')
                         .filter(|(name, _)| !name.ends_with('/'))
@@ -263,11 +367,34 @@ fn collect(report: &cleave::AnalysisReport, label: &str, out: &mut BTreeMap<Stri
                     {
                         coordinate = format!("{purl}@{spec}");
                     }
-                    out.insert(format!("{label}/dependency/{member}/{name}"), coordinate);
+                    out.insert(
+                        Subject::Dependency {
+                            label: label.to_owned(),
+                            member: member.to_owned(),
+                            name: name.to_owned(),
+                        },
+                        coordinate,
+                    );
                 }
             }
         }
     }
+}
+
+/// The registry's version catalogue (npm's packument) for a versionless
+/// package purl, when the registry returned one.
+pub(crate) fn packument(package: &str) -> Option<serde_json::Value> {
+    let (_, sources) =
+        scan::fetch::registry_with_sources(&filefacts::RefLocator::Purl(package.to_owned()));
+    catalogue(&sources)
+}
+
+/// The one retained source document that carries a version catalogue.
+fn catalogue(sources: &[fletch::fetch::RecordedSource]) -> Option<serde_json::Value> {
+    sources
+        .iter()
+        .filter_map(|s| serde_json::from_slice::<serde_json::Value>(&s.bytes).ok())
+        .find(|doc| doc.get("versions").is_some())
 }
 
 fn lookup(coordinate: &str, options: &cleave::AnalysisOptions) -> Observation {
@@ -293,14 +420,9 @@ fn lookup(coordinate: &str, options: &cleave::AnalysisOptions) -> Observation {
         && let Some((package, spec)) = coordinate.rsplit_once('@')
         && node_semver::Version::parse(spec).is_err()
     {
-        let packument = sources
-            .iter()
-            .filter_map(|s| serde_json::from_slice::<serde_json::Value>(&s.bytes).ok())
-            .find(|doc| doc.get("versions").is_some());
-        let resolved = packument
-            .as_ref()
-            .ok_or_else(|| "registry did not retain a version catalogue".to_owned())
-            .and_then(|doc| resolve_npm_spec(spec, doc));
+        let resolved = catalogue(&sources)
+            .context("registry did not retain a version catalogue")
+            .and_then(|doc| resolve_npm_spec(spec, &doc));
         match resolved {
             Ok(version) => {
                 let (resolved, _) = scan::fetch::registry_with_sources(
@@ -312,7 +434,7 @@ fn lookup(coordinate: &str, options: &cleave::AnalysisOptions) -> Observation {
                     observation.error = Some("resolved registry lookup unavailable".to_owned());
                 }
             }
-            Err(error) => observation.error = Some(error),
+            Err(error) => observation.error = Some(format!("{error:#}")),
         }
         if observation.error.is_some() {
             observation.document =
@@ -347,7 +469,9 @@ fn lookup(coordinate: &str, options: &cleave::AnalysisOptions) -> Observation {
     observation
 }
 
-pub(crate) fn resolve_npm_spec(spec: &str, doc: &serde_json::Value) -> Result<String, String> {
+/// The highest published version satisfying an npm `spec` — a dist-tag or a
+/// semver range — in a packument.
+pub(crate) fn resolve_npm_spec(spec: &str, doc: &serde_json::Value) -> Result<String> {
     if let Some(version) = doc
         .get("dist-tags")
         .and_then(|tags| tags.get(spec))
@@ -356,7 +480,7 @@ pub(crate) fn resolve_npm_spec(spec: &str, doc: &serde_json::Value) -> Result<St
         return Ok(version.to_owned());
     }
     let range = node_semver::Range::parse(spec)
-        .map_err(|e| format!("unsupported dependency range {spec:?}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("unsupported dependency range {spec:?}: {e}"))?;
     doc.get("versions")
         .and_then(serde_json::Value::as_object)
         .into_iter()
@@ -369,7 +493,7 @@ pub(crate) fn resolve_npm_spec(spec: &str, doc: &serde_json::Value) -> Result<St
         .filter(|(version, _)| version.satisfies(&range))
         .max_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(_, version)| version.clone())
-        .ok_or_else(|| {
+        .with_context(|| {
             format!("no published version satisfies {spec:?}; historical resolution unknown")
         })
 }
@@ -377,23 +501,73 @@ pub(crate) fn resolve_npm_spec(spec: &str, doc: &serde_json::Value) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::version::{Bump, BumpKind};
+
+    fn dependency(member: &str, name: &str) -> Subject {
+        Subject::Dependency {
+            label: "root".into(),
+            member: member.into(),
+            name: format!("pkg:npm/{name}"),
+        }
+    }
+
+    fn observation(coordinate: &str, id: &str, error: Option<&str>) -> Observation {
+        Observation {
+            coordinate: coordinate.to_owned(),
+            findings: if id.is_empty() {
+                vec![]
+            } else {
+                vec![Finding {
+                    id: id.to_owned(),
+                    description: id.to_owned(),
+                    severity: Severity::High,
+                }]
+            },
+            error: error.map(str::to_owned),
+            document: None,
+        }
+    }
+
+    fn patch() -> Bump {
+        Bump::new(BumpKind::Patch, 1)
+    }
+
+    #[test]
+    fn subjects_display_as_the_paths_the_report_has_always_shown() {
+        assert_eq!(
+            dependency("package.json", "x").to_string(),
+            "root/dependency/package.json/pkg:npm/x"
+        );
+        assert_eq!(
+            Subject::Unreadable {
+                label: "a.tgz".into(),
+                side: Side::Before
+            }
+            .to_string(),
+            "a.tgz (before)"
+        );
+        assert_eq!(
+            serde_json::to_string(&Subject::DiffPackage {
+                path: "<root>".into()
+            })
+            .unwrap(),
+            "\"package/<root>\""
+        );
+    }
 
     #[test]
     fn replacement_registry_availability_is_compared_only_within_one_manifest() {
-        use crate::version::{Bump, BumpKind};
-        let old = BTreeMap::from([(
-            "root/dependency/package.json/pkg:npm/old".into(),
+        let old = Coordinates::from([(
+            dependency("package.json", "old"),
             "pkg:npm/old@1.0.0".into(),
         )]);
         for (manifest, expected) in [
             ("package.json", Severity::High),
             ("nested/package.json", Severity::Medium),
         ] {
-            let new = BTreeMap::from([(
-                format!("root/dependency/{manifest}/pkg:npm/new"),
-                "pkg:npm/new@1.0.0".into(),
-            )]);
-            let mut rows = audit_with(&old, &new, |coordinate| {
+            let new =
+                Coordinates::from([(dependency(manifest, "new"), "pkg:npm/new@1.0.0".into())]);
+            let mut rows = audit_with(old.clone(), &new, |coordinate| {
                 let mut value = observation(
                     coordinate,
                     if coordinate.contains("/new@") {
@@ -409,10 +583,7 @@ mod tests {
                 value
             });
             for row in &mut rows {
-                row.apply_release_policy(Some(Bump {
-                    kind: BumpKind::Patch,
-                    steps: 1,
-                }));
+                row.apply_release_policy(Some(patch()));
             }
             let row = rows.iter().find(|row| row.new.is_some()).unwrap();
             assert_eq!(row.new_severity, expected);
@@ -420,111 +591,114 @@ mod tests {
         }
         let mut ambiguous = old.clone();
         ambiguous.insert(
-            "root/dependency/package.json/pkg:npm/other".into(),
+            dependency("package.json", "other"),
             "pkg:npm/other@1".into(),
         );
-        let new = BTreeMap::from([(
-            "root/dependency/package.json/pkg:npm/new".into(),
-            "pkg:npm/new@1".into(),
-        )]);
+        let new = Coordinates::from([(dependency("package.json", "new"), "pkg:npm/new@1".into())]);
         let original = ambiguous.clone();
         pair_replacements(&mut ambiguous, &new);
         assert_eq!(ambiguous, original);
     }
 
+    /// One row of the patch-policy table, named so a failure says which case.
+    struct PolicyCase {
+        name: &'static str,
+        old: (&'static str, Severity),
+        new: (&'static str, Severity),
+        failed: Option<Side>,
+        kind: BumpKind,
+        expected: Severity,
+    }
+
     #[test]
     fn patch_registry_policy_distinguishes_regression_remediation_and_unknown() {
-        use crate::version::{Bump, BumpKind};
-        for (old_id, old_severity, new_id, new_severity, error_side, kind, expected) in [
-            (
-                "",
-                Severity::None,
-                "version-removed",
-                Severity::Medium,
-                "",
-                BumpKind::Patch,
-                Severity::High,
-            ),
-            (
-                "risk",
-                Severity::Medium,
-                "risk",
-                Severity::High,
-                "",
-                BumpKind::Patch,
-                Severity::High,
-            ),
-            (
-                "risk",
-                Severity::None,
-                "risk",
-                Severity::Medium,
-                "",
-                BumpKind::Patch,
-                Severity::High,
-            ),
-            (
-                "risk",
-                Severity::Medium,
-                "risk",
-                Severity::Medium,
-                "",
-                BumpKind::Patch,
-                Severity::None,
-            ),
-            (
-                "version-removed",
-                Severity::Medium,
-                "",
-                Severity::None,
-                "",
-                BumpKind::Patch,
-                Severity::None,
-            ),
-            (
-                "",
-                Severity::None,
-                "version-removed",
-                Severity::Medium,
-                "old",
-                BumpKind::Patch,
-                Severity::None,
-            ),
-            (
-                "",
-                Severity::None,
-                "version-removed",
-                Severity::Medium,
-                "new",
-                BumpKind::Patch,
-                Severity::None,
-            ),
-            (
-                "",
-                Severity::None,
-                "version-removed",
-                Severity::Medium,
-                "",
-                BumpKind::Minor,
-                Severity::Medium,
-            ),
-        ] {
-            let mut old = observation("old", old_id, (error_side == "old").then_some("timeout"));
-            let mut new = observation("new", new_id, (error_side == "new").then_some("timeout"));
-            for f in &mut old.findings {
-                f.severity = old_severity;
-            }
-            for f in &mut new.findings {
-                f.severity = new_severity;
-            }
-            for subject in ["package/root", "root/dependency/example"] {
-                let mut row = compare(subject.into(), Some(old.clone()), Some(new.clone()));
-                row.apply_release_policy(Some(Bump { kind, steps: 1 }));
-                assert_eq!(
-                    row.new_severity, expected,
-                    "{subject}: {old_id} -> {new_id}, {error_side}, {kind:?}"
-                );
-                assert!(row.severity() >= row.new_severity);
+        use Severity::{High, Medium, None as Clean};
+        let cases = [
+            PolicyCase {
+                name: "patch newly removes a version",
+                old: ("", Clean),
+                new: ("version-removed", Medium),
+                failed: None,
+                kind: BumpKind::Patch,
+                expected: High,
+            },
+            PolicyCase {
+                name: "patch raises an existing finding",
+                old: ("risk", Medium),
+                new: ("risk", High),
+                failed: None,
+                kind: BumpKind::Patch,
+                expected: High,
+            },
+            PolicyCase {
+                name: "patch raises a finding from nothing",
+                old: ("risk", Clean),
+                new: ("risk", Medium),
+                failed: None,
+                kind: BumpKind::Patch,
+                expected: High,
+            },
+            PolicyCase {
+                name: "an unchanged finding is not new",
+                old: ("risk", Medium),
+                new: ("risk", Medium),
+                failed: None,
+                kind: BumpKind::Patch,
+                expected: Clean,
+            },
+            PolicyCase {
+                name: "remediation removes the finding",
+                old: ("version-removed", Medium),
+                new: ("", Clean),
+                failed: None,
+                kind: BumpKind::Patch,
+                expected: Clean,
+            },
+            PolicyCase {
+                name: "an unreadable baseline proves nothing new",
+                old: ("", Clean),
+                new: ("version-removed", Medium),
+                failed: Some(Side::Before),
+                kind: BumpKind::Patch,
+                expected: Clean,
+            },
+            PolicyCase {
+                name: "an unreadable current side proves nothing new",
+                old: ("", Clean),
+                new: ("version-removed", Medium),
+                failed: Some(Side::After),
+                kind: BumpKind::Patch,
+                expected: Clean,
+            },
+            PolicyCase {
+                name: "a minor release is not escalated",
+                old: ("", Clean),
+                new: ("version-removed", Medium),
+                failed: None,
+                kind: BumpKind::Minor,
+                expected: Medium,
+            },
+        ];
+        for case in cases {
+            let side = |(id, severity): (&str, Severity), failed: bool, coordinate: &str| {
+                let mut o = observation(coordinate, id, failed.then_some("timeout"));
+                for f in &mut o.findings {
+                    f.severity = severity;
+                }
+                Rc::new(o)
+            };
+            let old = side(case.old, case.failed == Some(Side::Before), "old");
+            let new = side(case.new, case.failed == Some(Side::After), "new");
+            for subject in [
+                Subject::DiffPackage {
+                    path: "root".into(),
+                },
+                dependency("package.json", "example"),
+            ] {
+                let mut row = compare(subject, Some(Rc::clone(&old)), Some(Rc::clone(&new)));
+                row.apply_release_policy(Some(Bump::new(case.kind, 1)));
+                assert_eq!(row.new_severity, case.expected, "{}", case.name);
+                assert!(row.severity() >= row.new_severity, "{}", case.name);
             }
         }
     }
@@ -546,7 +720,7 @@ mod tests {
             }],
             ..Default::default()
         });
-        let mut collected = BTreeMap::new();
+        let mut collected = Coordinates::new();
         collect(&report, "sample", &mut collected);
         assert_eq!(
             collected.values().collect::<Vec<_>>(),
@@ -565,50 +739,41 @@ mod tests {
         assert!(resolve_npm_spec("not-a-tag", &doc).is_err());
     }
 
-    fn observation(coordinate: &str, id: &str, error: Option<&str>) -> Observation {
-        Observation {
-            coordinate: coordinate.to_owned(),
-            findings: if id.is_empty() {
-                vec![]
-            } else {
-                vec![Finding {
-                    id: id.to_owned(),
-                    description: id.to_owned(),
-                    severity: Severity::High,
-                }]
-            },
-            error: error.map(str::to_owned),
-            document: None,
-        }
-    }
-
     #[test]
     fn shared_range_is_looked_up_once_and_is_not_new_risk() {
-        let side = BTreeMap::from([(
-            "dependency".to_owned(),
+        let side = Coordinates::from([(
+            dependency("package.json", "color-string"),
             "pkg:npm/color-string@^2.0.0".to_owned(),
         )]);
         let mut calls = 0;
-        let rows = audit_with(&side, &side, |purl| {
+        let rows = audit_with(side.clone(), &side, |purl| {
             calls += 1;
             observation(purl, "registry/hostile", None)
         });
         assert_eq!(calls, 1);
         assert_eq!(rows[0].severity(), Severity::High);
         assert_eq!(rows[0].new_severity, Severity::None);
+        // Both sides of the row share the one observation rather than copies.
+        assert!(Rc::ptr_eq(
+            rows[0].old.as_ref().unwrap(),
+            rows[0].new.as_ref().unwrap()
+        ));
     }
 
     #[test]
     fn added_or_changed_coordinate_compares_registry_findings() {
         for id in ["registry/hostile", "registry/yanked", "registry/missing"] {
-            let old = observation("pkg:npm/example@1.0.0", "", None);
-            let new = observation("pkg:npm/example@1.0.1", id, None);
+            let old = Rc::new(observation("pkg:npm/example@1.0.0", "", None));
+            let new = Rc::new(observation("pkg:npm/example@1.0.1", id, None));
+            let package = || Subject::DiffPackage {
+                path: "package".into(),
+            };
             assert_eq!(
-                compare("package".into(), Some(old), Some(new.clone())).new_severity,
+                compare(package(), Some(old), Some(Rc::clone(&new))).new_severity,
                 Severity::High
             );
             assert_eq!(
-                compare("dependency".into(), None, Some(new)).new_severity,
+                compare(dependency("package.json", "example"), None, Some(new)).new_severity,
                 Severity::High
             );
         }
@@ -617,9 +782,9 @@ mod tests {
     #[test]
     fn failed_baseline_is_unknown_not_a_clean_baseline() {
         let result = compare(
-            "dependency".into(),
-            Some(observation("old", "", Some("network failure"))),
-            Some(observation("new", "registry/hostile", None)),
+            dependency("package.json", "example"),
+            Some(Rc::new(observation("old", "", Some("network failure")))),
+            Some(Rc::new(observation("new", "registry/hostile", None))),
         );
         assert_eq!(result.new_severity, Severity::None);
         assert_eq!(result.severity(), Severity::High);

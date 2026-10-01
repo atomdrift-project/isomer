@@ -25,15 +25,22 @@ use cleave::Criticality;
 use cleave::types::{DiffReportV1, FileDiffEntry, TraitChange};
 
 use crate::Severity;
+use crate::taxonomy::{Root, TraitId};
 
-/// The full rubric outcome.
+/// The full rubric outcome. Every severity here is computed from what the
+/// axis holds, never stored beside it: a fact added later — the binary
+/// detector's, say — counts without anyone remembering to raise a total.
 #[derive(Debug)]
 pub(crate) struct Assessment {
-    pub severity: Severity,
     pub behavioral: Behavioral,
     pub signature: Signature,
     pub identity: Identity,
     pub structure: Structure,
+}
+
+/// The worst of a set of severities; `None` for an empty one.
+fn worst(severities: impl Iterator<Item = Severity>) -> Severity {
+    severities.max().unwrap_or(Severity::None)
 }
 
 /// Behavioral capability drift, grouped by *capability class* (execution-hijack,
@@ -42,7 +49,6 @@ pub(crate) struct Assessment {
 /// every ELF, but the *class* `execution-hijack` (the ifunc) is genuinely new.
 #[derive(Debug)]
 pub(crate) struct Behavioral {
-    pub severity: Severity,
     /// Capability classes, worst severity first (then most new traits first).
     pub categories: Vec<Category>,
     /// Capability classes that had *no* trait in the base version — a wholly
@@ -51,6 +57,10 @@ pub(crate) struct Behavioral {
 }
 
 impl Behavioral {
+    pub(crate) fn severity(&self) -> Severity {
+        worst(self.categories.iter().map(|c| c.severity))
+    }
+
     /// True when this category's class is absent from the base.
     pub(crate) fn is_new_category(&self, c: &Category) -> bool {
         self.new_categories.contains(&c.class)
@@ -85,6 +95,15 @@ pub(crate) struct TraitNote {
 }
 
 impl Assessment {
+    /// The worst of the four axes.
+    pub(crate) fn severity(&self) -> Severity {
+        self.behavioral
+            .severity()
+            .max(self.signature.severity())
+            .max(self.identity.severity())
+            .max(self.structure.severity())
+    }
+
     /// Every gained trait id the rubric judged (behavioral plus signature),
     /// for evidence rendering. Borrowed: the ids live in the assessment, and
     /// evidence only ever reads them.
@@ -115,8 +134,8 @@ impl Assessment {
     pub(crate) fn new_severity(&self) -> Severity {
         self.new_behavioral_severity()
             .max(self.new_signature_severity())
-            .max(self.identity.severity)
-            .max(self.structure.severity)
+            .max(self.identity.severity())
+            .max(self.structure.severity())
     }
 
     /// New severity excluding known-signature matches. A remediation release
@@ -126,8 +145,8 @@ impl Assessment {
     /// capability.
     pub(crate) fn new_severity_without_signatures(&self) -> Severity {
         self.new_behavioral_severity()
-            .max(self.identity.severity)
-            .max(self.structure.severity)
+            .max(self.identity.severity())
+            .max(self.structure.severity())
     }
 
     fn new_behavioral_severity(&self) -> Severity {
@@ -154,11 +173,16 @@ impl Assessment {
 /// Known-bad signature matches.
 #[derive(Debug)]
 pub(crate) struct Signature {
-    pub severity: Severity,
     /// A CVE referenced by any matched rule, if present.
     pub cve: Option<String>,
     /// Matched rules, worst first.
     pub ids: Vec<SigMatch>,
+}
+
+impl Signature {
+    pub(crate) fn severity(&self) -> Severity {
+        worst(self.ids.iter().map(|m| m.severity))
+    }
 }
 
 /// One matched known-bad rule.
@@ -178,15 +202,66 @@ pub(crate) struct SigMatch {
 /// excluded; a version bump is not a publisher change).
 #[derive(Debug)]
 pub(crate) struct Identity {
-    pub severity: Severity,
-    /// Field-level changes, e.g. `("signer", "Apple Dev X", "unsigned")`.
+    /// Field-level changes, e.g. `(signer, "Apple Dev X", "unsigned")`.
     pub changes: Vec<IdentityChange>,
+}
+
+impl Identity {
+    pub(crate) fn severity(&self) -> Severity {
+        worst(self.changes.iter().map(IdentityChange::severity))
+    }
+}
+
+/// Which identity claim moved. The field is what the code decides on; its
+/// words are only how it is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityField {
+    /// Every side present before is gone.
+    Identity,
+    /// Author credits replaced, with every party in the `author` role.
+    Authors,
+    /// A party in a publisher or maintainer role replaced.
+    Publisher,
+    Signer,
+    Organization,
+    Producer,
+    TeamId,
+    PublisherId,
+    PackageName,
+}
+
+impl IdentityField {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Authors => "authors",
+            Self::Publisher => "publisher",
+            Self::Signer => "signer",
+            Self::Organization => "organization",
+            Self::Producer => "producer",
+            Self::TeamId => "team id",
+            Self::PublisherId => "publisher id",
+            Self::PackageName => "package name",
+        }
+    }
+}
+
+impl std::fmt::Display for IdentityField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl serde::Serialize for IdentityField {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 /// One identity field that changed old → new.
 #[derive(Debug)]
 pub(crate) struct IdentityChange {
-    pub label: &'static str,
+    pub label: IdentityField,
     pub old: String,
     pub new: String,
 }
@@ -196,7 +271,7 @@ impl IdentityChange {
         // Package author credits are not an authenticated publishing identity.
         // A replacement is worth reviewing, but is not sufficient evidence of
         // a takeover. Preserve the stronger signal when identity is stripped.
-        if self.label == "authors" && !self.new.is_empty() {
+        if self.label == IdentityField::Authors && !self.new.is_empty() {
             Severity::Medium
         } else {
             Severity::High
@@ -228,18 +303,26 @@ impl IdentityChange {
 /// even with no trait or signature firing.
 #[derive(Debug)]
 pub(crate) struct Structure {
-    pub severity: Severity,
     pub facts: Vec<StructFact>,
 }
 
 impl Structure {
+    pub(crate) fn severity(&self) -> Severity {
+        worst(self.facts.iter().map(|f| f.severity))
+    }
+
     /// Whether the change introduced external third-party code — a new runtime
     /// dependency or a new/moved GitHub Action. These supply-chain events are
     /// always worth surfacing, even below the gate threshold.
     pub(crate) fn adds_external_code(&self) -> bool {
         self.facts
             .iter()
-            .any(|f| matches!(f.label, "dependency" | "github action"))
+            .any(|f| matches!(f.label, FactLabel::Dependency | FactLabel::GithubAction))
+    }
+
+    /// Whether the change gained a runtime dependency.
+    pub(crate) fn adds_dependency(&self) -> bool {
+        self.facts.iter().any(|f| f.label == FactLabel::Dependency)
     }
 }
 
@@ -253,12 +336,109 @@ pub(crate) enum FactKind {
     Became,
 }
 
-/// One structural fact, e.g. `("loader dependency", "ld-linux-x86-64.so.2")`.
+impl FactKind {
+    /// The word every renderer uses: `added` or `became`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Became => "became",
+        }
+    }
+
+    /// The terminal's one-character mark: `+` new, `~` altered in place.
+    pub(crate) fn sign(self) -> char {
+        match self {
+            Self::Added => '+',
+            Self::Became => '~',
+        }
+    }
+}
+
+impl serde::Serialize for FactKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// What a structural fact is. Branched on as a value — "is this a gained
+/// dependency?" — and shown as words, which can then be reworded without
+/// moving the SARIF rule id a Security-tab alert is tracked by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FactLabel {
+    LinkerAuditHook,
+    LoaderDependency,
+    IfuncResolvers,
+    WritableExecutable,
+    Imports,
+    HighEntropyRegion,
+    Dependency,
+    GithubAction,
+    BuildIdWithCodeChange,
+    BuildIdWithTraitChurn,
+    WritableExecutableMapping,
+    EntryPointGrafted,
+    LoaderCallbackGrafted,
+}
+
+impl FactLabel {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::LinkerAuditHook => "linker audit hook",
+            Self::LoaderDependency => "loader dependency",
+            Self::IfuncResolvers => "ifunc resolvers",
+            Self::WritableExecutable => "writable+executable",
+            Self::Imports => "imports",
+            Self::HighEntropyRegion => "high-entropy region",
+            Self::Dependency => "dependency",
+            Self::GithubAction => "github action",
+            Self::BuildIdWithCodeChange => "build ID unchanged despite code change",
+            Self::BuildIdWithTraitChurn => "build ID unchanged despite trait churn",
+            Self::WritableExecutableMapping => "writable+executable mapping",
+            Self::EntryPointGrafted => "entry point grafted",
+            Self::LoaderCallbackGrafted => "loader callback grafted",
+        }
+    }
+
+    /// The SARIF rule id. Spelled out rather than derived from the words: a
+    /// Security-tab alert is tracked by rule id, so rewording a label must not
+    /// silently reopen every alert filed under it.
+    pub(crate) fn rule_id(self) -> &'static str {
+        match self {
+            Self::LinkerAuditHook => "structure/linker-audit-hook",
+            Self::LoaderDependency => "structure/loader-dependency",
+            Self::IfuncResolvers => "structure/ifunc-resolvers",
+            Self::WritableExecutable => "structure/writable-executable",
+            Self::Imports => "structure/imports",
+            Self::HighEntropyRegion => "structure/high-entropy-region",
+            Self::Dependency => "structure/dependency",
+            Self::GithubAction => "structure/github-action",
+            Self::BuildIdWithCodeChange => "structure/build-id-unchanged-despite-code-change",
+            Self::BuildIdWithTraitChurn => "structure/build-id-unchanged-despite-trait-churn",
+            Self::WritableExecutableMapping => "structure/writable-executable-mapping",
+            Self::EntryPointGrafted => "structure/entry-point-grafted",
+            Self::LoaderCallbackGrafted => "structure/loader-callback-grafted",
+        }
+    }
+}
+
+impl std::fmt::Display for FactLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl serde::Serialize for FactLabel {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// One structural fact, e.g. `(loader dependency, "ld-linux-x86-64.so.2")`.
 #[derive(Debug)]
 pub(crate) struct StructFact {
     pub severity: Severity,
     pub kind: FactKind,
-    pub label: &'static str,
+    pub label: FactLabel,
     /// The artifact the fact was read from — `name · abi` for a binary image —
     /// when the fact is about one member rather than the whole change. The
     /// terminal lays it out apart from the detail; the prose renderers join
@@ -296,7 +476,9 @@ impl StructFact {
                 .join("; "),
         );
         if let Some(caveat) = self.caveat {
-            s.push_str(&format!(" ({caveat})"));
+            s.push_str(" (");
+            s.push_str(caveat);
+            s.push(')');
         }
         s
     }
@@ -338,7 +520,7 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &HashSet<String>) -> Ass
             if !is_finding(tc.crit) {
                 continue;
             }
-            if is_signature(&tc.id) {
+            if TraitId::new(&tc.id).is_signature() {
                 let sev = severity_from_crit(tc.crit);
                 if sev != Severity::None {
                     sig_ids.push(SigMatch {
@@ -367,8 +549,10 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &HashSet<String>) -> Ass
                     traits: HashMap::new(),
                 });
                 entry.severity = entry.severity.max(sev);
-                entry.namespaces.push(namespace_of(&tc.id));
-                let score = tc.crit.score_weight() as f32 * tc.conf;
+                entry
+                    .namespaces
+                    .push(TraitId::new(&tc.id).path().to_owned());
+                let score = importance(tc.crit, tc.conf);
                 entry
                     .traits
                     .entry(tc.id.clone())
@@ -418,45 +602,16 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &HashSet<String>) -> Ass
         .filter(|c| !base_classes.contains(c))
         .collect();
 
-    let behavioral_sev = categories
-        .iter()
-        .map(|c| c.severity)
-        .max()
-        .unwrap_or(Severity::None);
-    let signature_sev = sig_ids
-        .iter()
-        .map(|s| s.severity)
-        .max()
-        .unwrap_or(Severity::None);
-    let identity_sev = identity_changes
-        .iter()
-        .map(IdentityChange::severity)
-        .max()
-        .unwrap_or(Severity::None);
-
-    let structure = structural_facts(diff);
-    let structure_sev = structure.severity;
-
     Assessment {
-        severity: behavioral_sev
-            .max(signature_sev)
-            .max(identity_sev)
-            .max(structure_sev),
         behavioral: Behavioral {
-            severity: behavioral_sev,
             categories,
             new_categories,
         },
-        signature: Signature {
-            severity: signature_sev,
-            cve,
-            ids: sig_ids,
-        },
+        signature: Signature { cve, ids: sig_ids },
         identity: Identity {
-            severity: identity_sev,
             changes: identity_changes,
         },
-        structure,
+        structure: structural_facts(diff),
     }
 }
 
@@ -578,8 +733,12 @@ fn structural_facts(diff: &DiffReportV1) -> Structure {
         .collect();
 
     use FactKind::{Added, Became};
+    use FactLabel::{
+        Dependency, GithubAction, HighEntropyRegion, IfuncResolvers, Imports, LinkerAuditHook,
+        LoaderDependency, WritableExecutable,
+    };
     let mut facts = Vec::new();
-    let mut push = |severity: Severity, kind: FactKind, label: &'static str, names: &[String]| {
+    let mut push = |severity: Severity, kind: FactKind, label: FactLabel, names: &[String]| {
         if names.is_empty() {
             return;
         }
@@ -600,42 +759,30 @@ fn structural_facts(diff: &DiffReportV1) -> Structure {
         push(
             Severity::High,
             Added,
-            "linker audit hook",
+            LinkerAuditHook,
             &["DT_AUDIT — intercepts symbol resolution".to_string()],
         );
     }
     // A library that gains a *direct* dependency on the dynamic loader is the
     // xz tell — high on its own.
-    push(Severity::High, Added, "loader dependency", &deps);
-    push(Severity::High, Added, "ifunc resolvers", &ifuncs);
-    push(Severity::High, Added, "writable+executable", &rwx_new);
-    push(Severity::High, Became, "writable+executable", &rwx_became);
-    push(Severity::Medium, Added, "imports", &imports);
-    push(Severity::Medium, Added, "high-entropy region", &entropy_new);
-    push(
-        Severity::Medium,
-        Became,
-        "high-entropy region",
-        &entropy_became,
-    );
+    push(Severity::High, Added, LoaderDependency, &deps);
+    push(Severity::High, Added, IfuncResolvers, &ifuncs);
+    push(Severity::High, Added, WritableExecutable, &rwx_new);
+    push(Severity::High, Became, WritableExecutable, &rwx_became);
+    push(Severity::Medium, Added, Imports, &imports);
+    push(Severity::Medium, Added, HighEntropyRegion, &entropy_new);
+    push(Severity::Medium, Became, HighEntropyRegion, &entropy_became);
     // A gained runtime dependency is the supply-chain event isomer exists to
     // surface (event-stream added `flatmap-stream`; node-ipc added
     // `peacenotwar`). Medium: it makes the diff speak so a reviewer sees the
     // new dependency, but stays below the default `--fail-on high` so a routine
     // dependency bump doesn't break CI on its own.
-    push(Severity::Medium, Added, "dependency", &pkg_deps);
+    push(Severity::Medium, Added, Dependency, &pkg_deps);
     // Third-party CI code, same reasoning as a runtime dependency: a new action
     // — or one whose mutable tag was repointed — runs with repo secrets.
-    push(Severity::Medium, Added, "github action", &actions_new);
-    push(Severity::Medium, Became, "github action", &actions_moved);
-    Structure {
-        severity: facts
-            .iter()
-            .map(|f| f.severity)
-            .max()
-            .unwrap_or(Severity::None),
-        facts,
-    }
+    push(Severity::Medium, Added, GithubAction, &actions_new);
+    push(Severity::Medium, Became, GithubAction, &actions_moved);
+    Structure { facts }
 }
 
 /// Shannon-entropy threshold (bits/byte) above which a section reads as packed
@@ -644,10 +791,19 @@ const HIGH_ENTROPY: f64 = 7.2;
 
 /// A section mapped both writable and executable — a self-modifying / runtime
 /// code-generation surface.
+///
+/// cleave spells permissions two ways: ELF sections carry their joined flag
+/// names (`write,alloc,executable`), while PE and Mach-O sections are
+/// projected to a mode string (`rwx`, `r-x`).
 fn is_rwx(perms: &Option<String>) -> bool {
-    perms
-        .as_deref()
-        .is_some_and(|p| p.contains("write") && p.contains("exec"))
+    let Some(perms) = perms.as_deref() else {
+        return false;
+    };
+    if let [b'r' | b'-', w @ (b'w' | b'-'), x @ (b'x' | b'-')] = perms.as_bytes() {
+        return *w == b'w' && *x == b'x';
+    }
+    let has = |names: [&str; 2]| perms.split(',').any(|flag| names.contains(&flag));
+    has(["write", "writable"]) && has(["executable", "execinstr"])
 }
 
 /// The dependency name from a source-package manifest kv path, if the path
@@ -713,43 +869,10 @@ fn gained_traits(file: &FileDiffEntry) -> impl Iterator<Item = (bool, &TraitChan
     let promoted = traits.into_iter().flat_map(|t| {
         t.changed
             .iter()
-            .filter(|c| crit_rank(c.new.crit) > crit_rank(c.old.crit))
+            .filter(|c| c.new.crit.rank() > c.old.crit.rank())
             .map(|c| (false, &c.new))
     });
     added.chain(promoted)
-}
-
-/// Trait namespace: the taxonomy path before `::`, with the leading taxonomy
-/// root stripped so `metadata/binary/linking/runtime::ifunc` reads as
-/// `binary/linking/runtime`. Shared with [`crate::evidence`], so the namespaces
-/// a verdict groups by and the ones its evidence names cannot drift apart.
-pub(crate) fn namespace_of(id: &str) -> String {
-    const ROOTS: &[&str] = &[
-        "metadata",
-        "micro-behaviors",
-        "objectives",
-        "well-known",
-        "third_party",
-    ];
-    let path = id.split("::").next().unwrap_or(id);
-    match path.split_once('/') {
-        Some((root, rest)) if ROOTS.contains(&root) => rest.to_string(),
-        _ => path.to_string(),
-    }
-}
-
-/// The full taxonomy namespace, excluding the unstable local trait ID.
-pub(crate) fn trait_namespace(id: &str) -> &str {
-    id.split_once("::").map_or(id, |(namespace, _)| namespace)
-}
-
-/// Match a hierarchy at a path-component boundary, never inside a local ID.
-pub(crate) fn in_trait_hierarchy(id: &str, hierarchy: &str) -> bool {
-    let namespace = trait_namespace(id);
-    namespace == hierarchy
-        || namespace
-            .strip_prefix(hierarchy)
-            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Meaningful identity changes between two sides. Deliberately excludes
@@ -823,7 +946,7 @@ fn meaningful_identity_changes(
         (Some(o), Some(n)) => (o, n),
         (Some(o), None) => {
             out.push(IdentityChange {
-                label: "identity",
+                label: IdentityField::Identity,
                 old: describe_side(o),
                 new: "removed".into(),
             });
@@ -857,7 +980,7 @@ fn meaningful_identity_changes(
         return out;
     }
 
-    let mut push = |label: &'static str, ov: String, nv: String| {
+    let mut push = |label: IdentityField, ov: String, nv: String| {
         // A previously empty claim becoming populated is metadata recovery,
         // not evidence that the publisher changed. The suspicious direction
         // is populated -> empty or populated -> a different claim.
@@ -890,21 +1013,29 @@ fn meaningful_identity_changes(
             .chain(&n.authors)
             .all(|p| p.role == "author");
         push(
-            if credits_only { "authors" } else { "publisher" },
+            if credits_only {
+                IdentityField::Authors
+            } else {
+                IdentityField::Publisher
+            },
             authors(o),
             authors(n),
         );
     }
-    push("signer", signer(o), signer(n));
+    push(IdentityField::Signer, signer(o), signer(n));
     push(
-        "organization",
+        IdentityField::Organization,
         claim(&o.organization),
         claim(&n.organization),
     );
-    push("producer", claim(&o.producer), claim(&n.producer));
-    push("team id", claim(&o.team_id), claim(&n.team_id));
-    push("publisher id", ids(o), ids(n));
-    push("package name", claim(&o.name), claim(&n.name));
+    push(
+        IdentityField::Producer,
+        claim(&o.producer),
+        claim(&n.producer),
+    );
+    push(IdentityField::TeamId, claim(&o.team_id), claim(&n.team_id));
+    push(IdentityField::PublisherId, ids(o), ids(n));
+    push(IdentityField::PackageName, claim(&o.name), claim(&n.name));
     out
 }
 
@@ -935,28 +1066,19 @@ pub(crate) fn filename_only_identity(identity: &filefacts::Identity) -> bool {
             .as_ref()
             .is_none_or(|claim| claim.source == "file.basename" && !claim.verified)
     };
+    // "Nothing else" is stated as equality with an identity carrying only the
+    // two basename claims, rather than as a field-by-field list: a field
+    // filefacts adds later is then covered without anyone remembering to
+    // extend the list here.
+    let only_the_basename = filefacts::Identity {
+        name: identity.name.clone(),
+        version: identity.version.clone(),
+        ..filefacts::Identity::default()
+    };
     identity.name.is_some()
         && basename_claim(&identity.name)
         && basename_claim(&identity.version)
-        && identity.title.is_none()
-        && identity.identifier.is_none()
-        && identity.project.is_none()
-        && identity.authors.is_empty()
-        && identity.organization.is_none()
-        && identity.producer.is_none()
-        && identity.build_path.is_none()
-        && identity.signer.is_none()
-        && identity.trust == filefacts::Trust::Unsigned
-        && identity.team_id.is_none()
-        && identity.emails.is_empty()
-        && identity.urls.is_empty()
-        && identity.unique_ids.is_empty()
-}
-
-/// Known-bad detection namespaces. A hit means "we recognize this", not "this
-/// behaves badly" — that's the behavioral axis's job.
-fn is_signature(id: &str) -> bool {
-    id.starts_with("third_party/") || id.starts_with("well-known/malware/")
+        && *identity == only_the_basename
 }
 
 /// Whether a criticality tier is worth reporting as a change.
@@ -995,17 +1117,22 @@ pub(crate) fn severity_from_crit(crit: Criticality) -> Severity {
     }
 }
 
-/// Total order over cleave's criticality tiers, worst highest. The enum itself
-/// is not `Ord`, so every comparison in isomer goes through this one ranking.
-pub(crate) fn crit_rank(c: Criticality) -> u8 {
-    match c {
-        Criticality::Hostile => 5,
-        Criticality::Suspicious => 4,
-        Criticality::Notable => 3,
-        Criticality::Baseline => 2,
-        Criticality::Component => 1,
-        Criticality::Exception | Criticality::Filtered => 0,
-    }
+/// A confidence as a multiplier. cleave defaults a trait's confidence when
+/// the trait omits it, so zero means "not stated" rather than "certainly not",
+/// and reads as certain.
+pub(crate) fn effective_conf(conf: f32) -> f32 {
+    if conf > 0.0 { conf } else { 1.0 }
+}
+
+/// How much one trait weighs in a verdict: cleave's criticality weight times
+/// confidence — the ranking cleave's own differential uses. The one formula
+/// behind a category's trait scores, the behavior-shift mass, and the JSON
+/// `score` field, so the three cannot disagree on what a trait is worth.
+pub(crate) fn importance(crit: Criticality, conf: f32) -> f32 {
+    // Lossless: the weights are small integers.
+    #[allow(clippy::cast_precision_loss)]
+    let weight = crit.score_weight() as f32;
+    weight * effective_conf(conf)
 }
 
 /// The capability class a trait belongs to, derived from its taxonomy path.
@@ -1026,20 +1153,19 @@ pub(crate) fn crit_rank(c: Criticality) -> u8 {
 /// capability: the first says what the code *is*, the second that we recognize
 /// it. Both are judged on other axes.
 pub(crate) fn capability_class(id: &str) -> Option<String> {
-    if is_signature(id) {
+    let id = TraitId::new(id);
+    if id.is_signature() {
         return None;
     }
-    let path = id.split("::").next().unwrap_or(id);
-    let (root, rest) = path.split_once('/')?;
+    let (_, rest) = id.namespace().split_once('/')?;
     // Under `objectives/` and `micro-behaviors/` the path *is* the behavior
     // taxonomy, so the path names the capability. Under `metadata/` the path
     // names a structural location and the leaf names the fact — grouping by
     // path alone would file an ifunc resolver alongside the ordinary loader
     // entries every shared object has, and bury the one thing that mattered.
-    if root == "metadata" {
-        let leaf = id.rsplit_once("::").map(|(_, l)| l);
+    if id.root() == Root::Metadata {
         let path: Vec<&str> = rest.split('/').take(3).collect();
-        return Some(match leaf {
+        return Some(match id.leaf() {
             Some(leaf) => format!("{}::{leaf}", path.join("/")),
             None => path.join("/"),
         });
@@ -1047,10 +1173,10 @@ pub(crate) fn capability_class(id: &str) -> Option<String> {
     // Depth per the table above. An unenumerated root falls to the same
     // granularity as `micro-behaviors` rather than being dropped: a new
     // taxonomy branch should surface as a class, not vanish.
-    let depth = match root {
-        "well-known" | "third_party" => return None,
-        "objectives" => 1,
-        _ => 2,
+    let depth = match id.root() {
+        Root::WellKnown | Root::ThirdParty => return None,
+        Root::Objectives => 1,
+        Root::Metadata | Root::MicroBehaviors | Root::Other => 2,
     };
     let class = rest.split('/').take(depth).collect::<Vec<_>>().join("/");
     // A root with nothing under it (`objectives/`) names no capability.
@@ -1068,73 +1194,47 @@ fn humanize(class: &str) -> String {
     }
 }
 
-/// The stable id for a structural fact, e.g. `structure/loader-dependency`.
-/// This is the SARIF rule id, so a Security-tab alert keeps the same identity
-/// across runs and can be tracked or dismissed there.
-pub(crate) fn structure_id(label: &str) -> String {
-    let kebab: String = label
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("structure/{}", kebab.trim_matches('-'))
-}
-
 /// The readable tail of a trait id — the rule name an analyst greps for.
 /// `third_party/elastic/Linux_Trojan_XZBackdoor` reads as
 /// `elastic/Linux_Trojan_XZBackdoor`; a taxonomy id reads as its leaf.
 pub(crate) fn short_name(id: &str) -> String {
-    if let Some((_, leaf)) = id.rsplit_once("::") {
+    let trait_id = TraitId::new(id);
+    if let Some(leaf) = trait_id.leaf() {
         return leaf.to_string();
     }
-    if let Some(rest) = id.strip_prefix("third_party/") {
-        let segs: Vec<&str> = rest.split('/').collect();
-        return match (segs.first(), segs.last()) {
-            (Some(v), Some(l)) if segs.len() > 1 => format!("{v}/{l}"),
-            (Some(v), _) => v.to_string(),
-            _ => rest.to_string(),
+    if trait_id.root() == Root::ThirdParty {
+        let rest = trait_id.path();
+        // The vendor and the rule: first and last segments.
+        return match rest.split_once('/') {
+            Some((vendor, _)) => {
+                format!("{vendor}/{}", rest.rsplit('/').next().unwrap_or(rest))
+            }
+            None => rest.to_string(),
         };
     }
     id.rsplit('/').next().unwrap_or(id).to_string()
 }
 
 /// Pull a `CVE-YYYY-NNNN` out of a trait id that references one in either
-/// `CVE/2024/3094` (path) or `CVE-2024-3094` form.
+/// `CVE/2024/3094` (path) or `CVE-2024-3094` form. Every `CVE` in the id is
+/// tried, so an earlier unrelated `CVE` token cannot hide a real reference.
 fn extract_cve(id: &str) -> Option<String> {
-    let (_, rest) = id.split_once("CVE")?;
-    let sep: &[char] = &['/', '-', '_'];
-    let mut parts = rest.split(|c| sep.contains(&c)).filter(|s| !s.is_empty());
-    let year = parts.next()?;
-    let num = parts.next()?;
-    let ok = year.len() == 4
-        && year.bytes().all(|b| b.is_ascii_digit())
-        && !num.is_empty()
-        && num.bytes().all(|b| b.is_ascii_digit());
-    ok.then(|| format!("CVE-{year}-{num}"))
+    id.match_indices("CVE").find_map(|(at, _)| {
+        let rest = id.get(at + "CVE".len()..)?;
+        let mut parts = rest.split(['/', '-', '_']).filter(|s| !s.is_empty());
+        let year = parts.next()?;
+        let num = parts.next()?;
+        let ok = year.len() == 4
+            && year.bytes().all(|b| b.is_ascii_digit())
+            && !num.is_empty()
+            && num.bytes().all(|b| b.is_ascii_digit());
+        ok.then(|| format!("CVE-{year}-{num}"))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn signatures_are_known_entities_not_behavior_objectives() {
-        assert!(is_signature("third_party/elastic/XZBackdoor"));
-        assert!(is_signature(
-            "well-known/malware/trojan/pegglecrew::pegglecrew-mbr-wiper"
-        ));
-        assert!(!is_signature(
-            "objectives/supply-chain/trojanized/app/installer::unsigned-branded-mbr-wiper"
-        ));
-        assert!(!is_signature(
-            "objectives/supply-chain/hidden-payload/staging::remote-loader"
-        ));
-    }
 
     /// The class comes from the taxonomy, at a depth that suits each root, so
     /// a branch nobody enumerated still gets a class instead of vanishing.
@@ -1201,6 +1301,13 @@ mod tests {
         assert!(!is_rwx(&Some("alloc,executable".into())));
         assert!(!is_rwx(&Some("write,alloc".into())));
         assert!(!is_rwx(&None));
+        // PE and Mach-O sections arrive as mode strings.
+        assert!(is_rwx(&Some("rwx".into())));
+        assert!(is_rwx(&Some("-wx".into())));
+        assert!(!is_rwx(&Some("r-x".into())));
+        assert!(!is_rwx(&Some("rw-".into())));
+        // A flag that merely starts with a permission word is not one.
+        assert!(!is_rwx(&Some("writeback,executable_stack_note".into())));
     }
 
     #[test]
@@ -1264,7 +1371,7 @@ mod tests {
         for identity in [&manifest, &with_publisher] {
             let changes = meaningful_identity_changes(Some(identity), None);
             assert_eq!(changes.len(), 1);
-            assert_eq!(changes[0].label, "identity");
+            assert_eq!(changes[0].label, IdentityField::Identity);
             assert_eq!(changes[0].new, "removed");
         }
     }
@@ -1295,19 +1402,29 @@ mod tests {
         };
         let changes = meaningful_identity_changes(Some(&package), Some(&renamed_package));
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].label, "package name");
+        assert_eq!(changes[0].label, IdentityField::PackageName);
     }
 
     #[test]
     fn namespace_strips_taxonomy_root() {
         assert_eq!(
-            namespace_of("objectives/command-and-control/channel/websocket::sio"),
+            TraitId::new("objectives/command-and-control/channel/websocket::sio").path(),
             "command-and-control/channel/websocket"
         );
         assert_eq!(
-            namespace_of("micro-behaviors/data/encode/xor::x"),
+            TraitId::new("micro-behaviors/data/encode/xor::x").path(),
             "data/encode/xor"
         );
+    }
+
+    #[test]
+    fn short_names_read_as_the_rule_an_analyst_greps_for() {
+        assert_eq!(
+            short_name("third_party/elastic/linux/Linux_Trojan_XZBackdoor"),
+            "elastic/Linux_Trojan_XZBackdoor"
+        );
+        assert_eq!(short_name("third_party/vendor"), "vendor");
+        assert_eq!(short_name("micro-behaviors/process/create::exec"), "exec");
     }
 
     #[test]
@@ -1317,5 +1434,48 @@ mod tests {
             Some("CVE-2024-3094")
         );
         assert_eq!(extract_cve("third_party/elastic/whatever"), None);
+        // A first `CVE` that is not a reference does not hide a later one.
+        assert_eq!(
+            extract_cve("third_party/CVE_scanner/CVE-2021-44228").as_deref(),
+            Some("CVE-2021-44228")
+        );
+    }
+
+    /// The rule ids are a wire contract with code scanning. They are spelled
+    /// out per label; this pins them to the kebab form of the words they were
+    /// once derived from, so no alert filed under an old id is orphaned.
+    #[test]
+    fn structure_rule_ids_are_the_kebab_of_their_labels() {
+        use FactLabel::*;
+        let kebab = |label: &str| {
+            let k: String = label
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            format!("structure/{}", k.trim_matches('-'))
+        };
+        for label in [
+            LinkerAuditHook,
+            LoaderDependency,
+            IfuncResolvers,
+            WritableExecutable,
+            Imports,
+            HighEntropyRegion,
+            Dependency,
+            GithubAction,
+            BuildIdWithCodeChange,
+            BuildIdWithTraitChurn,
+            WritableExecutableMapping,
+            EntryPointGrafted,
+            LoaderCallbackGrafted,
+        ] {
+            assert_eq!(label.rule_id(), kebab(label.as_str()), "{label:?}");
+        }
     }
 }

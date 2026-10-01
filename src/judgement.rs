@@ -1,16 +1,17 @@
 //! Judging one comparison, for a caller that is not a command line.
 //!
-//! [`judge`] is what the `fs` verb does without the printing: it compares two
-//! paths, applies the rubric, and hands back the verdict and the JSON envelope
-//! together. A caller that wants the terminal, SARIF or Markdown renders goes
-//! through [`crate::analysis::Analysis`] as the binary does.
+//! [`judge`] is what the `fs` verb does, with the verdict broken out: it
+//! compares two paths, applies the rubric, and hands back the verdict and the
+//! JSON envelope together. A caller that wants the terminal, SARIF or Markdown
+//! render calls [`crate::fs::run`] with [`Options::format`] set, as the binary
+//! does.
 
+use std::fmt;
 use std::path::Path;
 
-use anyhow::Result;
 use serde_json::value::RawValue;
 
-use crate::analysis::{self, Analysis};
+use crate::analysis::{Comparison, Framing, Verb};
 use crate::llm::Interpretation;
 use crate::options::Options;
 use crate::{Format, Severity};
@@ -23,7 +24,10 @@ use crate::{Format, Severity};
 /// is that after the interpreter has had its say, which it only ever does when
 /// [`Options::llm`] asked for one. A caller that reports the two engines
 /// separately reads both; a caller that just wants the answer reads the second.
+///
+/// Only [`judge`] makes one, so a field added later is not a breaking change.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Judgement {
     /// The verdict for the change, after the interpreter.
     pub severity: Severity,
@@ -57,30 +61,121 @@ pub struct Judgement {
 ///
 /// # Errors
 ///
-/// Returns the underlying failure when either side cannot be analyzed, or
-/// when the envelope cannot be serialized.
-pub fn judge(old: &Path, new: &Path, opts: &Options) -> Result<Judgement> {
-    // Source archives are compared member-by-member; matching the `fs` verb
-    // here keeps a library caller and the command line on one code path.
-    let all_source_members = analysis::is_source_archive(old) && analysis::is_source_archive(new);
-    let options = cleave::AnalysisOptions {
-        all_files: all_source_members,
-        ..cleave::AnalysisOptions::default()
-    };
-    let report = analysis::diff(old, new, &options)?;
-    let mut analysis = Analysis::new("fs", old, new, &options, &report, opts)?;
-    analysis.finish(opts);
+/// [`ErrorKind::Options`] when `opts` cannot be applied, checked before any
+/// analysis runs; [`ErrorKind::Analysis`] when either side cannot be read or
+/// analyzed; [`ErrorKind::Report`] when the envelope cannot be serialized.
+pub fn judge(old: &Path, new: &Path, opts: &Options) -> Result<Judgement, Error> {
+    opts.validate().map_err(Error::of(ErrorKind::Options))?;
+    // The same `Comparison` the `fs` verb runs, so a library caller and the
+    // command line judge a pair identically.
+    let comparison = Comparison::run(old, new).map_err(Error::of(ErrorKind::Analysis))?;
+    let mut analysis = comparison
+        .judge(Verb::Fs, old, new, opts, Framing::default())
+        .map_err(Error::of(ErrorKind::Analysis))?;
 
     // `render` rather than `json` so the two stay one code path: a divergence
     // would give a library caller a different envelope than `--format json`.
-    let json = analysis.render(Format::Json, opts)?;
+    let mut json = analysis
+        .render(Format::Json)
+        .map_err(Error::of(ErrorKind::Report))?;
+    json.truncate(json.trim_end().len());
     Ok(Judgement {
         severity: analysis.verdict,
         deterministic: analysis.deterministic_verdict,
         new_severity: analysis.new_verdict,
-        gated: analysis.gated,
-        clean: analysis.clean,
-        interpretation: analysis.interp.clone(),
-        report: RawValue::from_string(json.trim_end().to_owned())?,
+        gated: analysis.gated(),
+        clean: analysis.clean(),
+        interpretation: analysis.interp.take(),
+        report: RawValue::from_string(json)
+            .map_err(anyhow::Error::from)
+            .map_err(Error::of(ErrorKind::Report))?,
     })
+}
+
+/// Why [`judge`] reached no verdict.
+///
+/// Displays as the outermost message; `{:#}` prints the whole cause chain, and
+/// [`std::error::Error::source`] walks it.
+#[derive(Debug)]
+pub struct Error {
+    kind: ErrorKind,
+    inner: anyhow::Error,
+}
+
+/// What kind of failure an [`Error`] is, for a caller deciding whether to fix
+/// its input, skip the pair, or report a bug.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// The [`Options`] could not be applied — a version override that does
+    /// not parse. Nothing was analyzed.
+    Options,
+    /// A side could not be read or analyzed.
+    Analysis,
+    /// The verdict was reached but could not be serialized.
+    Report,
+}
+
+impl Error {
+    /// What kind of failure this is.
+    #[must_use]
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+
+    fn of(kind: ErrorKind) -> impl Fn(anyhow::Error) -> Self {
+        move |inner| Self { kind, inner }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.inner.source()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bad override is the caller's input, reported as such before either
+    /// path is opened — these two do not exist.
+    #[test]
+    fn a_bad_override_fails_before_any_analysis() {
+        let opts = Options {
+            base_version: Some("not a version".to_owned()),
+            ..Options::default()
+        };
+        let err = judge(
+            Path::new("/nonexistent/old"),
+            Path::new("/nonexistent/new"),
+            &opts,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Options);
+        assert!(err.to_string().contains("--base-version"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_side_is_an_analysis_failure() {
+        let opts = Options {
+            offline: true,
+            ..Options::default()
+        };
+        let err = judge(
+            Path::new("/nonexistent/old"),
+            Path::new("/nonexistent/new"),
+            &opts,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Analysis);
+        // The alternate form carries the whole chain, as `anyhow`'s does.
+        assert!(format!("{err:#}").len() >= err.to_string().len());
+    }
 }

@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 pub(super) fn native_magic(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"\x7fELF") || bytes.starts_with(b"MZ") || macho_magic(bytes)
+    Format::of(bytes).is_some()
 }
 
 fn macho_magic(bytes: &[u8]) -> bool {
@@ -52,7 +52,43 @@ fn abi(v: &Values, keys: &[&str]) -> Result<String> {
         .map(|parts| parts.join("/"))
 }
 
-fn segments(v: &Values, key: &str, elf: bool) -> Result<Vec<Region>> {
+/// The native format an image is in, from its magic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    Elf,
+    Pe,
+    MachO,
+}
+
+impl Format {
+    fn of(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(b"\x7fELF") {
+            Some(Self::Elf)
+        } else if bytes.starts_with(b"MZ") {
+            Some(Self::Pe)
+        } else if macho_magic(bytes) {
+            Some(Self::MachO)
+        } else {
+            None
+        }
+    }
+}
+
+/// What one format's reader extracts, before the validation every format
+/// shares.
+struct Layout {
+    abi: String,
+    entry: u64,
+    build_id: Option<String>,
+    regions: Vec<Region>,
+    /// Executable sections, when the format's section table is trusted for
+    /// them; `None` falls back to executable mappings.
+    code: Option<Vec<Region>>,
+    callbacks: HashSet<u64>,
+}
+
+fn segments(v: &Values, key: &str, format: Format) -> Result<Vec<Region>> {
+    let elf = format == Format::Elf;
     v.get(key)
         .and_then(Value::as_array)
         .context("missing native segment table")?
@@ -68,14 +104,11 @@ fn segments(v: &Values, key: &str, elf: bool) -> Result<Vec<Region>> {
                 .and_then(Value::as_str)
                 .context("missing segment permissions")?;
             Ok(Region {
-                kind: if elf {
-                    s.get("type")
+                loadable: !elf
+                    || s.get("type")
                         .and_then(Value::as_str)
                         .context("missing ELF segment type")?
-                } else {
-                    "load"
-                }
-                .into(),
+                        == "load",
                 address: num("vaddr")?,
                 offset: num("file_offset")?,
                 size: num("file_size")?,
@@ -87,16 +120,16 @@ fn segments(v: &Values, key: &str, elf: bool) -> Result<Vec<Region>> {
         .collect()
 }
 
-fn section_regions(parsed: &ParsedFile<'_>, pe: bool) -> Vec<Region> {
+fn section_regions(parsed: &ParsedFile<'_>, format: Format) -> Vec<Region> {
     parsed
         .sections()
         .iter()
         .map(|s| Region {
-            kind: "load".into(),
+            loadable: true,
             address: s.vaddr,
             offset: s.file_offset,
             // PE raw data includes file-alignment padding beyond VirtualSize.
-            size: if pe && s.vsize > 0 {
+            size: if format == Format::Pe && s.vsize > 0 {
                 s.file_size.min(s.vsize)
             } else {
                 s.file_size
@@ -108,8 +141,8 @@ fn section_regions(parsed: &ParsedFile<'_>, pe: bool) -> Vec<Region> {
         .collect()
 }
 
-fn executable_sections(parsed: &ParsedFile<'_>, pe: bool) -> Option<Vec<Region>> {
-    let code: Vec<_> = section_regions(parsed, pe)
+fn executable_sections(parsed: &ParsedFile<'_>, format: Format) -> Option<Vec<Region>> {
+    let code: Vec<_> = section_regions(parsed, format)
         .into_iter()
         .filter(|s| s.executable && s.size > 0)
         .collect();
@@ -133,105 +166,112 @@ fn callbacks(v: &Values, keys: &[&str], base: u64) -> HashSet<u64> {
         .collect()
 }
 
+fn elf(parsed: &ParsedFile<'_>, v: &Values) -> Result<Layout> {
+    let regions = segments(v, "elf.segments", Format::Elf)?;
+    for r in &regions {
+        ensure!(
+            !r.loadable || r.size <= r.memory_size,
+            "ELF load segment exceeds memory size"
+        );
+    }
+    Ok(Layout {
+        abi: format!(
+            "elf/{}",
+            abi(v, &["elf.machine", "elf.class", "elf.endian", "elf.type"])?
+        ),
+        entry: number(v, "elf.entry")?,
+        build_id: identity(v, "elf.build_id"),
+        regions,
+        code: executable_sections(parsed, Format::Elf),
+        callbacks: callbacks(v, &["elf.init_array", "elf.fini_array"], 0),
+    })
+}
+
+fn pe(parsed: &ParsedFile<'_>, v: &Values) -> Result<Layout> {
+    ensure!(
+        v.get("pe.partial_parse") != Some(&Value::Bool(true)),
+        "partial PE parse"
+    );
+    let build_id = identity(v, "pe.debug.pdb.guid")
+        .zip(v.get("pe.debug.pdb.age").and_then(Value::as_u64))
+        .map(|(guid, age)| format!("pdb:{guid}/{age}"));
+    Ok(Layout {
+        abi: format!("pe/{}", abi(v, &["pe.machine_id", "pe.subsystem_raw"])?),
+        // PE section addresses and entry point are RVAs, callbacks are VAs.
+        entry: number(v, "pe.entry_point")?,
+        build_id,
+        regions: section_regions(parsed, Format::Pe),
+        code: None,
+        callbacks: callbacks(v, &["pe.tls_callbacks"], number(v, "pe.image_base")?),
+    })
+}
+
+fn macho(parsed: &ParsedFile<'_>, v: &Values) -> Result<Layout> {
+    ensure!(
+        v.get("macho.slices").is_none(),
+        "universal image requires slice pairing"
+    );
+    Ok(Layout {
+        abi: format!(
+            "macho/{}",
+            abi(
+                v,
+                &[
+                    "macho.cpu_type_raw",
+                    "macho.cpu_subtype",
+                    "macho.class_bits",
+                    "macho.endian",
+                    "macho.file_type_raw"
+                ]
+            )?
+        ),
+        // filefacts exposes goblin's normalized virtual address here, NOT the
+        // raw LC_MAIN file offset. LC_UNIXTHREAD already contains a VA.
+        entry: number(v, "macho.entry")?,
+        build_id: identity(v, "macho.uuid"),
+        regions: segments(v, "macho.segments", Format::MachO)?,
+        code: executable_sections(parsed, Format::MachO),
+        callbacks: HashSet::new(),
+    })
+}
+
 pub(super) fn inspect(bytes: &[u8]) -> Result<Image<'_>> {
-    ensure!(native_magic(bytes), "unsupported native image");
+    let format = Format::of(bytes).context("unsupported native image")?;
     let _no_disassembly = filefacts::rizin::scoped_disable_current_thread();
     let parsed = filefacts::open(bytes)?;
     let v = parsed.values();
-    let (abi, entry, build_id, regions, code, callbacks) = if bytes.starts_with(b"\x7fELF") {
-        let regions = segments(v, "elf.segments", true)?;
-        for r in &regions {
-            ensure!(
-                r.kind != "load" || r.size <= r.memory_size,
-                "ELF load segment exceeds memory size"
-            );
-        }
-        (
-            format!(
-                "elf/{}",
-                abi(v, &["elf.machine", "elf.class", "elf.endian", "elf.type"])?
-            ),
-            number(v, "elf.entry")?,
-            identity(v, "elf.build_id"),
-            regions,
-            executable_sections(&parsed, false),
-            callbacks(v, &["elf.init_array", "elf.fini_array"], 0),
-        )
-    } else if bytes.starts_with(b"MZ") {
-        ensure!(
-            v.get("pe.partial_parse") != Some(&Value::Bool(true)),
-            "partial PE parse"
-        );
-        let id = identity(v, "pe.debug.pdb.guid")
-            .zip(v.get("pe.debug.pdb.age").and_then(Value::as_u64))
-            .map(|(guid, age)| format!("pdb:{guid}/{age}"));
-        (
-            format!("pe/{}", abi(v, &["pe.machine_id", "pe.subsystem_raw"])?),
-            // PE section addresses and entry point are RVAs, callbacks are VAs.
-            number(v, "pe.entry_point")?,
-            id,
-            section_regions(&parsed, true),
-            None,
-            callbacks(v, &["pe.tls_callbacks"], number(v, "pe.image_base")?),
-        )
-    } else {
-        ensure!(
-            v.get("macho.slices").is_none(),
-            "universal image requires slice pairing"
-        );
-        let regions = segments(v, "macho.segments", false)?;
-        (
-            format!(
-                "macho/{}",
-                abi(
-                    v,
-                    &[
-                        "macho.cpu_type_raw",
-                        "macho.cpu_subtype",
-                        "macho.class_bits",
-                        "macho.endian",
-                        "macho.file_type_raw"
-                    ]
-                )?
-            ),
-            // filefacts exposes goblin's normalized virtual address here, NOT
-            // the raw LC_MAIN file offset. LC_UNIXTHREAD already contains a VA.
-            number(v, "macho.entry")?,
-            identity(v, "macho.uuid"),
-            regions,
-            executable_sections(&parsed, false),
-            HashSet::new(),
-        )
+    let layout = match format {
+        Format::Elf => elf(&parsed, v)?,
+        Format::Pe => pe(&parsed, v)?,
+        Format::MachO => macho(&parsed, v)?,
     };
-    for region in &regions {
+    for region in &layout.regions {
         validate_region(region, bytes)?;
     }
     ensure!(
-        regions.iter().any(|r| r.kind == "load" && r.size > 0),
+        layout.regions.iter().any(|r| r.loadable && r.size > 0),
         "no file-backed load regions"
     );
-    if let Some(code) = &code {
+    if let Some(code) = &layout.code {
         for s in code {
             validate_region(s, bytes)?;
             ensure!(
-                regions.iter().any(|r| r.kind == "load"
-                    && r.executable
-                    && s.address.checked_sub(r.address).is_some_and(|d| {
-                        d.checked_add(s.size).is_some_and(|end| end <= r.size)
-                            && r.offset.checked_add(d) == Some(s.offset)
-                    })),
+                layout
+                    .regions
+                    .iter()
+                    .any(|r| r.loadable && r.executable && r.covers(s)),
                 "code section is outside its executable mapping"
             );
         }
     }
     Ok(Image {
         bytes,
-        abi,
-        entry,
-        build_id,
-        regions,
-        code,
-        callbacks,
+        abi: layout.abi,
+        entry: layout.entry,
+        build_id: layout.build_id,
+        regions: layout.regions,
+        code: layout.code,
+        callbacks: layout.callbacks,
     })
 }
 

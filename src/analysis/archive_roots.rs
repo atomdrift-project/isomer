@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 
 use cleave::types::{DiffReportV1, FileStatus};
 
+use crate::member::MemberPath;
+
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) enum Key {
     Path(String),
@@ -28,13 +30,13 @@ impl Roots {
         let mut declarations: BTreeMap<_, (Vec<String>, Vec<String>)> = BTreeMap::new();
         let mut prefix_counts = BTreeMap::<String, usize>::new();
         for file in &diff.files {
-            let Some((container, member)) = file.path.split_once("!!") else {
+            let Some((container, member)) = MemberPath::new(&file.path).split() else {
                 continue;
             };
             let Some((root, "composer.json")) = member.split_once('/') else {
                 continue;
             };
-            let Some(stem) = super::git_snapshot_root(root) else {
+            let Some(stem) = super::normalize::git_snapshot_root(root) else {
                 continue;
             };
             let prefix = format!("{container}!!{root}");
@@ -100,7 +102,7 @@ impl Roots {
     }
 
     pub(super) fn key(&self, path: &str) -> Key {
-        if let Some((container, member)) = path.split_once("!!")
+        if let Some((container, member)) = MemberPath::new(path).split()
             && let Some((root, suffix)) = member.split_once('/')
             && let Some(package) = self.packages.get(&format!("{container}!!{root}"))
         {
@@ -110,7 +112,7 @@ impl Roots {
                 suffix: suffix.to_string(),
             };
         }
-        Key::Path(super::normalized_member_path(path))
+        Key::Path(super::normalize::normalized_member_path(path))
     }
 }
 
@@ -123,7 +125,8 @@ mod tests {
 
     use super::*;
     use crate::Severity;
-    use crate::analysis::{archive_member_pair, normalized_archive_diff};
+    use crate::analysis::normalize::normalized_archive_diff;
+    use crate::analysis::source::archive_member_pair;
 
     fn file(root: &str, suffix: &str, status: FileStatus) -> FileDiffEntry {
         FileDiffEntry {
@@ -179,7 +182,7 @@ mod tests {
     fn matching_declarations_pair_wrappers_and_recover_literal_source_paths() {
         let raw = fixture();
         let normalized = normalized_archive_diff(&raw);
-        let features = crate::analysis::feature_set(&normalized);
+        let features = crate::json::feature_set(&normalized);
         assert_eq!(features.judged_summary.files_unchanged, 2);
         assert_eq!(features.judged_summary.files_added, 0);
         assert_eq!(features.judged_summary.files_removed, 0);
@@ -197,7 +200,7 @@ mod tests {
             .find(|file| file.path.ends_with("Client.php"))
             .unwrap();
         assert_eq!(
-            archive_member_pair(&raw, source),
+            archive_member_pair(&raw, &Roots::from_diff(&raw), source),
             Some((
                 "client-abcdef1234567/src/Client.php",
                 "acme-client-fedcba9876543/src/Client.php",
@@ -213,12 +216,11 @@ mod tests {
         let mut raw = fixture();
         raw.files[3].scopes.traits = Some(ScopeDiff {
             added: vec![TraitChange {
-                id: "objectives/exfiltration/http::credential-upload".into(),
-                trait_section: "objectives".into(),
-                crit: Criticality::Hostile,
-                conf: 1.0,
-                count: 1,
                 desc: "Uploads credentials".into(),
+                ..crate::testkit::finding(
+                    "objectives/exfiltration/http::credential-upload",
+                    Criticality::Hostile,
+                )
             }],
             ..Default::default()
         });

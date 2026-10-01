@@ -8,13 +8,14 @@
 //! - `1` — findings at or above `--fail-on`
 //! - `2` — operational error (never conflated with findings)
 
+use std::io::{self, Write as _};
 use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
 use isomer::options::Options;
-use isomer::{Format, Gate, Severity, ci, fetch, fs};
+use isomer::{Format, Gate, Outcome, Severity, ci, fetch, fs};
 
 const EXIT_FINDINGS: u8 = 1;
 const EXIT_ERROR: u8 = 2;
@@ -57,18 +58,33 @@ struct Cli {
     #[arg(long, global = true, value_name = "VER")]
     head_version: Option<String>,
 
-    /// Interpret the diff with a small LLM at this OpenAI-compatible base URL
-    /// (env: ISOMER_LLM). Bare `--llm` uses the default local endpoint.
-    #[arg(long, global = true, value_name = "URL", num_args = 0..=1, default_missing_value = "local")]
+    /// Interpret the diff with a small LLM: `local`, `openrouter`, or an
+    /// OpenAI-compatible base URL; comma-separate several for a failover
+    /// chain. Bare `--llm` uses the default local endpoint.
+    #[arg(
+        long,
+        global = true,
+        value_name = "URL",
+        env = "ISOMER_LLM",
+        num_args = 0..=1,
+        default_missing_value = "local"
+    )]
     llm: Option<String>,
 
-    /// Model name for `--llm` (env: ISOMER_LLM_MODEL); autodetected if omitted.
-    #[arg(long, global = true, value_name = "NAME")]
+    /// Model name for `--llm`, one per endpoint when comma-separated;
+    /// autodetected if omitted.
+    #[arg(long, global = true, value_name = "NAME", env = "ISOMER_LLM_MODEL")]
     llm_model: Option<String>,
 
-    /// Bearer token for `--llm` (env: ISOMER_LLM_KEY); omit for local endpoints.
-    #[arg(long, global = true, value_name = "KEY")]
-    llm_key: Option<String>,
+    /// Bearer token for `--llm`; omit for local endpoints.
+    #[arg(
+        long,
+        global = true,
+        value_name = "KEY",
+        env = "ISOMER_LLM_KEY",
+        hide_env_values = true
+    )]
+    llm_key: Option<isomer::options::Secret>,
 
     /// Per-request LLM timeout in seconds.
     #[arg(long, global = true, value_name = "SECS")]
@@ -208,17 +224,68 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    Diagnostics::install();
     disable_analysis_cache_if_requested();
     let cli = Cli::parse();
     cli.color.apply();
-    match run(&cli) {
-        Ok(clean) if clean => ExitCode::SUCCESS,
-        Ok(_) => ExitCode::from(EXIT_FINDINGS),
+    match run(&cli).and_then(|outcome| {
+        write_stdout(&outcome.report)?;
+        Ok(outcome.clean)
+    }) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(EXIT_FINDINGS),
         Err(err) => {
             eprintln!("isomer: {err:#}");
             ExitCode::from(EXIT_ERROR)
         }
     }
+}
+
+/// Broken-pipe-safe write: a closed downstream pipe (e.g. `| head`) is a normal
+/// exit, not a panic. `println!` would panic here.
+fn write_stdout(s: &str) -> anyhow::Result<()> {
+    let mut out = io::stdout().lock();
+    match out.write_all(s.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The library's diagnostics, shown the way the command line always has: one
+/// `isomer: …` line on stderr each.
+///
+/// Only isomer's own records. cleave and its dependencies log through the same
+/// facade, and their internals are not this tool's to narrate.
+#[derive(Debug)]
+struct Diagnostics;
+
+impl Diagnostics {
+    fn install() {
+        static LOGGER: Diagnostics = Diagnostics;
+        // Fails only when a logger is already set, which leaves that one in
+        // charge — the right outcome either way.
+        if log::set_logger(&LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Info);
+        }
+    }
+}
+
+impl log::Log for Diagnostics {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Info
+            && (metadata.target() == "isomer" || metadata.target().starts_with("isomer::"))
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            // Best-effort: a diagnostic that cannot be written must not take
+            // down the run it was only describing.
+            let _ = writeln!(io::stderr().lock(), "isomer: {}", record.args());
+        }
+    }
+
+    fn flush(&self) {}
 }
 
 /// `ISOMER_NO_CACHE=1` disables the analysis-result cache for the run, so a
@@ -238,8 +305,9 @@ fn disable_analysis_cache_if_requested() {
     }
 }
 
-/// Runs the selected verb; returns whether the delta is clean at `--fail-on`.
-fn run(cli: &Cli) -> anyhow::Result<bool> {
+/// Runs the selected verb: its report, and whether the delta is clean at
+/// `--fail-on`.
+fn run(cli: &Cli) -> anyhow::Result<Outcome> {
     refresh_rules(cli);
     let opts = Options::from(cli);
     match &cli.command {
@@ -261,14 +329,13 @@ fn run(cli: &Cli) -> anyhow::Result<bool> {
                 max_files: *max_files,
                 base_artifacts: base_artifacts.clone(),
                 head_artifacts: head_artifacts.clone(),
+                env: ci::CiEnv::from_process(),
             },
         ),
         Command::Fs { old, new } => fs::run(Path::new(old), Path::new(new), &opts),
         Command::Git { .. } => anyhow::bail!("`isomer git` is not implemented yet"),
-        Command::Purl { old, new } => fetch::compare("purl", old, new, &opts),
-        Command::Oci { old, new } => {
-            fetch::compare("oci", &fetch::oci_purl(old), &fetch::oci_purl(new), &opts)
-        }
+        Command::Purl { old, new } => fetch::purl(old, new, &opts),
+        Command::Oci { old, new } => fetch::oci(old, new, &opts),
     }
 }
 
@@ -291,6 +358,15 @@ fn refresh_rules(cli: &Cli) {
         scan::Mode::default(),
         cli.format == Format::Terminal,
     );
+    // The ML model bundle, installed on first use. The library only ever loads
+    // what is installed, so the one network step lives here, behind the same
+    // `--offline` switch; a host that cannot reach the bucket scores without
+    // the model rather than failing.
+    if !cli.offline
+        && let Err(e) = scan::models_repo::model_dir()
+    {
+        eprintln!("isomer: ML model unavailable, risk scoring skipped: {e:#}");
+    }
 }
 
 #[cfg(test)]
@@ -333,7 +409,7 @@ mod tests {
         ] {
             let args = [vec!["isomer"], flags, vec!["fs", "before", "after"]].concat();
             assert_eq!(
-                isomer::registry::enabled(&Options::from(&Cli::try_parse_from(args).unwrap())),
+                Options::from(&Cli::try_parse_from(args).unwrap()).follows_registry(),
                 expected
             );
         }

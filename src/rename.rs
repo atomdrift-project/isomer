@@ -25,7 +25,7 @@
 //! partner could not is still reported as gained.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What a filename is once its volatile tokens are removed: the directory, and
 /// the tokens that survived.
@@ -74,12 +74,12 @@ fn volatile(token: &str) -> bool {
 }
 
 /// The identity of a path, or `None` when it has no volatile token to look
-/// past — in which case only its exact path can match.
-pub(crate) fn identity(path: &str) -> Option<Identity<'_>> {
-    let (dir, name) = match path.rsplit_once('/') {
-        Some((d, n)) => (d, n),
-        None => ("", path),
-    };
+/// past — in which case only its exact path can match. A path that is not
+/// valid UTF-8 has no identity either: its tokens cannot be read, so it is
+/// left to the exact pass rather than guessed at.
+pub(crate) fn identity(path: &Path) -> Option<Identity<'_>> {
+    let dir = path.parent().map_or(Some(""), Path::to_str)?;
+    let name = path.file_name()?.to_str()?;
     let tokens: Vec<&str> = name.split(['.', '-', '_']).collect();
     // The name has to start with something that is not a build number, or
     // `1.2.3.tar.gz` and `4.5.6.tar.gz` would be the same artifact.
@@ -98,33 +98,34 @@ pub(crate) fn identity(path: &str) -> Option<Identity<'_>> {
 /// Returns one entry per pairing, as indices into the two slices. Exact paths
 /// pair first so an unchanged name always beats a normalized one, and every
 /// head path is claimed at most once.
-pub(crate) fn pair(base: &[String], head: &[String]) -> Vec<(usize, usize)> {
-    let mut by_path: HashMap<&str, usize> = HashMap::with_capacity(head.len());
+pub(crate) fn pair(base: &[PathBuf], head: &[PathBuf]) -> Vec<(usize, usize)> {
+    let mut by_path: HashMap<&Path, usize> = HashMap::with_capacity(head.len());
     // Every candidate, not just the first: two builds of the same bundle can
     // sit in one directory, and a claimed candidate must not block the others.
     let mut by_identity: HashMap<Identity<'_>, Vec<usize>> = HashMap::with_capacity(head.len());
     for (i, p) in head.iter().enumerate() {
-        by_path.entry(p.as_str()).or_insert(i);
+        by_path.entry(p.as_path()).or_insert(i);
         if let Some(id) = identity(p) {
             by_identity.entry(id).or_default().push(i);
         }
     }
 
     let mut claimed = vec![false; head.len()];
+    let mut paired = vec![false; base.len()];
     let mut pairs = Vec::new();
     // Exact paths first, across the whole set: a name that did not change must
     // never lose its partner to some other file's normalization.
     for (i, p) in base.iter().enumerate() {
-        if let Some(&j) = by_path.get(p.as_str())
+        if let Some(&j) = by_path.get(p.as_path())
             && !claimed[j]
         {
             claimed[j] = true;
+            paired[i] = true;
             pairs.push((i, j));
         }
     }
-    let paired_base: std::collections::HashSet<usize> = pairs.iter().map(|(i, _)| *i).collect();
     for (i, p) in base.iter().enumerate() {
-        if paired_base.contains(&i) {
+        if paired[i] {
             continue;
         }
         if let Some(id) = identity(p)
@@ -138,22 +139,35 @@ pub(crate) fn pair(base: &[String], head: &[String]) -> Vec<(usize, usize)> {
     pairs
 }
 
-/// Every file under `root`, as paths relative to it, sorted for determinism.
-pub(crate) fn list(root: &Path) -> std::io::Result<Vec<String>> {
-    fn walk(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usize) -> std::io::Result<()> {
-        if depth > 64 {
-            return Ok(());
+/// How deep [`list`] descends before refusing the tree.
+const MAX_DEPTH: usize = 64;
+
+/// Every regular file under `root`, as paths relative to it, sorted for
+/// determinism.
+///
+/// Symlinks are not followed and special files — FIFOs, sockets, devices —
+/// are not listed: opening a FIFO with no writer blocks forever, and none of
+/// them is a build output. Paths stay `PathBuf`s, so a name that is not
+/// UTF-8 is still opened by its real bytes. A tree nested past
+/// [`MAX_DEPTH`] is an error rather than a silently shorter list: the caller
+/// would analyze a subset and report it as the whole.
+pub(crate) fn list(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<PathBuf>, depth: usize) -> std::io::Result<()> {
+        if depth > MAX_DEPTH {
+            return Err(std::io::Error::other(format!(
+                "{} is nested more than {MAX_DEPTH} directories deep",
+                dir.display()
+            )));
         }
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let kind = entry.file_type()?;
-            if kind.is_symlink() {
-                continue;
-            }
             if kind.is_dir() {
                 walk(&entry.path(), base, out, depth + 1)?;
-            } else if let Ok(rel) = entry.path().strip_prefix(base) {
-                out.push(rel.to_string_lossy().into_owned());
+            } else if kind.is_file()
+                && let Ok(rel) = entry.path().strip_prefix(base)
+            {
+                out.push(rel.to_path_buf());
             }
         }
         Ok(())
@@ -169,7 +183,11 @@ mod tests {
     use super::*;
 
     fn id(p: &str) -> Option<Vec<&str>> {
-        identity(p).map(|i| i.stable)
+        identity(Path::new(p)).map(|i| i.stable)
+    }
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
     }
 
     #[test]
@@ -216,8 +234,8 @@ mod tests {
     #[test]
     fn directories_are_part_of_the_identity() {
         assert_ne!(
-            identity("a/main.4f2a1b9c.js"),
-            identity("b/main.d4e5f60a.js")
+            identity(Path::new("a/main.4f2a1b9c.js")),
+            identity(Path::new("b/main.d4e5f60a.js"))
         );
     }
 
@@ -236,14 +254,8 @@ mod tests {
     fn exact_paths_pair_before_normalized_ones() {
         // `main.aaaaaaaa.js` is present on both sides unchanged; it must keep
         // its partner rather than lose it to the other file's normalization.
-        let base = vec![
-            "d/main.aaaaaaaa.js".to_string(),
-            "d/main.bbbbbbbb.js".to_string(),
-        ];
-        let head = vec![
-            "d/main.aaaaaaaa.js".to_string(),
-            "d/main.cccccccc.js".to_string(),
-        ];
+        let base = paths(&["d/main.aaaaaaaa.js", "d/main.bbbbbbbb.js"]);
+        let head = paths(&["d/main.aaaaaaaa.js", "d/main.cccccccc.js"]);
         let mut got = pair(&base, &head);
         got.sort_unstable();
         assert_eq!(got, vec![(0, 0), (1, 1)]);
@@ -252,18 +264,15 @@ mod tests {
     #[test]
     fn each_head_file_is_claimed_once() {
         // Two base files normalize onto one head file; only one may take it.
-        let base = vec![
-            "d/app.11111111.js".to_string(),
-            "d/app.22222222.js".to_string(),
-        ];
-        let head = vec!["d/app.33333333.js".to_string()];
+        let base = paths(&["d/app.11111111.js", "d/app.22222222.js"]);
+        let head = paths(&["d/app.33333333.js"]);
         assert_eq!(pair(&base, &head).len(), 1);
     }
 
     #[test]
     fn unrelated_files_do_not_pair() {
-        let base = vec!["d/alpha.11111111.js".to_string()];
-        let head = vec!["d/beta.22222222.js".to_string()];
+        let base = paths(&["d/alpha.11111111.js"]);
+        let head = paths(&["d/beta.22222222.js"]);
         assert!(pair(&base, &head).is_empty());
     }
 
@@ -280,5 +289,41 @@ mod tests {
         assert!(!volatile("v2"));
         assert!(!volatile("abc")); // too short to be a hash
         assert!(!volatile(""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_skips_special_files_and_keeps_raw_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/a.js"), b"x").unwrap();
+        let raw = std::ffi::OsStr::from_bytes(b"b\xff.js");
+        std::fs::write(dir.path().join(raw), b"x").unwrap();
+        // A FIFO with no writer would block `open` forever.
+        let fifo = dir.path().join("pipe");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::os::unix::fs::symlink(dir.path().join("sub/a.js"), dir.path().join("link")).unwrap();
+
+        let got = list(dir.path()).unwrap();
+        assert_eq!(got, vec![PathBuf::from(raw), PathBuf::from("sub/a.js")]);
+    }
+
+    #[test]
+    fn list_refuses_a_tree_deeper_than_it_will_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deep = dir.path().to_path_buf();
+        for _ in 0..=MAX_DEPTH + 1 {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("f"), b"x").unwrap();
+        assert!(list(dir.path()).is_err());
     }
 }

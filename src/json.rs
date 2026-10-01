@@ -13,9 +13,28 @@
 //! object states the CI exit decision outright — the one thing a pipeline must
 //! read without re-deriving it.
 //!
-//! These are wire structs only; `fs::json` maps the domain types onto them.
+//! The wire structs come first; [`envelope`] maps an [`Analysis`] onto them.
 
+use anyhow::Result;
+use cleave::types::{
+    DiffReportV1, FileDiffEntry, FileStatus, KvChange, MetricChange, ScopeDiff, ScopeDiffs,
+    SectionChange, TraitChange,
+};
 use serde::Serialize;
+
+use crate::Severity;
+use crate::analysis::Analysis;
+use crate::member::MemberPath;
+use crate::version::BumpKind;
+
+/// How one item moved between the two sides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Change {
+    Added,
+    Removed,
+    Changed,
+}
 
 /// Top-level envelope. Generic over the raw report so this module stays
 /// decoupled from cleave's diff types.
@@ -26,7 +45,7 @@ pub(crate) struct Envelope<'a, R: Serialize> {
     /// Producing engine, `isomer/<pkg-version>` (mirrors scan's `eng`).
     pub eng: &'static str,
     /// The isomer surface that produced this report, e.g. `fs`.
-    pub verb: &'static str,
+    pub verb: crate::analysis::Verb,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact: Option<&'a str>,
     pub version: Version<'a>,
@@ -122,7 +141,7 @@ pub(crate) struct FileFeatures<'a> {
     pub path: &'a str,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub file_type: Option<&'a str>,
-    pub status: &'static str,
+    pub status: FileStatus,
     pub archive_depth: usize,
     pub identity_changed: bool,
     pub scopes: FeatureScopes,
@@ -139,7 +158,7 @@ pub(crate) struct FileFeatures<'a> {
 #[derive(Serialize)]
 pub(crate) struct TraitDelta<'a> {
     pub id: &'a str,
-    pub change: &'static str,
+    pub change: Change,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old: Option<TraitSide<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,7 +167,7 @@ pub(crate) struct TraitDelta<'a> {
 
 #[derive(Serialize)]
 pub(crate) struct TraitSide<'a> {
-    pub criticality: &'static str,
+    pub criticality: cleave::Criticality,
     pub confidence: f32,
     /// Criticality weight multiplied by confidence: the same importance used
     /// to rank terminal traits.
@@ -163,7 +182,7 @@ pub(crate) struct TraitSide<'a> {
 #[derive(Serialize)]
 pub(crate) struct ValueDelta<'a> {
     pub path: &'a str,
-    pub change: &'static str,
+    pub change: Change,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old: Option<&'a serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -183,7 +202,7 @@ pub(crate) struct FactDelta<'a> {
     pub path: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     pub namespace: &'a str,
-    pub change: &'static str,
+    pub change: Change,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old: Option<&'a serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -193,7 +212,7 @@ pub(crate) struct FactDelta<'a> {
 #[derive(Serialize)]
 pub(crate) struct SectionDelta<'a> {
     pub name: &'a str,
-    pub change: &'static str,
+    pub change: Change,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old: Option<SectionSide<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,15 +235,19 @@ pub(crate) struct SectionSide<'a> {
 #[derive(Serialize)]
 pub(crate) struct Dep<'a> {
     pub profile: &'a crate::deps::RiskProfile,
+    /// The predecessor's profile, when the dependency replaced one.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_profile: Option<&'a crate::deps::RiskProfile>,
+    /// The predecessor's coordinate, when the dependency replaced one.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline: Option<&'a str>,
-    pub new_severity: &'static str,
+    pub new_severity: Severity,
     pub comparison: &'a str,
     /// The declared coordinate, `peacenotwar@^9.1.3`.
     pub coord: &'a str,
-    pub ecosystem: &'a str,
+    pub ecosystem: crate::purl::Ecosystem,
     /// Worst severity found in the fetched dependency.
-    pub severity: &'static str,
+    pub severity: Severity,
     /// Strongest finding descriptions, worst-first.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub highlights: &'a [String],
@@ -253,8 +276,8 @@ pub(crate) struct Ev<'a> {
     pub member: Option<&'a str>,
     /// `file:line` (text) or `file:0x<offset>` (binary).
     pub location: &'a str,
-    /// The top rule's severity word.
-    pub severity: &'a str,
+    /// The top rule's severity.
+    pub severity: Severity,
     /// The top rule's description.
     pub desc: &'a str,
     pub lines: Vec<EvLine<'a>>,
@@ -289,16 +312,16 @@ pub(crate) struct Version<'a> {
     pub new: Option<&'a str>,
     /// Semver bump class: `major` | `minor` | `patch` | `same` | `downgrade`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bump: Option<&'static str>,
+    pub bump: Option<BumpKind>,
 }
 
 #[derive(Serialize)]
 pub(crate) struct Verdict<'a> {
     /// Overall severity (rubric ∪ current ML risk): the "how bad is it now" axis.
-    pub severity: &'static str,
+    pub severity: Severity,
     /// Change-only severity (newly-introduced risk ∪ an ML-risk jump): the axis
     /// the default `--gate new` acts on.
-    pub new_severity: &'static str,
+    pub new_severity: Severity,
     pub gate: Gate,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub risk: Option<Risk>,
@@ -321,7 +344,7 @@ pub(crate) struct Verdict<'a> {
 /// Reported always, so a passing run shows the headroom it had.
 #[derive(Serialize)]
 pub(crate) struct BehaviorMass {
-    pub severity: &'static str,
+    pub severity: Severity,
     pub mass: f32,
     pub share: f32,
     pub ids_gained: u32,
@@ -348,11 +371,11 @@ pub(crate) struct Ids<'a> {
 #[derive(Serialize)]
 pub(crate) struct Gate {
     /// Which axis the gate reads: `new` (default) or `any`.
-    pub on: &'static str,
+    pub on: crate::Gate,
     /// The `--fail-on` threshold.
-    pub fail_on: &'static str,
+    pub fail_on: Severity,
     /// The severity actually compared against the threshold.
-    pub severity: &'static str,
+    pub severity: Severity,
     /// `true` when the run exits non-zero.
     pub fail: bool,
 }
@@ -378,7 +401,7 @@ pub(crate) struct Prop<'a> {
 
 #[derive(Serialize)]
 pub(crate) struct Behavioral<'a> {
-    pub severity: &'static str,
+    pub severity: Severity,
     pub categories: Vec<Category<'a>>,
 }
 
@@ -387,7 +410,7 @@ pub(crate) struct Category<'a> {
     /// Kebab class key, e.g. `execution-hijack`.
     pub class: &'a str,
     pub label: &'a str,
-    pub severity: &'static str,
+    pub severity: Severity,
     /// The class had no trait in the base version — a wholly new behavior.
     #[serde(rename = "new")]
     pub new_category: bool,
@@ -401,7 +424,7 @@ pub(crate) struct Category<'a> {
 
 #[derive(Serialize)]
 pub(crate) struct Signature<'a> {
-    pub severity: &'static str,
+    pub severity: Severity,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cve: Option<&'a str>,
     pub count: usize,
@@ -414,38 +437,38 @@ pub(crate) struct SigId<'a> {
     /// The rule's human description, when it carries one.
     #[serde(skip_serializing_if = "str::is_empty")]
     pub desc: &'a str,
-    /// Per-signature severity word.
-    pub crit: &'static str,
+    /// Per-signature severity.
+    pub crit: Severity,
     /// Absent on the old side (vs an escalation of an existing match).
     pub new: bool,
 }
 
 #[derive(Serialize)]
 pub(crate) struct Identity<'a> {
-    pub severity: &'static str,
+    pub severity: Severity,
     pub changes: Vec<IdChange<'a>>,
 }
 
 #[derive(Serialize)]
 pub(crate) struct IdChange<'a> {
-    pub field: &'static str,
+    pub field: crate::rubric::IdentityField,
     pub old: &'a str,
     pub new: &'a str,
 }
 
 #[derive(Serialize)]
 pub(crate) struct Structure {
-    pub severity: &'static str,
+    pub severity: Severity,
     pub facts: Vec<Fact>,
 }
 
 #[derive(Serialize)]
 pub(crate) struct Fact {
-    pub severity: &'static str,
+    pub severity: Severity,
     /// `added` for newly-present structure, `became` for existing structure
     /// altered in place.
-    pub change: &'static str,
-    pub label: &'static str,
+    pub change: crate::rubric::FactKind,
+    pub label: crate::rubric::FactLabel,
     pub detail: String,
 }
 
@@ -456,136 +479,491 @@ pub(crate) struct Llm<'a> {
     pub model: &'a str,
 }
 
+// ── mapping ─────────────────────────────────────────────────────────────────
+
+/// Build the `--format json` envelope. Compact and typed, mirroring
+/// `../scan`: a curated `verdict` and its evidence beside the full `raw`
+/// cleave diff.
+pub(crate) fn envelope(analysis: &Analysis<'_>) -> Result<String> {
+    let a = &analysis.assessment;
+    let categories = a
+        .behavioral
+        .categories
+        .iter()
+        .map(|c| Category {
+            class: &c.class,
+            label: &c.label,
+            severity: c.severity,
+            new_category: a.behavioral.is_new_category(c),
+            namespaces: &c.namespaces,
+            new_ids: &c.new_ids,
+            escalated_ids: &c.escalated_ids,
+        })
+        .collect();
+    let sig_ids = a
+        .signature
+        .ids
+        .iter()
+        .map(|m| SigId {
+            id: &m.id,
+            desc: &m.desc,
+            crit: m.severity,
+            new: m.is_new,
+        })
+        .collect();
+    let facts = a
+        .structure
+        .facts
+        .iter()
+        .map(|f| Fact {
+            severity: f.severity,
+            change: f.kind,
+            label: f.label,
+            detail: f.sentence(),
+        })
+        .collect();
+    let changes = a
+        .identity
+        .changes
+        .iter()
+        .map(|c| IdChange {
+            field: c.label,
+            old: &c.old,
+            new: &c.new,
+        })
+        .collect();
+
+    // The proof hunks and the full identity claims — everything the UI and
+    // the CLI cache need to redraw without re-reading the artifact.
+    let hunks = analysis.hunks(usize::MAX);
+    let evidence = hunks
+        .iter()
+        .map(|h| Ev {
+            member: h.member.as_deref(),
+            location: &h.location,
+            severity: h.severity,
+            desc: &h.desc,
+            lines: h
+                .lines
+                .iter()
+                .map(|l| EvLine {
+                    locator: &l.locator,
+                    text: &l.text,
+                    added: l.added.as_flag(),
+                    is_match: l.is_match,
+                })
+                .collect(),
+        })
+        .collect();
+    // The root describes the artifact itself, so it is asked first — the
+    // same ordering `Naming::resolve` uses — before any member's identity.
+    let provenance = analysis
+        .diff
+        .files
+        .iter()
+        .filter(|f| MemberPath::new(&f.path).is_root())
+        .chain(analysis.diff.files.iter())
+        .find_map(|f| f.identity.as_ref())
+        .map_or((None, None), |idd| (idd.old.as_ref(), idd.new.as_ref()));
+    let mut features = feature_set(analysis.display_diff());
+    features.trait_shift = Some(analysis.shift.clone());
+
+    let envelope = Envelope {
+        v: "2",
+        eng: concat!("isomer/", env!("CARGO_PKG_VERSION")),
+        verb: analysis.verb,
+        artifact: (!analysis.naming.name.is_empty()).then_some(analysis.naming.name.as_str()),
+        version: Version {
+            old: analysis.naming.old.as_ref().map(|v| v.raw.as_str()),
+            new: analysis.naming.new.as_ref().map(|v| v.raw.as_str()),
+            bump: analysis.naming.bump.map(|b| b.kind),
+        },
+        provenance: Provenance {
+            old: provenance.0,
+            new: provenance.1,
+        },
+        verdict: Verdict {
+            severity: analysis.verdict,
+            new_severity: analysis.new_verdict,
+            gate: Gate {
+                on: analysis.gate(),
+                fail_on: analysis.fail_on(),
+                severity: analysis.gated(),
+                fail: !analysis.clean(),
+            },
+            risk: analysis.shown_risk().map(|r| Risk {
+                old: r.old,
+                new: r.new,
+                delta: r.delta(),
+                new_classification: r.new_classification.to_string(),
+                model: if analysis.risk_llm_raised() {
+                    "azoth+llm"
+                } else {
+                    "azoth"
+                },
+            }),
+            proportionality: Prop {
+                disproportionate: analysis.prop.drift.is_disproportionate(),
+                note: analysis.prop.drift.note(),
+                skew: analysis.prop.skew.as_deref(),
+            },
+            behavioral: Behavioral {
+                severity: a.behavioral.severity(),
+                categories,
+            },
+            signature: Signature {
+                severity: a.signature.severity(),
+                cve: a.signature.cve.as_deref(),
+                count: a.signature.ids.len(),
+                ids: sig_ids,
+            },
+            identity: Identity {
+                severity: a.identity.severity(),
+                changes,
+            },
+            frameworks: Frameworks {
+                attack: Ids {
+                    new: analysis.survey.attack.gained(),
+                    removed: analysis.survey.attack.lost(),
+                    unchanged: analysis.survey.attack.kept(),
+                },
+                mbc: Ids {
+                    new: analysis.survey.mbc.gained(),
+                    removed: analysis.survey.mbc.lost(),
+                    unchanged: analysis.survey.mbc.kept(),
+                },
+            },
+            structure: Structure {
+                severity: a.structure.severity(),
+                facts,
+            },
+            behavior_mass: BehaviorMass {
+                severity: analysis.behavior_mass,
+                mass: analysis.shift.injected_mass(),
+                share: analysis.shift.injected_share(),
+                ids_gained: analysis.shift.injected_ids(),
+                id_share: analysis.shift.injected_id_share(),
+            },
+        },
+        features,
+        evidence,
+        deps: analysis
+            .deps
+            .iter()
+            .map(|d| Dep {
+                profile: &d.risk,
+                baseline_profile: d.baseline_risk.as_ref(),
+                coord: &d.coord,
+                ecosystem: d.ecosystem,
+                severity: d.severity,
+                highlights: &d.highlights,
+                note: d.note.as_deref(),
+                baseline: d.baseline.as_deref(),
+                new_severity: d.new_severity,
+                comparison: &d.comparison,
+            })
+            .collect(),
+        llm: analysis.interp.as_ref().map(|i| Llm {
+            nature: &i.nature,
+            verdict: &i.verdict,
+            model: &i.model,
+        }),
+        raw: analysis.report,
+        registry: &analysis.registry,
+    };
+    Ok(serde_json::to_string(&envelope)?)
+}
+
+/// Convert Cleave's complete judged differential into a compact, stable
+/// feature record. This intentionally has no display cap: terminal rendering
+/// is the only consumer allowed to discard low-importance rows.
+pub(crate) fn feature_set(diff: &DiffReportV1) -> FeatureSet<'_> {
+    let summary = &diff.summary;
+    let compared = summary.files_added
+        + summary.files_removed
+        + summary.files_changed
+        + summary.files_unchanged;
+    FeatureSet {
+        judged_summary: diff.summary.clone(),
+        trait_shift: None,
+        v: "1",
+        topology: Topology {
+            added: summary.files_added,
+            removed: summary.files_removed,
+            changed: summary.files_changed,
+            unchanged: summary.files_unchanged,
+            compared,
+        },
+        scopes: feature_scopes(&diff.scopes),
+        files: diff.files.iter().map(file_features).collect(),
+    }
+}
+
+fn feature_scopes(scopes: &ScopeDiffs) -> FeatureScopes {
+    FeatureScopes {
+        traits: scopes.traits.as_ref().map(scope_stats),
+        metrics: scopes.metrics.as_ref().map(scope_stats),
+        facts: scopes.kv.as_ref().map(scope_stats),
+        symbols: scopes.symbols.as_ref().map(scope_stats),
+        strings: scopes.strings.as_ref().map(scope_stats),
+        sections: scopes.sections.as_ref().map(scope_stats),
+    }
+}
+
+fn scope_stats<T>(scope: &ScopeDiff<T>) -> ScopeStats {
+    ScopeStats {
+        added: scope.added.len(),
+        removed: scope.removed.len(),
+        changed: scope.changed.len(),
+        old_count: scope.old_count,
+        new_count: scope.new_count,
+        old_weight: scope.old_weight,
+        new_weight: scope.new_weight,
+        change_weight: scope.change_weight,
+        roc: scope.roc,
+        truncated: scope.truncated,
+    }
+}
+
+fn file_features(file: &FileDiffEntry) -> FileFeatures<'_> {
+    FileFeatures {
+        path: &file.path,
+        file_type: file.file_type.as_deref(),
+        status: file.status,
+        archive_depth: crate::member::MemberPath::new(&file.path).depth(),
+        identity_changed: file.identity.as_ref().is_some_and(|id| id.changed),
+        scopes: feature_scopes(&file.scopes),
+        traits: trait_features(file.scopes.traits.as_ref()),
+        metrics: metric_features(file.scopes.metrics.as_ref()),
+        facts: fact_features(file.scopes.kv.as_ref()),
+        sections: section_features(file.scopes.sections.as_ref()),
+    }
+}
+
+fn trait_side(t: &TraitChange) -> TraitSide<'_> {
+    TraitSide {
+        criticality: t.crit,
+        confidence: t.conf,
+        score: crate::rubric::importance(t.crit, t.conf),
+        count: t.count,
+        description: &t.desc,
+    }
+}
+
+fn trait_features(scope: Option<&ScopeDiff<TraitChange>>) -> Vec<TraitDelta<'_>> {
+    use TraitDelta;
+
+    let Some(scope) = scope else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(scope.added.len() + scope.removed.len() + scope.changed.len());
+    out.extend(scope.added.iter().map(|t| TraitDelta {
+        id: &t.id,
+        change: Change::Added,
+        old: None,
+        new: Some(trait_side(t)),
+    }));
+    out.extend(scope.removed.iter().map(|t| TraitDelta {
+        id: &t.id,
+        change: Change::Removed,
+        old: Some(trait_side(t)),
+        new: None,
+    }));
+    out.extend(scope.changed.iter().map(|t| TraitDelta {
+        id: &t.new.id,
+        change: Change::Changed,
+        old: Some(trait_side(&t.old)),
+        new: Some(trait_side(&t.new)),
+    }));
+    out
+}
+
+/// How far a numeric value moved, three ways.
+#[derive(Debug, PartialEq)]
+struct NumericDelta {
+    /// Signed change; an addition counts from zero, a removal to zero.
+    delta: Option<f64>,
+    absolute: Option<f64>,
+    /// Signed change relative to `abs(old)`; undefined from zero.
+    relative: Option<f64>,
+}
+
+fn numeric_delta(old: Option<f64>, new: Option<f64>) -> NumericDelta {
+    let delta = match (old, new) {
+        (Some(old), Some(new)) => Some(new - old),
+        (None, Some(new)) => Some(new),
+        (Some(old), None) => Some(-old),
+        (None, None) => None,
+    };
+    NumericDelta {
+        delta,
+        absolute: delta.map(f64::abs),
+        relative: match (old, new) {
+            (Some(old), Some(new)) if old != 0.0 => Some((new - old) / old.abs()),
+            _ => None,
+        },
+    }
+}
+
+fn value_delta<'a>(
+    path: &'a str,
+    change: Change,
+    old: Option<&'a serde_json::Value>,
+    new: Option<&'a serde_json::Value>,
+) -> ValueDelta<'a> {
+    let moved = numeric_delta(
+        old.and_then(serde_json::Value::as_f64),
+        new.and_then(serde_json::Value::as_f64),
+    );
+    ValueDelta {
+        path,
+        change,
+        old,
+        new,
+        delta: moved.delta,
+        absolute_delta: moved.absolute,
+        relative_delta: moved.relative,
+    }
+}
+
+fn metric_features(scope: Option<&ScopeDiff<MetricChange>>) -> Vec<ValueDelta<'_>> {
+    let Some(scope) = scope else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(scope.added.len() + scope.removed.len() + scope.changed.len());
+    out.extend(
+        scope
+            .added
+            .iter()
+            .map(|m| value_delta(&m.path, Change::Added, None, Some(&m.value))),
+    );
+    out.extend(
+        scope
+            .removed
+            .iter()
+            .map(|m| value_delta(&m.path, Change::Removed, Some(&m.value), None)),
+    );
+    out.extend(scope.changed.iter().map(|m| {
+        value_delta(
+            &m.new.path,
+            Change::Changed,
+            Some(&m.old.value),
+            Some(&m.new.value),
+        )
+    }));
+    out
+}
+
+fn fact_features(scope: Option<&ScopeDiff<KvChange>>) -> Vec<FactDelta<'_>> {
+    use FactDelta;
+
+    let Some(scope) = scope else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(scope.added.len() + scope.removed.len() + scope.changed.len());
+    out.extend(scope.added.iter().map(|f| FactDelta {
+        path: &f.path,
+        namespace: &f.namespace,
+        change: Change::Added,
+        old: None,
+        new: Some(&f.value),
+    }));
+    out.extend(scope.removed.iter().map(|f| FactDelta {
+        path: &f.path,
+        namespace: &f.namespace,
+        change: Change::Removed,
+        old: Some(&f.value),
+        new: None,
+    }));
+    out.extend(scope.changed.iter().map(|f| FactDelta {
+        path: &f.new.path,
+        namespace: &f.new.namespace,
+        change: Change::Changed,
+        old: Some(&f.old.value),
+        new: Some(&f.new.value),
+    }));
+    out
+}
+
+fn section_side(s: &SectionChange) -> SectionSide<'_> {
+    SectionSide {
+        size: s.size,
+        entropy: s.entropy,
+        permissions: s.permissions.as_deref(),
+    }
+}
+
+fn section_features(scope: Option<&ScopeDiff<SectionChange>>) -> Vec<SectionDelta<'_>> {
+    use SectionDelta;
+
+    let Some(scope) = scope else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(scope.added.len() + scope.removed.len() + scope.changed.len());
+    out.extend(scope.added.iter().map(|s| SectionDelta {
+        name: &s.name,
+        change: Change::Added,
+        old: None,
+        new: Some(section_side(s)),
+        size_delta: Some(i128::from(s.size)),
+        entropy_delta: None,
+    }));
+    out.extend(scope.removed.iter().map(|s| SectionDelta {
+        name: &s.name,
+        change: Change::Removed,
+        old: Some(section_side(s)),
+        new: None,
+        size_delta: Some(-i128::from(s.size)),
+        entropy_delta: None,
+    }));
+    out.extend(scope.changed.iter().map(|s| SectionDelta {
+        name: &s.new.name,
+        change: Change::Changed,
+        old: Some(section_side(&s.old)),
+        new: Some(section_side(&s.new)),
+        size_delta: Some(i128::from(s.new.size) - i128::from(s.old.size)),
+        entropy_delta: Some(s.new.entropy - s.old.entropy),
+    }));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The envelope serializes in declaration order (verdict before the bulky
-    /// raw), omits absent optionals, and states the gate decision outright.
     #[test]
-    fn envelope_shape_is_stable() {
-        let raw = serde_json::json!({"diff": "…"});
-        let env = Envelope::<'_, serde_json::Value> {
-            v: "2",
-            eng: "isomer/test",
-            verb: "fs",
-            artifact: Some("liblzma.so"),
-            version: Version {
-                old: Some("5.4.5"),
-                new: Some("5.6.0"),
-                bump: Some("minor"),
-            },
-            provenance: Provenance {
-                old: None,
-                new: None,
-            },
-            verdict: Verdict {
-                severity: "critical",
-                new_severity: "critical",
-                gate: Gate {
-                    on: "new",
-                    fail_on: "high",
-                    severity: "critical",
-                    fail: true,
-                },
-                risk: Some(Risk {
-                    old: 0.1,
-                    new: 0.98,
-                    delta: 0.88,
-                    new_classification: "hostile".to_owned(),
-                    model: "azoth",
-                }),
-                proportionality: Prop {
-                    disproportionate: true,
-                    note: None,
-                    skew: None,
-                },
-                behavioral: Behavioral {
-                    severity: "high",
-                    categories: Vec::new(),
-                },
-                signature: Signature {
-                    severity: "none",
-                    cve: None,
-                    count: 0,
-                    ids: Vec::new(),
-                },
-                identity: Identity {
-                    severity: "none",
-                    changes: Vec::new(),
-                },
-                frameworks: Frameworks {
-                    attack: Ids {
-                        new: vec!["T1055"],
-                        removed: Vec::new(),
-                        unchanged: 2,
-                    },
-                    mbc: Ids {
-                        new: Vec::new(),
-                        removed: Vec::new(),
-                        unchanged: 0,
-                    },
-                },
-                structure: Structure {
-                    severity: "high",
-                    facts: Vec::new(),
-                },
-                behavior_mass: BehaviorMass {
-                    severity: "none",
-                    mass: 0.8,
-                    share: 0.47,
-                    ids_gained: 1,
-                    id_share: 0.5,
-                },
-            },
-            features: FeatureSet {
-                judged_summary: Default::default(),
-                trait_shift: None,
-                v: "1",
-                topology: Topology {
-                    added: 0,
-                    removed: 0,
-                    changed: 1,
-                    unchanged: 0,
-                    compared: 1,
-                },
-                scopes: FeatureScopes {
-                    traits: None,
-                    metrics: None,
-                    facts: None,
-                    symbols: None,
-                    strings: None,
-                    sections: None,
-                },
-                files: Vec::new(),
-            },
-            evidence: Vec::new(),
-            deps: Vec::new(),
-            registry: &[],
-            llm: None,
-            raw: &raw,
-        };
-        let s = serde_json::to_string(&env).unwrap();
-        assert!(s.contains("\"new_classification\":\"hostile\""));
-        // Field order: verdict and its proof precede the bulky raw diff.
-        let order = [
-            "\"v\"",
-            "\"verdict\"",
-            "\"features\"",
-            "\"evidence\"",
-            "\"raw\"",
-        ];
-        for k in order {
-            assert!(s.contains(k), "missing {k}");
-        }
-        let pos: Vec<usize> = order.iter().map(|k| s.find(k).unwrap()).collect();
-        assert!(pos.windows(2).all(|w| w[0] < w[1]), "keys out of order");
-        // Absent optionals are omitted, not null.
-        assert!(!s.contains("\"llm\""), "llm must be omitted when None");
-        assert!(!s.contains("\"note\""), "note must be omitted when None");
-        // The gate decision is present and explicit.
-        assert!(
-            s.contains(r#""gate":{"on":"new","fail_on":"high","severity":"critical","fail":true}"#)
+    fn numeric_feature_deltas_are_signed_and_safe_at_zero() {
+        assert_eq!(
+            numeric_delta(Some(10.0), Some(15.0)),
+            NumericDelta {
+                delta: Some(5.0),
+                absolute: Some(5.0),
+                relative: Some(0.5)
+            }
+        );
+        assert_eq!(
+            numeric_delta(None, Some(15.0)),
+            NumericDelta {
+                delta: Some(15.0),
+                absolute: Some(15.0),
+                relative: None
+            }
+        );
+        assert_eq!(
+            numeric_delta(Some(15.0), None),
+            NumericDelta {
+                delta: Some(-15.0),
+                absolute: Some(15.0),
+                relative: None
+            }
+        );
+        assert_eq!(
+            numeric_delta(Some(0.0), Some(2.0)),
+            NumericDelta {
+                delta: Some(2.0),
+                absolute: Some(2.0),
+                relative: None
+            }
         );
     }
 }

@@ -8,23 +8,23 @@ use std::collections::BTreeMap;
 
 use cleave::types::{Changed, DiffReportV1, TraitChange};
 
-use crate::rubric::crit_rank;
+use crate::member::MemberPath;
 
 /// Recognize cleave's generated `parent!!parent##encoding@offset` names.
 /// Requiring the repeated source name avoids interpreting ordinary archive
 /// filenames containing `##` as decoded views.
 fn owner(path: &str) -> Option<&str> {
-    let (parent, leaf) = path.rsplit_once("!!")?;
+    let (parent, leaf) = MemberPath::new(path).parent()?;
     let (source, location) = leaf.rsplit_once("##")?;
     let (encoding, offset) = location.split_once('@')?;
-    (source == parent.rsplit("!!").next()?
+    (source == parent.leaf()
         && !encoding.is_empty()
         && encoding
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'+')
         && !offset.is_empty()
         && offset.bytes().all(|b| b.is_ascii_digit()))
-    .then_some(parent)
+    .then_some(parent.as_str())
 }
 
 pub(super) fn reconcile_traits(mut diff: Cow<'_, DiffReportV1>) -> Cow<'_, DiffReportV1> {
@@ -34,7 +34,9 @@ pub(super) fn reconcile_traits(mut diff: Cow<'_, DiffReportV1>) -> Cow<'_, DiffR
     // Union the known old inventories at each logical source and its archive
     // ancestors. Never propagate sideways: an added sibling carrying the same
     // capability must still be judged independently.
-    let mut baseline: BTreeMap<String, BTreeMap<String, TraitChange>> = BTreeMap::new();
+    // Borrowed from the diff: only the few traits that end up replacing an
+    // addition are cloned, below.
+    let mut baseline: BTreeMap<&str, BTreeMap<&str, &TraitChange>> = BTreeMap::new();
     for file in &diff.files {
         let Some(traits) = &file.scopes.traits else {
             continue;
@@ -46,17 +48,15 @@ pub(super) fn reconcile_traits(mut diff: Cow<'_, DiffReportV1>) -> Cow<'_, DiffR
         {
             let mut path = owner(&file.path).unwrap_or(&file.path);
             loop {
-                let inventory = baseline.entry(path.to_owned()).or_default();
-                let entry = inventory
-                    .entry(old.id.clone())
-                    .or_insert_with(|| old.clone());
-                if crit_rank(old.crit) > crit_rank(entry.crit) {
-                    *entry = old.clone();
+                let inventory = baseline.entry(path).or_default();
+                let entry = inventory.entry(old.id.as_str()).or_insert(old);
+                if old.crit.rank() > entry.crit.rank() {
+                    *entry = old;
                 }
-                let Some((parent, _)) = path.rsplit_once("!!") else {
+                let Some((parent, _)) = MemberPath::new(path).parent() else {
                     break;
                 };
-                path = parent;
+                path = parent.as_str();
             }
         }
     }
@@ -69,8 +69,8 @@ pub(super) fn reconcile_traits(mut diff: Cow<'_, DiffReportV1>) -> Cow<'_, DiffR
             continue;
         };
         for (added_index, new) in traits.added.iter().enumerate() {
-            if let Some(old) = inventory.get(&new.id) {
-                replacements.push((index, added_index, old.clone()));
+            if let Some(old) = inventory.get(new.id.as_str()) {
+                replacements.push((index, added_index, (*old).clone()));
             }
         }
     }

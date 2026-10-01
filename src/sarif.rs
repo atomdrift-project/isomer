@@ -11,12 +11,19 @@
 //! prove it when evidence exists, and to the changed file otherwise; a finding
 //! with no honest location is reported at the file rather than invented
 //! somewhere precise-looking.
+//!
+//! The log is a typed model serialized by serde, not a `json!` tree: a field
+//! name typo is a compile error rather than an alert GitHub silently ignores,
+//! and there is no `Value` indexing to panic on.
+
+use std::collections::HashMap;
 
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde::Serialize;
 
 use crate::Severity;
 use crate::analysis::Analysis;
+use crate::taxonomy::{TraitId, under};
 
 /// One SARIF result before it is indexed against the rule table.
 struct Finding {
@@ -35,7 +42,142 @@ struct Finding {
     /// `ids` exactly — a composite rule often owns the window that proves a
     /// trait underneath it.
     hints: Vec<String>,
+    /// What tells this finding apart from another under the same rule when it
+    /// has no trait ids: the identity field and its two values, or the
+    /// structural fact's subject and detail. Without it every publisher drift
+    /// in a run shared one fingerprint, and code scanning merged them into a
+    /// single alert.
+    distinct: Vec<String>,
     tags: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct Log<'a> {
+    #[serde(rename = "$schema")]
+    schema: &'static str,
+    version: &'static str,
+    runs: [Run<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct Run<'a> {
+    tool: Tool<'a>,
+    /// A clean run still uploads: code scanning resolves alerts that no longer
+    /// appear, so an empty result set is how a fixed finding gets closed.
+    results: Vec<SarifResult<'a>>,
+    invocations: [Invocation; 1],
+}
+
+#[derive(Serialize)]
+struct Tool<'a> {
+    driver: Driver<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Driver<'a> {
+    name: &'static str,
+    semantic_version: &'static str,
+    version: &'static str,
+    information_uri: &'static str,
+    rules: Vec<Rule<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Rule<'a> {
+    id: &'a str,
+    name: &'a str,
+    short_description: Text<'a>,
+    full_description: Text<'a>,
+    help: Help<'a>,
+    default_configuration: Configuration,
+    properties: RuleProperties<'a>,
+}
+
+#[derive(Serialize)]
+struct Text<'a> {
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct Help<'a> {
+    text: &'a str,
+    markdown: &'a str,
+}
+
+#[derive(Serialize)]
+struct Configuration {
+    level: &'static str,
+}
+
+#[derive(Serialize)]
+struct RuleProperties<'a> {
+    tags: &'a [String],
+    /// GitHub's own vocabulary: the same three tiers as `level`, except that
+    /// its lowest is a recommendation.
+    #[serde(rename = "problem.severity")]
+    problem_severity: &'static str,
+    #[serde(rename = "security-severity")]
+    security_severity: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SarifResult<'a> {
+    rule_id: &'a str,
+    rule_index: usize,
+    level: &'static str,
+    message: Text<'a>,
+    locations: [Location<'a>; 1],
+    partial_fingerprints: Fingerprints,
+}
+
+#[derive(Serialize)]
+struct Fingerprints {
+    #[serde(rename = "isomerFindingV1")]
+    isomer_finding_v1: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Location<'a> {
+    physical_location: PhysicalLocation,
+    /// The archive member, when the physical file is its container: pointing
+    /// a line number inside a tarball at the repo would be a lie.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logical_locations: Option<[LogicalLocation<'a>; 1]>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PhysicalLocation {
+    artifact_location: ArtifactLocation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<Region>,
+}
+
+#[derive(Serialize)]
+struct ArtifactLocation {
+    uri: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Region {
+    start_line: u64,
+}
+
+#[derive(Serialize)]
+struct LogicalLocation<'a> {
+    name: &'a str,
+    kind: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Invocation {
+    execution_successful: bool,
 }
 
 /// Render the analysis as a SARIF 2.1.0 log.
@@ -57,64 +199,68 @@ pub(crate) fn report(a: &Analysis<'_>) -> Result<String> {
         f.tags.extend(techniques.iter().cloned());
     }
     let hunks = a.hunks(EVIDENCE_CAP);
+    let fallback_file = a
+        .pairs
+        .first()
+        .map_or(a.naming.name.as_str(), |p| p.label.as_str());
 
-    let mut rules: Vec<Value> = Vec::new();
-    let mut results: Vec<Value> = Vec::new();
+    let mut rules: Vec<Rule<'_>> = Vec::new();
+    let mut rule_index: HashMap<&str, usize> = HashMap::new();
+    let mut results = Vec::with_capacity(findings.len());
     for f in &findings {
         // One rule per distinct id; results carry the index back to it.
-        let index = match rules.iter().position(|r| r["id"].as_str() == Some(&f.rule)) {
-            Some(i) => i,
-            None => {
-                rules.push(json!({
-                    "id": f.rule,
-                    "name": f.name,
-                    "shortDescription": {"text": f.name},
-                    "fullDescription": {"text": f.help},
-                    "help": {"text": f.help, "markdown": f.help},
-                    "defaultConfiguration": {"level": level(f.severity)},
-                    "properties": {
-                        "tags": f.tags,
-                        // GitHub's own vocabulary: the same three tiers as
-                        // `level`, except that its lowest is a recommendation.
-                        "problem.severity": match f.severity {
-                            Severity::Critical | Severity::High => "error",
-                            Severity::Medium => "warning",
-                            Severity::Low | Severity::None => "recommendation",
-                        },
-                        "security-severity": security_severity(f.severity),
-                    },
-                }));
-                rules.len() - 1
-            }
-        };
-        results.push(json!({
-            "ruleId": f.rule,
-            "ruleIndex": index,
-            "level": level(f.severity),
-            "message": {"text": f.message},
-            "locations": [locate(a, &hunks, f)],
-            "partialFingerprints": {"isomerFindingV1": fingerprint(&f.rule, &f.ids)},
-        }));
+        let index = *rule_index.entry(f.rule.as_str()).or_insert_with(|| {
+            rules.push(Rule {
+                id: &f.rule,
+                name: &f.name,
+                short_description: Text { text: &f.name },
+                full_description: Text { text: &f.help },
+                help: Help {
+                    text: &f.help,
+                    markdown: &f.help,
+                },
+                default_configuration: Configuration {
+                    level: level(f.severity),
+                },
+                properties: RuleProperties {
+                    tags: &f.tags,
+                    problem_severity: problem_severity(f.severity),
+                    security_severity: security_severity(f.severity),
+                },
+            });
+            rules.len() - 1
+        });
+        results.push(SarifResult {
+            rule_id: &f.rule,
+            rule_index: index,
+            level: level(f.severity),
+            message: Text { text: &f.message },
+            locations: [locate(&hunks, f, fallback_file)],
+            partial_fingerprints: Fingerprints {
+                isomer_finding_v1: fingerprint(&f.rule, &f.ids, &f.distinct),
+            },
+        });
     }
 
-    let log = json!({
-        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [{
-            "tool": {"driver": {
-                "name": "isomer",
-                "semanticVersion": env!("CARGO_PKG_VERSION"),
-                "version": env!("CARGO_PKG_VERSION"),
-                "informationUri": "https://github.com/atomdrift-project/isomer",
-                "rules": rules,
-            }},
-            // A clean run still uploads: code scanning resolves alerts that no
-            // longer appear, so an empty result set is how a fixed finding
-            // gets closed.
-            "results": results,
-            "invocations": [{"executionSuccessful": true}],
+    let log = Log {
+        schema: "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+        version: "2.1.0",
+        runs: [Run {
+            tool: Tool {
+                driver: Driver {
+                    name: "isomer",
+                    semantic_version: crate::VERSION,
+                    version: crate::VERSION,
+                    information_uri: "https://github.com/atomdrift-project/isomer",
+                    rules,
+                },
+            },
+            results,
+            invocations: [Invocation {
+                execution_successful: true,
+            }],
         }],
-    });
+    };
     Ok(serde_json::to_string_pretty(&log)?)
 }
 
@@ -158,6 +304,7 @@ fn findings(a: &Analysis<'_>) -> Vec<Finding> {
             ),
             ids,
             hints: c.namespaces.clone(),
+            distinct: Vec::new(),
             tags: vec![
                 "security".into(),
                 "supply-chain".into(),
@@ -192,6 +339,7 @@ fn findings(a: &Analysis<'_>) -> Vec<Finding> {
             ),
             ids: vec![m.id.clone()],
             hints: Vec::new(),
+            distinct: Vec::new(),
             tags: vec!["security".into(), "supply-chain".into(), "malware".into()],
         });
     }
@@ -201,7 +349,7 @@ fn findings(a: &Analysis<'_>) -> Vec<Finding> {
         out.push(Finding {
             rule: "isomer/identity".into(),
             name: "Publisher identity drift".into(),
-            severity: assessment.identity.severity,
+            severity: assessment.identity.severity(),
             message: format!("{} changed: {old} → {new}", ch.label),
             help: "The party that signed or published this artifact changed. A new signer on \
                    an established package is how an account takeover first shows up in the \
@@ -209,6 +357,7 @@ fn findings(a: &Analysis<'_>) -> Vec<Finding> {
                 .into(),
             ids: Vec::new(),
             hints: Vec::new(),
+            distinct: vec![ch.label.as_str().to_owned(), old.to_owned(), new.to_owned()],
             tags: vec![
                 "security".into(),
                 "supply-chain".into(),
@@ -218,12 +367,9 @@ fn findings(a: &Analysis<'_>) -> Vec<Finding> {
     }
 
     for f in &assessment.structure.facts {
-        let kind = match f.kind {
-            crate::rubric::FactKind::Added => "gained",
-            crate::rubric::FactKind::Became => "altered",
-        };
+        let kind = f.kind.as_str();
         out.push(Finding {
-            rule: format!("isomer/{}", crate::rubric::structure_id(f.label)),
+            rule: format!("isomer/{}", f.label.rule_id()),
             name: format!("Structural change: {}", f.label),
             severity: f.severity,
             message: format!("{} {kind} {} — {}", a.naming.name, f.label, f.sentence()),
@@ -234,6 +380,8 @@ fn findings(a: &Analysis<'_>) -> Vec<Finding> {
                 .into(),
             ids: Vec::new(),
             hints: Vec::new(),
+            // `added` and `became` are different findings under one label.
+            distinct: vec![kind.to_owned(), f.sentence()],
             tags: vec!["security".into(), "supply-chain".into(), "structure".into()],
         });
     }
@@ -250,7 +398,11 @@ fn findings(a: &Analysis<'_>) -> Vec<Finding> {
 /// with no trait ids at all (publisher drift, a structural fact) is a property
 /// of the change rather than of a line, so it lands on the first changed file
 /// with no region — better an imprecise location than a precise fiction.
-fn locate(a: &Analysis<'_>, hunks: &[&crate::evidence::Hunk], f: &Finding) -> Value {
+fn locate<'h>(
+    hunks: &[&'h crate::evidence::Hunk],
+    f: &Finding,
+    fallback_file: &str,
+) -> Location<'h> {
     let anchor = if f.ids.is_empty() && f.hints.is_empty() {
         None
     } else {
@@ -259,48 +411,71 @@ fn locate(a: &Analysis<'_>, hunks: &[&crate::evidence::Hunk], f: &Finding) -> Va
             .find(|h| f.ids.iter().any(|id| id == &h.id))
             .or_else(|| {
                 hunks.iter().find(|h| {
-                    f.hints.iter().any(|ns| {
-                        crate::rubric::in_trait_hierarchy(&h.id, ns)
-                            || crate::rubric::in_trait_hierarchy(
-                                &crate::rubric::namespace_of(&h.id),
-                                ns,
-                            )
-                    })
+                    let id = TraitId::new(&h.id);
+                    f.hints
+                        .iter()
+                        .any(|ns| id.is_under(ns) || under(id.path(), ns))
                 })
             })
             // Still nothing: the strongest evidence in the change is a better
             // pointer than an arbitrary file.
             .or_else(|| hunks.first())
     };
-    if let Some(h) = anchor {
-        let mut physical = json!({
-            "artifactLocation": {"uri": uri(&h.file)},
-        });
-        if let Some(line) = h.line {
-            physical["region"] = json!({"startLine": line});
-        }
-        let mut loc = json!({"physicalLocation": physical});
-        if let Some(member) = &h.member {
-            // Name the archive member in a logical location — the physical
-            // file is the container, and pointing a line number inside a
-            // tarball at the repo would be a lie.
-            loc["logicalLocations"] = json!([{"name": member, "kind": "member"}]);
-        }
-        return loc;
+    match anchor {
+        Some(h) => Location {
+            physical_location: PhysicalLocation {
+                artifact_location: ArtifactLocation { uri: uri(&h.file) },
+                region: h.line.map(|start_line| Region { start_line }),
+            },
+            logical_locations: h.member.as_deref().map(|name| {
+                [LogicalLocation {
+                    name,
+                    kind: "member",
+                }]
+            }),
+        },
+        None => Location {
+            physical_location: PhysicalLocation {
+                artifact_location: ArtifactLocation {
+                    uri: uri(fallback_file),
+                },
+                region: None,
+            },
+            logical_locations: None,
+        },
     }
-    let file = a
-        .pairs
-        .first()
-        .map(|p| p.label.clone())
-        .unwrap_or_else(|| a.naming.name.clone());
-    json!({"physicalLocation": {"artifactLocation": {"uri": uri(&file)}}})
 }
 
-/// A SARIF artifact URI: repo-relative, forward slashes, no `./` prefix.
+/// Bytes a URI path may carry as-is: RFC 3986's unreserved characters, the
+/// sub-delimiters, `:`, `@`, and `/` as the segment separator. Everything else
+/// — a space, `#`, `?`, `%`, any non-ASCII byte — is percent-encoded.
+const URI_PATH: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'!')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')')
+    .remove(b'*')
+    .remove(b'+')
+    .remove(b',')
+    .remove(b';')
+    .remove(b'=')
+    .remove(b':')
+    .remove(b'@')
+    .remove(b'/');
+
+/// A SARIF artifact URI: repo-relative, forward slashes, no `./` prefix, and
+/// percent-encoded — a pull request is free to name a file `a b#c.js`, and a
+/// raw `#` would end the path at a fragment.
 fn uri(path: &str) -> String {
     let p = path.replace('\\', "/");
     let p = p.strip_prefix("./").unwrap_or(&p);
-    p.trim_start_matches('/').to_string()
+    percent_encoding::utf8_percent_encode(p.trim_start_matches('/'), URI_PATH).to_string()
 }
 
 /// SARIF result levels. GitHub renders `error` as a failing annotation.
@@ -309,6 +484,15 @@ fn level(sev: Severity) -> &'static str {
         Severity::Critical | Severity::High => "error",
         Severity::Medium => "warning",
         Severity::Low | Severity::None => "note",
+    }
+}
+
+/// GitHub's `problem.severity` vocabulary.
+fn problem_severity(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Critical | Severity::High => "error",
+        Severity::Medium => "warning",
+        Severity::Low | Severity::None => "recommendation",
     }
 }
 
@@ -327,7 +511,11 @@ fn security_severity(sev: Severity) -> &'static str {
 /// alert rather than closing and reopening it as lines move. FNV-1a: tiny,
 /// dependency-free, and — unlike a stdlib hasher — guaranteed to produce the
 /// same value in every future build.
-fn fingerprint(rule: &str, ids: &[String]) -> String {
+///
+/// `distinct` separates findings that share a rule and carry no trait ids. It
+/// is hashed after its own separator, and only when present, so every finding
+/// that has no such parts keeps the fingerprint it always had.
+fn fingerprint(rule: &str, ids: &[String], distinct: &[String]) -> String {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x100_0000_01b3;
     let mut h = OFFSET;
@@ -345,6 +533,11 @@ fn fingerprint(rule: &str, ids: &[String]) -> String {
         eat("\0");
         eat(id);
     }
+    // In order: these are positional (a field, then its old and new values).
+    for part in distinct {
+        eat("\u{1}");
+        eat(part);
+    }
     format!("{h:016x}")
 }
 
@@ -354,16 +547,42 @@ mod tests {
 
     #[test]
     fn fingerprint_is_order_independent_and_stable() {
-        let a = fingerprint("isomer/capability/C2", &["b".into(), "a".into()]);
-        let b = fingerprint("isomer/capability/C2", &["a".into(), "b".into()]);
+        let a = fingerprint("isomer/capability/C2", &["b".into(), "a".into()], &[]);
+        let b = fingerprint("isomer/capability/C2", &["a".into(), "b".into()], &[]);
         assert_eq!(a, b, "id order must not change the fingerprint");
         assert_ne!(
             a,
-            fingerprint("isomer/capability/network", &["a".into(), "b".into()])
+            fingerprint("isomer/capability/network", &["a".into(), "b".into()], &[])
         );
         // Pinned: the value is a wire contract with code scanning's alert
         // tracking, so a refactor must not silently change it.
-        assert_eq!(fingerprint("r", &[]), "af63ef4c86020cd5");
+        assert_eq!(fingerprint("r", &[], &[]), "af63ef4c86020cd5");
+    }
+
+    /// Two publisher drifts in one run are two alerts, not one.
+    #[test]
+    fn findings_without_trait_ids_still_fingerprint_apart() {
+        let signer = fingerprint(
+            "isomer/identity",
+            &[],
+            &["signer".into(), "A".into(), "B".into()],
+        );
+        let org = fingerprint(
+            "isomer/identity",
+            &[],
+            &["organization".into(), "A".into(), "B".into()],
+        );
+        assert_ne!(signer, org);
+        assert_ne!(signer, fingerprint("isomer/identity", &[], &[]));
+        // Positional: swapping old and new is a different change.
+        assert_ne!(
+            signer,
+            fingerprint(
+                "isomer/identity",
+                &[],
+                &["signer".into(), "B".into(), "A".into()]
+            )
+        );
     }
 
     #[test]
@@ -373,16 +592,27 @@ mod tests {
         assert_eq!(uri("src\\a.js"), "src/a.js");
     }
 
+    /// A raw `#` or `?` would end the path; a space or `%` is not a valid URI
+    /// character at all.
+    #[test]
+    fn uris_are_percent_encoded() {
+        assert_eq!(uri("a b#c?.js"), "a%20b%23c%3F.js");
+        assert_eq!(uri("100%.js"), "100%25.js");
+        assert_eq!(uri("dir/ü.js"), "dir/%C3%BC.js");
+        assert_eq!(uri("scope/@pkg/a-b_c~d.js"), "scope/@pkg/a-b_c~d.js");
+    }
+
     /// Structural rule ids are stable strings: GitHub tracks a Security-tab
     /// alert by rule id, so changing one silently reopens every alert.
     #[test]
     fn structure_rule_ids_are_stable() {
+        use crate::rubric::FactLabel;
         assert_eq!(
-            crate::rubric::structure_id("loader dependency"),
+            FactLabel::LoaderDependency.rule_id(),
             "structure/loader-dependency"
         );
         assert_eq!(
-            crate::rubric::structure_id("writable+executable"),
+            FactLabel::WritableExecutable.rule_id(),
             "structure/writable-executable"
         );
     }

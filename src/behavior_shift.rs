@@ -99,7 +99,7 @@ pub(crate) struct Weights {
 }
 
 fn behavioral(id: &str) -> bool {
-    id.starts_with("micro-behaviors/") || id.starts_with("objectives/")
+    crate::taxonomy::TraitId::new(id).is_behavioral()
 }
 
 impl Profiles {

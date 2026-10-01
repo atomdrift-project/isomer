@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 
 use crate::Severity;
 use crate::analysis::Analysis;
-use crate::options::Options;
+use crate::evidence::{Group, LineMark};
 
 /// Hidden HTML comment identifying an isomer report, so the posting step can
 /// find the comment it wrote last time. Part of the action's contract — do not
@@ -26,57 +26,93 @@ const MAX_BODY: usize = 60_000;
 
 /// Evidence hunks in the comment. Fewer than the JSON record: a reviewer wants
 /// the smoking gun, not the archive.
-const MAX_HUNKS: usize = 6;
+const COMMENT_HUNKS: usize = 6;
+
+/// Known-bad rules listed before the rest are summarized as a count.
+const MAX_SIGNATURES: usize = 10;
+
+/// The note appended where the body was cut to fit [`MAX_BODY`].
+const TRUNCATED: &str = "\n_Report truncated to fit GitHub's comment limit. \
+                         The full record is in the job's SARIF upload and step summary._\n";
 
 /// Render the report body.
-pub(crate) fn report(a: &Analysis<'_>, opts: &Options) -> String {
+pub(crate) fn report(a: &Analysis<'_>) -> Result<String, std::fmt::Error> {
     let mut s = String::with_capacity(4096);
-    let _ = writeln!(s, "{MARKER}");
-    let _ = writeln!(s, "### {}", heading(a));
-    let _ = writeln!(s);
+    writeln!(s, "{MARKER}")?;
+    writeln!(s, "### {}", heading(a))?;
+    writeln!(s)?;
 
-    if !a.speaks(opts) {
+    if !a.speaks() {
         // Nothing to say — but the comment may already exist from an earlier,
         // worse push, so it has to say *that* rather than going blank.
-        let _ = writeln!(s, "{}", clean_body(a, opts));
-        return s;
+        writeln!(s, "{}", clean_body(a))?;
+        return Ok(s);
     }
 
     // The judgement first, always: what isomer makes of the change, before any
     // of the detail behind it. Escaped like any other untrusted line — it may
     // carry a rule description, or the LLM's phrasing of a diff that tried to
     // talk to it.
-    let _ = writeln!(s, "> {}", cell(&a.judgement()));
-    let _ = writeln!(s);
-    risk(&mut s, a);
-    behavioral(&mut s, a);
-    signatures(&mut s, a);
-    identity(&mut s, a);
-    structure(&mut s, a);
-    frameworks(&mut s, a);
+    writeln!(s, "> {}", cell(&a.judgement()))?;
+    writeln!(s)?;
+    risk(&mut s, a)?;
+    behavioral(&mut s, a)?;
+    signatures(&mut s, a)?;
+    identity(&mut s, a)?;
+    structure(&mut s, a)?;
+    frameworks(&mut s, a)?;
     // One view: a speaking verdict carries its metrics and the evidence behind
     // it — the differential hunks are the root cause a reviewer acts on.
-    stats(&mut s, a);
-    evidence(&mut s, a);
-    let _ = write!(s, "\n---\n{}\n", footer(a, opts));
+    stats(&mut s, a)?;
+    evidence(&mut s, a)?;
+    Ok(fit(s, &format!("\n---\n{}\n", footer(a))))
+}
 
-    if s.len() > MAX_BODY {
-        // Cut on a line boundary within the char boundary. A mid-line cut can
-        // land inside an evidence fence marker, which leaves the comment's
-        // markup malformed; dropping the partial line costs nothing, since the
-        // note below already says the report was cut.
-        let cut = s.floor_char_boundary(MAX_BODY);
-        s.truncate(cut);
-        if let Some(line_end) = s.rfind('\n') {
-            s.truncate(line_end + 1);
-        }
-        let _ = write!(
-            s,
-            "\n\n_Report truncated to fit GitHub's comment limit. \
-             The full record is in the job's SARIF upload and step summary._\n"
-        );
+/// Join a body and its footer within [`MAX_BODY`].
+///
+/// The footer carries the gate verdict, so it is reserved first and the body
+/// is what gets cut — on a line boundary, so no fence marker or table row is
+/// split, and with any evidence fence the cut left open closed again, so the
+/// truncation note does not render as code.
+fn fit(mut body: String, footer: &str) -> String {
+    let budget = MAX_BODY.saturating_sub(footer.len());
+    if body.len() <= budget {
+        body.push_str(footer);
+        return body;
     }
-    s
+    // Room for the note and a closing fence; a fence is never wider than the
+    // longest backtick run in the evidence plus one, so 64 is generous.
+    let cut = body.floor_char_boundary(budget.saturating_sub(TRUNCATED.len() + 64));
+    body.truncate(cut);
+    if let Some(line_end) = body.rfind('\n') {
+        body.truncate(line_end + 1);
+    }
+    if let Some(open) = open_fence(&body).map(str::len) {
+        body.push_str(&"`".repeat(open));
+        body.push('\n');
+    }
+    body.push_str(TRUNCATED);
+    body.push_str(footer);
+    body
+}
+
+/// The fence left open at the end of `body`, if any. A fence line is a run of
+/// three or more backticks alone on a line, closed by a run at least as long —
+/// the only fences [`fence`] writes.
+fn open_fence(body: &str) -> Option<&str> {
+    let mut open: Option<&str> = None;
+    for line in body.lines() {
+        let line = line.trim_end();
+        if line.len() < 3 || !line.bytes().all(|b| b == b'`') {
+            continue;
+        }
+        open = match open {
+            Some(fence) if line.len() >= fence.len() => None,
+            Some(fence) => Some(fence),
+            None => Some(line),
+        };
+    }
+    open
 }
 
 /// `🔴 HOSTILE · node-ipc · 12.0.0 → 12.0.1 · patch release · 3 of 14 files`.
@@ -84,7 +120,7 @@ fn heading(a: &Analysis<'_>) -> String {
     let mut parts = vec![format!(
         "{} {}",
         emoji(a.verdict),
-        crate::terminal::verdict_word(a.verdict)
+        crate::view::verdict_word(a.verdict)
     )];
     if !a.naming.name.is_empty() {
         parts.push(code(&a.naming.name));
@@ -98,7 +134,7 @@ fn heading(a: &Analysis<'_>) -> String {
     if let Some(scope) = a.scope {
         parts.push(scope.label().to_string());
     }
-    parts.extend(crate::terminal::change_scale(a.display_diff()));
+    parts.extend(crate::view::change_scale(a.display_diff()));
     parts.join(" · ")
 }
 
@@ -115,8 +151,8 @@ pub(crate) fn one_line(a: &Analysis<'_>) -> String {
 
 /// The body for a change isomer has nothing to say about. Kept short and
 /// affirmative: this is the state a reviewer should see most of the time.
-fn clean_body(a: &Analysis<'_>, opts: &Options) -> String {
-    let scale = crate::terminal::change_scale(a.display_diff());
+fn clean_body(a: &Analysis<'_>) -> String {
+    let scale = crate::view::change_scale(a.display_diff());
     let scope = if scale.is_empty() {
         String::new()
     } else {
@@ -124,59 +160,54 @@ fn clean_body(a: &Analysis<'_>, opts: &Options) -> String {
     };
     format!(
         "No newly-introduced capabilities, known-bad signatures, or publisher drift{scope}.\n{}",
-        footer(a, opts)
+        footer(a)
     )
 }
 
-fn footer(a: &Analysis<'_>, opts: &Options) -> String {
-    let gate = if a.clean {
-        format!("passes `--fail-on {}`", opts.fail_on.as_str())
+fn footer(a: &Analysis<'_>) -> String {
+    let gate = if a.clean() {
+        format!("passes `--fail-on {}`", a.fail_on().as_str())
     } else {
         format!(
             "**fails `--fail-on {}`** — gated severity `{}`",
-            opts.fail_on.as_str(),
-            a.gated.as_str()
+            a.fail_on().as_str(),
+            a.gated().as_str()
         )
     };
     format!(
         "<sub>isomer {} · gate `{}` · {gate}</sub>",
-        env!("CARGO_PKG_VERSION"),
-        match opts.gate {
-            crate::Gate::New => "new",
-            crate::Gate::Any => "any",
-        },
+        crate::VERSION,
+        a.gate().as_str(),
     )
 }
 
-fn risk(s: &mut String, a: &Analysis<'_>) {
+fn risk(s: &mut String, a: &Analysis<'_>) -> std::fmt::Result {
     // Shown when the model changed its mind, or whenever the full report is
     // being written. An unchanged band on a passing change is not news.
-    let Some(r) = a.risk.filter(|_| a.risk_band_moved() || !a.clean) else {
-        return;
+    let Some(r) = a.shown_risk().filter(|_| a.risk_band_moved() || !a.clean()) else {
+        return Ok(());
     };
-    let d = r.delta();
-    let arrow = if d > 0.005 {
-        format!(" ▲ {d:+.2}")
-    } else if d < -0.005 {
-        format!(" ▼ {d:+.2}")
-    } else {
-        String::new()
+    let arrow = match r.trend() {
+        crate::risk::Trend::Flat => String::new(),
+        trend => format!(" {} {:+.2}", trend.arrow(), r.delta()),
     };
-    let _ = writeln!(
+    writeln!(
         s,
         "**ML risk score** `{:.2}` → `{:.2}` (new decision: {}){arrow}\n",
         r.old, r.new, r.new_classification,
-    );
+    )?;
+
+    Ok(())
 }
 
-fn behavioral(s: &mut String, a: &Analysis<'_>) {
+fn behavioral(s: &mut String, a: &Analysis<'_>) -> std::fmt::Result {
     let cats = &a.assessment.behavioral.categories;
     if cats.is_empty() {
-        return;
+        return Ok(());
     }
-    let _ = writeln!(s, "#### Capabilities\n");
-    let _ = writeln!(s, "| | capability | namespace | traits |");
-    let _ = writeln!(s, "|---|---|---|---|");
+    writeln!(s, "#### Capabilities\n")?;
+    writeln!(s, "| | capability | namespace | traits |")?;
+    writeln!(s, "|---|---|---|---|")?;
     for c in cats {
         let fresh = a.assessment.behavioral.is_new_category(c);
         // Both halves, when both moved: a category with new *and* escalated
@@ -190,95 +221,100 @@ fn behavioral(s: &mut String, a: &Analysis<'_>) {
             (n, e) => format!("+{n} · {e} escalated"),
         };
         let namespaces: Vec<String> = c.namespaces.iter().map(|n| code(n)).collect();
-        let _ = writeln!(
+        writeln!(
             s,
             "| {} **{}** | {} | {} | {count} |",
             dots(c.severity),
             if fresh { "new" } else { "expanded" },
             cell(&c.label),
             namespaces.join(" · "),
-        );
+        )?;
     }
-    let _ = writeln!(s);
+    writeln!(s)?;
+
+    Ok(())
 }
 
-fn signatures(s: &mut String, a: &Analysis<'_>) {
+fn signatures(s: &mut String, a: &Analysis<'_>) -> std::fmt::Result {
     let sig = &a.assessment.signature;
     if sig.ids.is_empty() {
-        return;
+        return Ok(());
     }
     let cve = sig
         .cve
         .as_ref()
         .map(|c| format!(" · {c}"))
         .unwrap_or_default();
-    let _ = writeln!(s, "#### Known-bad signatures{cve}\n");
-    let _ = writeln!(s, "| | rule | detects |");
-    let _ = writeln!(s, "|---|---|---|");
-    for m in sig.ids.iter().take(10) {
-        let _ = writeln!(
+    writeln!(s, "#### Known-bad signatures{cve}\n")?;
+    writeln!(s, "| | rule | detects |")?;
+    writeln!(s, "|---|---|---|")?;
+    for m in sig.ids.iter().take(MAX_SIGNATURES) {
+        writeln!(
             s,
             "| {} | {} | {} |",
             dots(m.severity),
             code(&crate::rubric::short_name(&m.id)),
             cell(&m.desc),
-        );
+        )?;
     }
-    if sig.ids.len() > 10 {
-        let _ = writeln!(s, "| | _+{} more_ | |", sig.ids.len() - 10);
+    if sig.ids.len() > MAX_SIGNATURES {
+        writeln!(s, "| | _+{} more_ | |", sig.ids.len() - MAX_SIGNATURES)?;
     }
-    let _ = writeln!(s);
+    writeln!(s)?;
+
+    Ok(())
 }
 
-fn identity(s: &mut String, a: &Analysis<'_>) {
+fn identity(s: &mut String, a: &Analysis<'_>) -> std::fmt::Result {
     let changes = &a.assessment.identity.changes;
     if changes.is_empty() {
-        return;
+        return Ok(());
     }
-    let _ = writeln!(s, "#### Publisher\n");
+    writeln!(s, "#### Publisher\n")?;
     for ch in changes {
         let (old, new) = ch.shown();
-        let _ = writeln!(s, "- **{}**: {} → {}", ch.label, cell(old), cell(new));
+        writeln!(s, "- **{}**: {} → {}", ch.label, cell(old), cell(new))?;
     }
-    let _ = writeln!(s);
+    writeln!(s)?;
+
+    Ok(())
 }
 
-fn structure(s: &mut String, a: &Analysis<'_>) {
+fn structure(s: &mut String, a: &Analysis<'_>) -> std::fmt::Result {
     let facts = &a.assessment.structure.facts;
     if facts.is_empty() {
-        return;
+        return Ok(());
     }
-    let _ = writeln!(s, "#### Structure\n");
+    writeln!(s, "#### Structure\n")?;
     for f in facts {
-        let kind = match f.kind {
-            crate::rubric::FactKind::Added => "new",
-            crate::rubric::FactKind::Became => "became",
-        };
-        let _ = writeln!(
+        let kind = f.kind.as_str();
+        writeln!(
             s,
             "- {} {kind} **{}** — {}",
             dots(f.severity),
             f.label,
             cell(&f.sentence())
-        );
+        )?;
     }
-    let _ = writeln!(s);
+    writeln!(s)?;
+
+    Ok(())
 }
 
 /// ATT&CK and MBC ids the change moved. Shown as ids: isomer has no catalog
 /// mapping them to prose and will not invent one.
-fn frameworks(s: &mut String, a: &Analysis<'_>) {
+fn frameworks(s: &mut String, a: &Analysis<'_>) -> std::fmt::Result {
     let rows: Vec<(&str, &crate::evidence::Sides)> =
         [("ATT&CK", &a.survey.attack), ("MBC", &a.survey.mbc)]
             .into_iter()
             .filter(|(_, sides)| sides.changed())
             .collect();
     if rows.is_empty() {
-        return;
+        return Ok(());
     }
-    let _ = writeln!(s, "#### Technique coverage\n");
-    let _ = writeln!(s, "| | introduced | no longer present | unchanged |");
-    let _ = writeln!(s, "|---|---|---|---|");
+    writeln!(s, "#### Technique coverage\n")?;
+    writeln!(s, "| | introduced | no longer present | unchanged |")?;
+    writeln!(s, "|---|---|---|---|")?;
     for (label, sides) in rows {
         // Each id with its official name, one per line in the cell.
         let list = |ids: Vec<&str>| {
@@ -287,112 +323,115 @@ fn frameworks(s: &mut String, a: &Analysis<'_>) {
             } else {
                 ids.iter()
                     .map(|i| match crate::frameworks::name(i) {
-                        Some(name) => format!("`{}` {name}", cell(i)),
-                        None => format!("`{}`", cell(i)),
+                        Some(name) => format!("{} {}", code(i), cell(&name)),
+                        None => code(i),
                     })
                     .collect::<Vec<_>>()
                     .join("<br>")
             }
         };
-        let _ = writeln!(
+        writeln!(
             s,
             "| **{label}** | {} | {} | {} |",
             list(sides.gained()),
             list(sides.lost()),
             sides.kept(),
-        );
+        )?;
     }
-    let _ = writeln!(s);
+    writeln!(s)?;
+    Ok(())
 }
 
-fn stats(s: &mut String, a: &Analysis<'_>) {
-    let rows = crate::terminal::stats_data(a.display_diff());
+fn stats(s: &mut String, a: &Analysis<'_>) -> std::fmt::Result {
+    let rows = crate::view::stats(a.display_diff());
     if rows.is_empty() {
-        return;
+        return Ok(());
     }
     let joined = rows
         .iter()
-        .map(|(o, n, label, note)| {
-            let d = n - o;
-            let mut r = format!("{o} → {n} {label} ({d:+})");
-            if !note.is_empty() {
-                let _ = write!(r, " — {}", code(note));
+        .map(|row| {
+            let mut r = format!(
+                "{} → {} {} ({:+})",
+                row.old,
+                row.new,
+                row.label,
+                row.delta()
+            );
+            if !row.note.is_empty() {
+                r.push_str(" — ");
+                r.push_str(&code(&row.note));
             }
             r
         })
         .collect::<Vec<_>>()
         .join(" · ");
-    let _ = writeln!(s, "**Stats** {joined}\n");
+    writeln!(s, "**Stats** {joined}\n")?;
+
+    Ok(())
 }
 
-fn evidence(s: &mut String, a: &Analysis<'_>) {
-    let hunks = a.hunks(MAX_HUNKS);
+fn evidence(s: &mut String, a: &Analysis<'_>) -> std::fmt::Result {
+    let hunks = a.hunks(COMMENT_HUNKS);
     if hunks.is_empty() {
-        return;
+        return Ok(());
     }
-    let _ = writeln!(s, "#### Evidence\n");
-    let _ = writeln!(
+    writeln!(s, "#### Evidence\n")?;
+    writeln!(
         s,
         "<sub>{}</sub>\n",
-        crate::terminal::evidence_note_text(&hunks)
-    );
-    let mut i = 0;
-    while i < hunks.len() {
-        if hunks[i].additions {
-            // One heading per changed file — captioned with its strongest rule
-            // — then a single fenced diff of its added lines, an ellipsis at
-            // each gap, mirroring the terminal's grouped view.
-            let run = crate::evidence::additions_at(&hunks, i);
-            let name = run.name;
-            let title = run
-                .top
-                .map(|h| format!(" — {}", cell(&h.desc)))
-                .unwrap_or_default();
-            let _ = writeln!(
-                s,
-                "{} {}{} — added lines\n",
-                dots(run.severity),
-                code(name),
-                title
-            );
-            if let Some(ms) = crate::terminal::file_metrics_summary(a.display_diff(), name) {
-                let _ = writeln!(s, "<sub>{}</sub>\n", cell(&ms.join(" · ")));
-            }
-            let mut body = String::new();
-            for (k, h) in hunks[i..run.end].iter().enumerate() {
-                if k > 0 {
-                    body.push_str("  ⋯\n");
+        crate::view::evidence_note_text(&hunks)
+    )?;
+    for group in crate::evidence::groups(&hunks) {
+        match group {
+            Group::Additions {
+                name,
+                severity,
+                top,
+                runs,
+            } => {
+                // One heading per changed file — captioned with its strongest
+                // rule — then a single fenced diff of its added lines, an
+                // ellipsis at each gap, mirroring the terminal's grouped view.
+                let title = top
+                    .map(|h| format!(" — {}", cell(&h.desc)))
+                    .unwrap_or_default();
+                writeln!(
+                    s,
+                    "{} {}{title} — added lines\n",
+                    dots(severity),
+                    code(name)
+                )?;
+                if let Some(ms) = crate::view::file_metrics_summary(a.display_diff(), name) {
+                    writeln!(s, "<sub>{}</sub>\n", cell(&ms.join(" · ")))?;
                 }
+                let mut body = String::new();
+                for (k, h) in runs.iter().enumerate() {
+                    if k > 0 {
+                        body.push_str("  ⋯\n");
+                    }
+                    for l in &h.lines {
+                        writeln!(body, "+ {:>6}  {}", l.locator, l.text)?;
+                    }
+                }
+                writeln!(s, "{}", fence(&body))?;
+            }
+            Group::Single(h) => {
+                let where_ = match &h.member {
+                    Some(m) => format!("{} → {}", code(&h.file), code(m)),
+                    None => code(&h.location),
+                };
+                writeln!(s, "{} {where_} — {}\n", dots(h.severity), cell(&h.desc))?;
+                let mut body = String::new();
                 for l in &h.lines {
-                    let _ = writeln!(body, "+ {:>6}  {}", l.locator, l.text);
+                    let gutter = if l.added == LineMark::Added { "+" } else { " " };
+                    writeln!(body, "{gutter} {:>6}  {}", l.locator, l.text)?;
                 }
+                writeln!(s, "{}", fence(&body))?;
             }
-            let _ = writeln!(s, "{}", fence(&body));
-            i = run.end;
-        } else {
-            let where_ = match &hunks[i].member {
-                Some(m) => format!("{} → {}", code(&hunks[i].file), code(m)),
-                None => code(&hunks[i].location),
-            };
-            let _ = writeln!(
-                s,
-                "{} {} — {}\n",
-                dots(hunks[i].severity),
-                where_,
-                cell(&hunks[i].desc)
-            );
-            let body: String = hunks[i]
-                .lines
-                .iter()
-                .map(|l| {
-                    let gutter = if l.added == Some(true) { "+" } else { " " };
-                    format!("{gutter} {:>6}  {}\n", l.locator, l.text)
-                })
-                .collect();
-            let _ = writeln!(s, "{}", fence(&body));
-            i += 1;
         }
     }
+
+    Ok(())
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -418,17 +457,35 @@ fn dots(sev: Severity) -> &'static str {
 /// Make a value safe as markdown *prose* — a table cell, a list item, or text
 /// sitting beside the raw HTML this report emits.
 ///
-/// Pipes would end a column and newlines a row. `<` and `&` matter just as
-/// much: GitHub renders a comment body as rich text, so an artifact whose
-/// author field or suppression reason carries `<img>`/`<details>` can forge a
-/// banner, hide the real verdict behind a collapsed block, or beacon the
-/// reviewer's IP. Everything reaching a comment is attacker-controlled — a
-/// fork's pull request supplies both the artifact *and* `.isomer.toml`.
+/// Everything reaching a comment is attacker-controlled — a fork's pull
+/// request supplies both the artifact *and* `.isomer.toml` — and GitHub
+/// renders a comment as rich text. So every ASCII punctuation character is
+/// backslash-escaped, which CommonMark defines for exactly this purpose: `<`
+/// cannot open `<img>`/`<details>` (forge a banner, hide the verdict, beacon
+/// the reviewer's IP), `[`/`](`/`![` cannot forge a "✅ CLEAN" link or image,
+/// `*`/`_`/`#`/`>` cannot restyle the line, and `|` cannot end a column.
+/// Newlines would end a row and become spaces. Two GitHub conveniences are not
+/// markdown and survive escaping, so they are broken with an invisible word
+/// joiner: an `@team` mention would ping people, and a `#123` reference would
+/// link an unrelated issue.
 fn cell(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('|', "\\|")
-        .replace(['\n', '\r'], " ")
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\n' | '\r' => out.push(' '),
+            '@' | '#' => {
+                out.push('\\');
+                out.push(c);
+                out.push('\u{2060}');
+            }
+            c if c.is_ascii_punctuation() => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// An inline code span whose delimiter outgrows any backtick run inside it, so
@@ -485,6 +542,21 @@ mod tests {
         assert_eq!(cell("a\nb"), "a b");
     }
 
+    /// Link, image, and emphasis syntax from an artifact must render as the
+    /// literal text it is, or a signer name can forge a passing banner.
+    #[test]
+    fn cells_cannot_forge_links_images_or_mentions() {
+        let forged = cell("![✅ CLEAN](https://x/b.svg) [ok](https://x) **bold** _i_");
+        assert!(!forged.contains("]("), "{forged}");
+        assert!(!forged.contains("**"), "{forged}");
+        assert!(forged.contains("\\!\\[✅ CLEAN\\]"), "{forged}");
+        // A mention or issue reference is split by an invisible joiner.
+        assert_eq!(cell("@team"), "\\@\u{2060}team");
+        assert_eq!(cell("#123"), "\\#\u{2060}123");
+        // Ordinary words and non-ASCII text pass through.
+        assert_eq!(cell("Jörg Müller"), "Jörg Müller");
+    }
+
     /// The inline half of the fence problem: a member name or path out of a
     /// hostile archive must not close the span and inject markup after it.
     #[test]
@@ -504,18 +576,37 @@ mod tests {
     fn cells_neutralize_html() {
         assert_eq!(
             cell("<img src=x onerror=alert(1)>"),
-            "&lt;img src=x onerror=alert(1)>"
+            "\\<img src\\=x onerror\\=alert\\(1\\)\\>"
         );
-        assert_eq!(cell("a & b"), "a &amp; b");
-        // Ampersand first, so an escaped entity is not re-encoded into a live one.
-        assert_eq!(cell("&lt;script>"), "&amp;lt;script>");
+        assert_eq!(cell("a & b"), "a \\& b");
+        // An entity spelled out in the input stays literal text.
+        assert_eq!(cell("&lt;script>"), "\\&lt\\;script\\>");
+    }
+
+    /// An oversized report keeps its footer — the gate verdict — and never
+    /// leaves an evidence fence open over the truncation note.
+    #[test]
+    fn truncation_keeps_the_footer_and_closes_an_open_fence() {
+        let mut body = String::from("intro\n");
+        body.push_str("````\n");
+        while body.len() < MAX_BODY * 2 {
+            body.push_str("+ 1  é line of evidence\n");
+        }
+        let footer = "\n---\n<sub>gate verdict</sub>\n";
+        let out = fit(body, footer);
+        assert!(out.len() <= MAX_BODY, "{} > {MAX_BODY}", out.len());
+        assert!(out.ends_with(footer));
+        assert!(out.contains("Report truncated"));
+        assert_eq!(open_fence(&out), None, "the cut must close its fence");
+
+        let short = fit("small\n".to_owned(), footer);
+        assert_eq!(short, format!("small\n{footer}"));
     }
 
     #[test]
-    fn truncation_respects_char_boundaries() {
-        let s = "aé";
-        // Byte 2 splits the 'é'; the floor must step back to 1.
-        assert_eq!(s.floor_char_boundary(2), 1);
-        assert!(s.is_char_boundary(s.floor_char_boundary(2)));
+    fn open_fence_tracks_nesting_by_length() {
+        assert_eq!(open_fence("```\ncode\n```\n"), None);
+        assert_eq!(open_fence("````\n```\n"), Some("````"));
+        assert_eq!(open_fence("text\n````\nx\n"), Some("````"));
     }
 }

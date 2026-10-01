@@ -5,7 +5,7 @@ use cleave::types::{ScopeDiff, TraitChange};
 
 fn region(offset: u64, address: u64, size: u64, exec: bool) -> Region {
     Region {
-        kind: "load".into(),
+        loadable: true,
         offset,
         address,
         size,
@@ -162,11 +162,11 @@ fn traits(roc: f32) -> ScopeDiff<TraitChange> {
         old_count: 20,
         new_count: 23,
         added: (0..3)
-            .map(|i| TraitChange {
-                id: format!("micro-behaviors/os/module/load::call-{i}"),
-                crit: cleave::Criticality::Notable,
-                conf: 1.0,
-                ..Default::default()
+            .map(|i| {
+                crate::testkit::finding(
+                    &format!("micro-behaviors/os/module/load::call-{i}"),
+                    cleave::Criticality::Notable,
+                )
             })
             .collect(),
         ..Default::default()
@@ -290,16 +290,11 @@ fn normal_assessment_keeps_traits_and_adds_structural_evidence() {
             summary: DiffSummary::default(),
             scopes: ScopeDiffs::default(),
             files: vec![FileDiffEntry {
-                path: "<root>".into(),
-                status: FileStatus::Changed,
-                file_type: Some(file_type.into()),
-                identity: None,
-                old_formula: None,
-                new_formula: None,
                 scopes: ScopeDiffs {
                     traits: Some(traits(0.4)),
                     ..Default::default()
                 },
+                ..crate::testkit::entry("<root>", file_type, FileStatus::Changed)
             }],
         };
         let pairs = [crate::analysis::Pair {
@@ -315,7 +310,7 @@ fn normal_assessment_keeps_traits_and_adds_structural_evidence() {
             .collect();
         assert!(!trait_ids.is_empty());
         enrich(&pairs, &report, &mut assessment);
-        assert_eq!(assessment.structure.severity, Severity::High);
+        assert_eq!(assessment.structure.severity(), Severity::High);
         assert!(assessment.new_severity().fails(Severity::High));
         assert_eq!(
             trait_ids,
@@ -330,7 +325,7 @@ fn normal_assessment_keeps_traits_and_adds_structural_evidence() {
                 .structure
                 .facts
                 .iter()
-                .any(|f| f.label == "entry point grafted")
+                .any(|f| f.label == FactLabel::EntryPointGrafted)
         );
     }
 }
@@ -545,9 +540,13 @@ fn pe_tls_callbacks_are_normalized_to_section_rvas() {
     assert!(
         c.findings
             .iter()
-            .any(|f| f.label == "loader callback grafted")
+            .any(|f| f.label == FactLabel::LoaderCallbackGrafted)
     );
-    assert!(!c.findings.iter().any(|f| f.label == "entry point grafted"));
+    assert!(
+        !c.findings
+            .iter()
+            .any(|f| f.label == FactLabel::EntryPointGrafted)
+    );
 }
 
 #[test]

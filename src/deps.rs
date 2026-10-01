@@ -11,12 +11,16 @@
 //! reported per dependency, never swallowed — a gap in coverage must not read
 //! as a clean dependency.
 
+use std::collections::{BTreeMap, HashSet};
+
+use anyhow::{Context, Result, bail};
 use cleave::AnalysisOptions;
 use cleave::types::DiffReportV1;
 
 use crate::Severity;
+use crate::member::MemberPath;
+use crate::purl::Ecosystem;
 use crate::rubric::severity_from_crit;
-use std::collections::BTreeMap;
 
 /// Per-category maxima preserve risk increases hidden by an unchanged overall
 /// maximum. Identity/packaging metadata is not a behavioral category.
@@ -35,7 +39,40 @@ impl Default for RiskProfile {
     }
 }
 
-pub(crate) fn compare_profiles(old: &RiskProfile, new: &RiskProfile) -> Severity {
+/// How a dependency's profile moved against its predecessor's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProfileDelta {
+    /// Less capability or risk than before.
+    Reduced,
+    /// The same categories at the same severities.
+    Equivalent,
+    /// More risk, or a behavioral category the predecessor did not have; the
+    /// new profile's own worst severity rides along.
+    Increased(Severity),
+}
+
+impl ProfileDelta {
+    /// The severity this movement contributes to the gate: an increase is at
+    /// least High, an equivalent swap is worth naming, a reduction is not.
+    pub(crate) fn severity(self) -> Severity {
+        match self {
+            Self::Reduced => Severity::Low,
+            Self::Equivalent => Severity::Medium,
+            Self::Increased(worst) => Severity::High.max(worst),
+        }
+    }
+
+    /// The movement in words, for every renderer.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Reduced => "reduced dependency capability/risk profile",
+            Self::Equivalent => "equivalent dependency capability/risk profile",
+            Self::Increased(_) => "increased dependency risk or new behavioral category",
+        }
+    }
+}
+
+pub(crate) fn compare_profiles(old: &RiskProfile, new: &RiskProfile) -> ProfileDelta {
     if new.severity > old.severity
         || new.categories.iter().any(|(category, severity)| {
             old.categories
@@ -43,11 +80,11 @@ pub(crate) fn compare_profiles(old: &RiskProfile, new: &RiskProfile) -> Severity
                 .is_none_or(|prior| severity > prior)
         })
     {
-        Severity::High.max(new.severity)
+        ProfileDelta::Increased(new.severity)
     } else if new.severity < old.severity || new.categories != old.categories {
-        Severity::Low
+        ProfileDelta::Reduced
     } else {
-        Severity::Medium
+        ProfileDelta::Equivalent
     }
 }
 
@@ -59,8 +96,8 @@ const MAX_HIGHLIGHTS: usize = 4;
 pub(crate) struct DepProfile {
     /// The declared coordinate, `peacenotwar@^9.1.3`.
     pub coord: String,
-    /// The package ecosystem, `npm` / `pypi` / …, for the section's context.
-    pub ecosystem: &'static str,
+    /// The package ecosystem, for the section's context.
+    pub ecosystem: Ecosystem,
     /// Worst severity found in the fetched dependency.
     pub severity: Severity,
     /// Strongest finding descriptions, worst-first — what the dependency does.
@@ -114,14 +151,10 @@ fn profiles_with(
                 let old = fetch(old);
                 new.baseline = Some(old.coord);
                 if old.note.is_none() && new.note.is_none() {
-                    new.new_severity = compare_profiles(&old.risk, &new.risk);
+                    let delta = compare_profiles(&old.risk, &new.risk);
+                    new.new_severity = delta.severity();
                     new.baseline_risk = Some(old.risk);
-                    new.comparison = match new.new_severity {
-                        Severity::Low => "reduced dependency capability/risk profile",
-                        Severity::Medium => "equivalent dependency capability/risk profile",
-                        _ => "increased dependency risk or new behavioral category",
-                    }
-                    .to_owned();
+                    new.comparison = delta.describe().to_owned();
                 } else {
                     new.new_severity = Severity::None;
                     new.comparison = "unknown dependency profile comparison".to_owned();
@@ -140,15 +173,19 @@ fn profiles_with(
 
 /// A runtime dependency a change declared: its ecosystem, name, and the version
 /// spec as written in the manifest.
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct Added {
-    ecosystem: &'static str,
+    ecosystem: Ecosystem,
     name: String,
     spec: String,
 }
 
 /// Fetch one added dependency and summarize what it does.
 fn profile(dep: &Added, options: &AnalysisOptions, progress: bool) -> DepProfile {
-    let coord = format!("{}@{}", dep.name, dep.spec);
+    // For display only — the fetch below resolves from `dep` itself — and
+    // lifted from the pull request's own manifest, so neutralized here once
+    // for every renderer.
+    let coord = crate::printable(&format!("{}@{}", dep.name, dep.spec));
     // Exact pins identify one immutable release. A range (`^0.1.0`) does not:
     // fetching its floor would miss the later compatible release an installer
     // actually resolves — precisely the event-stream/flatmap-stream failure
@@ -169,7 +206,7 @@ fn profile(dep: &Added, options: &AnalysisOptions, progress: bool) -> DepProfile
     let purl = match resolved_coordinate(dep) {
         Ok(purl) => purl,
         Err(error) => {
-            out.note = Some(error);
+            out.note = Some(format!("{error:#}"));
             return out;
         }
     };
@@ -185,7 +222,7 @@ fn profile(dep: &Added, options: &AnalysisOptions, progress: bool) -> DepProfile
             (out.severity, out.highlights) = summarize(&report);
             out.risk.severity = out.severity;
             for finding in crate::evidence::all_findings(&report) {
-                if finding.id.starts_with("metadata/") {
+                if crate::taxonomy::TraitId::new(&finding.id).is_metadata() {
                     continue;
                 }
                 if let Some(category) = crate::rubric::capability_class(&finding.id) {
@@ -210,23 +247,18 @@ fn profile(dep: &Added, options: &AnalysisOptions, progress: bool) -> DepProfile
     out
 }
 
-fn resolved_coordinate(dep: &Added) -> Result<String, String> {
-    let package = format!("pkg:{}/{}", dep.ecosystem, dep.name.replace('@', "%40"));
+fn resolved_coordinate(dep: &Added) -> Result<String> {
     if let Some(version) = exact_version(&dep.spec) {
-        return Ok(format!("{package}@{version}"));
+        return crate::purl::package(dep.ecosystem, &dep.name, Some(&version));
     }
-    if dep.ecosystem != "npm" {
-        return Err("dependency range resolution unavailable; profile unknown".into());
+    if dep.ecosystem != Ecosystem::Npm {
+        bail!("dependency range resolution unavailable; profile unknown");
     }
-    let (_, sources) =
-        scan::fetch::registry_with_sources(&filefacts::RefLocator::Purl(package.clone()));
-    let packument = sources
-        .iter()
-        .filter_map(|s| serde_json::from_slice::<serde_json::Value>(&s.bytes).ok())
-        .find(|doc| doc.get("versions").is_some())
-        .ok_or_else(|| "registry version catalogue unavailable; profile unknown".to_owned())?;
+    let package = crate::purl::package(dep.ecosystem, &dep.name, None)?;
+    let packument = crate::registry::packument(&package)
+        .context("registry version catalogue unavailable; profile unknown")?;
     let version = crate::registry::resolve_npm_spec(&dep.spec, &packument)?;
-    Ok(format!("{package}@{version}"))
+    crate::purl::package(dep.ecosystem, &dep.name, Some(&version))
 }
 
 /// A fetched dependency's analysis, read down to what the profile shows: its
@@ -282,6 +314,9 @@ fn exact_version(spec: &str) -> Option<String> {
 /// scope. Uses the same runtime dependency roots as the risk rubric:
 /// `dependencies`, `optionalDependencies`, and `peerDependencies`. Deeper paths
 /// are sub-fields of a version spec; dev/build trees do not ship to end users.
+///
+/// A dependency declared twice — in `package.json` and its lockfile, say — is
+/// one dependency, profiled once.
 fn changes(diff: &DiffReportV1) -> Vec<(Option<Added>, Added)> {
     let mut out = Vec::new();
     for file in &diff.files {
@@ -327,22 +362,16 @@ fn changes(diff: &DiffReportV1) -> Vec<(Option<Added>, Added)> {
             }
         }
     }
+    let mut seen: HashSet<(Option<Added>, Added)> = HashSet::new();
+    out.retain(|pair| seen.insert(pair.clone()));
     out
 }
 
-/// The PURL ecosystem for a manifest, keyed on its filename (the diff carries
-/// the member path, e.g. `<root>!!package/package.json`). `None` when the file
+/// The ecosystem for a manifest, keyed on its file name (the diff carries the
+/// member path, e.g. `<root>!!package/package.json`). `None` when the file
 /// declares no fetchable runtime dependencies, so no purl can be built.
-fn ecosystem(path: &str) -> Option<&'static str> {
-    let base = path.rsplit(['/', '!']).next().unwrap_or(path);
-    match base {
-        "package.json" | "package-lock.json" => Some("npm"),
-        "pyproject.toml" | "requirements.txt" | "poetry.lock" | "Pipfile.lock" => Some("pypi"),
-        "Cargo.toml" | "Cargo.lock" => Some("cargo"),
-        "Gemfile.lock" => Some("gem"),
-        "composer.json" | "composer.lock" => Some("composer"),
-        _ => None,
-    }
+fn ecosystem(path: &str) -> Option<Ecosystem> {
+    Ecosystem::of_manifest(MemberPath::new(path).file_name())
 }
 
 #[cfg(test)]
@@ -365,34 +394,47 @@ mod tests {
 
     #[test]
     fn profiles_compare_categories_and_per_category_risk_not_just_the_maximum() {
+        use ProfileDelta::{Equivalent, Increased, Reduced};
         use Severity::{Critical, High, Low, Medium};
         let old = risk(
             High,
             &[("data/read", Medium), ("communications/http", High)],
         );
-        for (new, expected) in [
-            (old.clone(), Medium),
-            (risk(High, &[("communications/http", High)]), Low),
+        for (new, expected, gate) in [
+            (old.clone(), Equivalent, Medium),
+            (risk(High, &[("communications/http", High)]), Reduced, Low),
             (
                 risk(
                     Medium,
                     &[("data/read", Medium), ("communications/http", Medium)],
                 ),
+                Reduced,
                 Low,
             ),
             (
                 risk(High, &[("data/read", High), ("communications/http", High)]),
+                Increased(High),
                 High,
             ),
-            (risk(High, &[("process/create", Medium)]), High),
-            (risk(Critical, &[("data/read", Medium)]), Critical),
-            (risk(Low, &[("new/category", Low)]), High),
+            (
+                risk(High, &[("process/create", Medium)]),
+                Increased(High),
+                High,
+            ),
+            (
+                risk(Critical, &[("data/read", Medium)]),
+                Increased(Critical),
+                Critical,
+            ),
+            (risk(Low, &[("new/category", Low)]), Increased(Low), High),
         ] {
-            assert_eq!(compare_profiles(&old, &new), expected);
+            let delta = compare_profiles(&old, &new);
+            assert_eq!(delta, expected);
+            assert_eq!(delta.severity(), gate);
         }
         assert_eq!(
             compare_profiles(&RiskProfile::default(), &RiskProfile::default()),
-            Medium
+            Equivalent
         );
     }
 
@@ -438,7 +480,7 @@ mod tests {
         for failing_spec in [None, Some("1.0.0"), Some("1.0.1")] {
             let rows = profiles_with(&diff, |dep| DepProfile {
                 coord: format!("{}@{}", dep.name, dep.spec),
-                ecosystem: "npm",
+                ecosystem: Ecosystem::Npm,
                 severity: Severity::High,
                 highlights: vec![],
                 note: (failing_spec == Some(dep.spec.as_str())).then(|| "timeout".into()),
@@ -496,10 +538,6 @@ mod tests {
             summary: DiffSummary::default(),
             scopes: ScopeDiffs::default(),
             files: vec![FileDiffEntry {
-                path: "package.json".to_string(),
-                file_type: Some("package.json".to_string()),
-                status: FileStatus::Changed,
-                identity: None,
                 scopes: ScopeDiffs {
                     kv: Some(ScopeDiff {
                         added: changes,
@@ -507,8 +545,7 @@ mod tests {
                     }),
                     ..Default::default()
                 },
-                old_formula: None,
-                new_formula: None,
+                ..crate::testkit::entry("package.json", "package.json", FileStatus::Changed)
             }],
         };
 
@@ -528,7 +565,7 @@ mod tests {
     fn added_dependency_profiles_contribute_their_worst_severity() {
         let profile = |severity| DepProfile {
             coord: "dep@1".to_string(),
-            ecosystem: "npm",
+            ecosystem: Ecosystem::Npm,
             severity,
             highlights: Vec::new(),
             note: None,
@@ -549,5 +586,33 @@ mod tests {
         let mut expanded = profile(Severity::Medium);
         expanded.new_severity = Severity::High;
         assert_eq!(severity(&[expanded]), Severity::High);
+    }
+
+    /// A dependency the manifest and its lockfile both declare is fetched once.
+    #[test]
+    fn a_dependency_declared_twice_is_profiled_once() {
+        let entry = serde_json::json!({"added":[{"path":"dependencies.dep", "value":"1.0.0"}]});
+        let mut value = serde_json::json!({
+            "old_root":"before", "new_root":"after", "summary":DiffSummary::default(),
+            "scopes": {},
+            "files":[
+                {"path":"package/package.json", "status":"changed", "scopes":{}},
+                {"path":"package/package-lock.json", "status":"changed", "scopes":{}}
+            ]
+        });
+        value["files"][0]["scopes"]["kv"] = entry.clone();
+        value["files"][1]["scopes"]["kv"] = entry;
+        let diff: DiffReportV1 = serde_json::from_value(value).unwrap();
+        assert_eq!(changes(&diff).len(), 1);
+    }
+
+    #[test]
+    fn manifests_are_recognized_by_their_file_name_only() {
+        assert_eq!(
+            ecosystem("<root>!!package/package.json"),
+            Some(Ecosystem::Npm)
+        );
+        assert_eq!(ecosystem("package.json"), Some(Ecosystem::Npm));
+        assert_eq!(ecosystem("sub/mypackage.json"), None);
     }
 }

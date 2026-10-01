@@ -12,7 +12,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::Severity;
-use crate::rubric::{Assessment, FactKind, StructFact};
+use crate::rubric::{Assessment, FactKind, FactLabel, StructFact};
 
 mod adapters;
 #[cfg(test)]
@@ -25,12 +25,11 @@ use adapters::{inspect_all, native_magic};
 #[derive(Debug, Clone)]
 struct Finding {
     severity: Severity,
-    label: &'static str,
+    label: FactLabel,
     facts: Vec<(&'static str, String)>,
     caveat: Option<&'static str>,
 }
 
-const BUILD_ID_WITH_CODE_CHANGE: &str = "build ID unchanged despite code change";
 const BUILD_ID_CAVEAT: &str = "a build ID is no integrity guarantee";
 
 #[derive(Debug)]
@@ -49,7 +48,10 @@ struct Comparison {
 
 #[derive(Debug, Clone)]
 struct Region {
-    kind: String,
+    /// A file-backed mapping the loader maps: every Mach-O/PE region, and an
+    /// ELF segment of type `load`. Notes, dynamic tables and the like are
+    /// regions of the file, not of the running image.
+    loadable: bool,
     offset: u64,
     size: u64,
     address: u64,
@@ -59,6 +61,31 @@ struct Region {
 }
 
 impl Region {
+    /// Mapped, executable, and carrying bytes: code that can run.
+    fn is_code(&self) -> bool {
+        self.loadable && self.executable && self.size > 0
+    }
+
+    /// Whether `inner` lies wholly inside this region's file-backed bytes, at
+    /// the same file offset the mapping implies — the test for a section that
+    /// belongs to a segment.
+    fn covers(&self, inner: &Region) -> bool {
+        inner.address.checked_sub(self.address).is_some_and(|d| {
+            d.checked_add(inner.size)
+                .is_some_and(|end| end <= self.size)
+                && self.offset.checked_add(d) == Some(inner.offset)
+        })
+    }
+
+    /// Whether `old` (in `old_bytes`) and `new` (in `new_bytes`) are the same
+    /// mapping with the same contents.
+    fn same_as(&self, old_bytes: &[u8], new: &Region, new_bytes: &[u8]) -> bool {
+        self.address == new.address
+            && self.size == new.size
+            && self.bytes(old_bytes).is_some()
+            && self.bytes(old_bytes) == new.bytes(new_bytes)
+    }
+
     fn contains(&self, address: u64) -> bool {
         // Only file-backed instructions qualify; an entry in zero-fill does
         // not prove execution of an appended payload.
@@ -93,22 +120,14 @@ impl Image<'_> {
             .as_ref()
             .unwrap_or(&self.regions)
             .iter()
-            .filter(|r| r.kind == "load" && r.executable && r.size > 0)
+            .filter(|r| r.is_code())
             .collect()
     }
 }
 
 fn compare(old: &Image<'_>, new: &Image<'_>) -> Comparison {
-    let old_exec: Vec<_> = old
-        .regions
-        .iter()
-        .filter(|r| r.kind == "load" && r.executable && r.size > 0)
-        .collect();
-    let new_exec: Vec<_> = new
-        .regions
-        .iter()
-        .filter(|r| r.kind == "load" && r.executable && r.size > 0)
-        .collect();
+    let old_exec: Vec<_> = old.regions.iter().filter(|r| r.is_code()).collect();
+    let new_exec: Vec<_> = new.regions.iter().filter(|r| r.is_code()).collect();
     let compatible = old.abi == new.abi;
     // Compare like with like when a section table appears/disappears. A
     // change in extraction representation is not itself an executable edit.
@@ -119,15 +138,7 @@ fn compare(old: &Image<'_>, new: &Image<'_>) -> Comparison {
     };
     let retained: Vec<_> = old_code
         .iter()
-        .filter(|r| {
-            compatible
-                && new_code.iter().any(|n| {
-                    r.address == n.address
-                        && r.size == n.size
-                        && r.bytes(old.bytes).is_some()
-                        && r.bytes(old.bytes) == n.bytes(new.bytes)
-                })
-        })
+        .filter(|r| compatible && new_code.iter().any(|n| r.same_as(old.bytes, n, new.bytes)))
         .collect();
     let mut result = Comparison {
         abi: new.abi.clone(),
@@ -152,20 +163,13 @@ fn compare(old: &Image<'_>, new: &Image<'_>) -> Comparison {
     // a code gain. Offsets can move during signing/debug layout changes.
     let changed_code: u64 = new_code
         .iter()
-        .filter(|n| {
-            !old_code.iter().any(|r| {
-                r.address == n.address
-                    && r.size == n.size
-                    && r.bytes(old.bytes).is_some()
-                    && r.bytes(old.bytes) == n.bytes(new.bytes)
-            })
-        })
+        .filter(|n| !old_code.iter().any(|r| r.same_as(old.bytes, n, new.bytes)))
         .map(|r| r.size)
         .sum();
     if result.retained_build_id == Some(true) && changed_code > 0 {
         result.findings.push(Finding {
             severity: Severity::Medium,
-            label: BUILD_ID_WITH_CODE_CHANGE,
+            label: FactLabel::BuildIdWithCodeChange,
             facts: vec![("code", format!("{changed_code} executable bytes changed"))],
             caveat: Some(BUILD_ID_CAVEAT),
         });
@@ -175,11 +179,11 @@ fn compare(old: &Image<'_>, new: &Image<'_>) -> Comparison {
         let old_mapping = old
             .regions
             .iter()
-            .find(|r| r.kind == "load" && r.address == region.address);
+            .find(|r| r.loadable && r.address == region.address);
         if region.writable && old_mapping.is_none_or(|r| !r.executable || !r.writable) {
             result.findings.push(Finding {
                 severity: Severity::High,
-                label: "writable+executable mapping",
+                label: FactLabel::WritableExecutableMapping,
                 facts: vec![(
                     "mapping",
                     format!("{:#x} became writable+executable", region.address),
@@ -194,14 +198,10 @@ fn compare(old: &Image<'_>, new: &Image<'_>) -> Comparison {
         // The new entry must leave the old executable address ranges, not
         // merely move between existing functions during a normal rebuild.
         let appended = region.offset >= old.bytes.len() as u64;
-        let repurposed = old.regions.iter().any(|r| {
-            r.kind == "load"
-                && !r.executable
-                && region.address.checked_sub(r.address).is_some_and(|d| {
-                    d.checked_add(region.size).is_some_and(|end| end <= r.size)
-                        && r.offset.checked_add(d) == Some(region.offset)
-                })
-        });
+        let repurposed = old
+            .regions
+            .iter()
+            .any(|r| r.loadable && !r.executable && r.covers(region));
         if !original_retained || (!appended && !repurposed) {
             continue;
         }
@@ -212,7 +212,7 @@ fn compare(old: &Image<'_>, new: &Image<'_>) -> Comparison {
         {
             result.findings.push(Finding {
                 severity: Severity::High,
-                label: "entry point grafted",
+                label: FactLabel::EntryPointGrafted,
                 facts: vec![
                     ("entry", format!("{:#x} → {:#x}", old.entry, new.entry)),
                     (
@@ -246,7 +246,7 @@ fn compare(old: &Image<'_>, new: &Image<'_>) -> Comparison {
         if !callbacks.is_empty() {
             result.findings.push(Finding {
                 severity: Severity::High,
-                label: "loader callback grafted",
+                label: FactLabel::LoaderCallbackGrafted,
                 facts: vec![
                     (
                         "callbacks",
@@ -326,7 +326,7 @@ fn trait_churn(
     }
     Some(Finding {
         severity: Severity::Medium,
-        label: "build ID unchanged despite trait churn",
+        label: FactLabel::BuildIdWithTraitChurn,
         facts: vec![(
             "traits",
             format!(
@@ -365,36 +365,33 @@ pub(crate) fn enrich(
         let mut comparisons = match compare_paths(old, new) {
             Ok(c) => c,
             Err(error) => {
-                eprintln!(
-                    "isomer: structural comparison unavailable: {}",
-                    crate::printable(&error.to_string())
+                // `{:#}`: the whole cause chain, not just the outermost
+                // "reading X" context.
+                log::warn!(
+                    "structural comparison unavailable: {}",
+                    crate::printable(&format!("{error:#}"))
                 );
                 continue;
             }
         };
-        let file = diff
-            .files
-            .iter()
-            .find(|f| f.path == pair.label || (pairs.len() == 1 && f.path == "<root>"));
+        let file = diff.files.iter().find(|f| {
+            f.path == pair.label
+                || (pairs.len() == 1 && crate::member::MemberPath::new(&f.path).is_root())
+        });
         // Universal binaries expose aggregate/preferred-slice traits. Do not
         // attach those to a different slice's identity.
-        let churn = comparisons
-            .first()
-            .filter(|_| comparisons.len() == 1)
-            .and_then(|comparison| {
-                file.and_then(|f| f.scopes.traits.as_ref())
-                    .and_then(|t| trait_churn(comparison, t))
-            });
         // Trait churn under a retained build ID is the same observation as
         // code change under a retained build ID, seen through the scanner
         // instead of the bytes: when both fire they are one finding.
-        if let Some(churn) = churn
-            && let Some(comparison) = comparisons.first_mut()
+        if let [comparison] = comparisons.as_mut_slice()
+            && let Some(churn) = file
+                .and_then(|f| f.scopes.traits.as_ref())
+                .and_then(|t| trait_churn(comparison, t))
         {
             match comparison
                 .findings
                 .iter_mut()
-                .find(|f| f.label == BUILD_ID_WITH_CODE_CHANGE)
+                .find(|f| f.label == FactLabel::BuildIdWithCodeChange)
             {
                 Some(finding) => finding.facts.extend(churn.facts),
                 None => comparison.findings.push(churn),
@@ -406,8 +403,6 @@ pub(crate) fn enrich(
             // apart. The detail stays the bare observation.
             let subject = format!("{} · {}", crate::printable(&pair.label), comparison.abi);
             for finding in comparison.findings {
-                assessment.severity = assessment.severity.max(finding.severity);
-                assessment.structure.severity = assessment.structure.severity.max(finding.severity);
                 assessment.structure.facts.push(StructFact {
                     severity: finding.severity,
                     kind: FactKind::Became,

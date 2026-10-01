@@ -9,14 +9,18 @@
 
 use crate::Severity;
 
-/// A parsed dotted-numeric version. Pre-release / build metadata is kept in
-/// `raw` for display but does not affect bump classification.
+/// A parsed dotted-numeric version. The prerelease tag takes part in bump
+/// classification ([`Version::prerelease`]); build metadata (`+build.5`) is
+/// kept in `raw` for display and ignored everywhere else, as SemVer requires.
 ///
 /// The first three components retain their usual major/minor/patch meaning.
 /// Additional numeric components are preserved because WordPress and Windows
 /// packages commonly use four-part versions (`4.4.6.4`, `10.0.19045.4046`).
 /// For release-tolerance purposes those deeper components are patch-level.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Equality is by meaning, not spelling: `1.2` equals `1.2.0`, and build
+/// metadata never distinguishes two versions.
+#[derive(Debug, Clone)]
 pub(crate) struct Version {
     pub major: u64,
     pub minor: u64,
@@ -29,6 +33,16 @@ pub(crate) struct Version {
     /// from a filename precisely because this is not the source token.
     pub raw: String,
 }
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Self) -> bool {
+        let width = self.component_count().max(other.component_count());
+        (0..width).all(|i| self.component(i) == other.component(i))
+            && self.prerelease() == other.prerelease()
+    }
+}
+
+impl Eq for Version {}
 
 impl Version {
     /// Parse a bare version token (`5.6.0`, `1.2`, `4.4.6.4`,
@@ -64,6 +78,31 @@ impl Version {
 
     fn component_count(&self) -> usize {
         3 + self.extra.len()
+    }
+
+    /// The SemVer prerelease tag — `rc.1` in `6.0.0-rc.1+build-5` — or `None`
+    /// for a release. Build metadata is removed *first*: a hyphen inside it
+    /// (`1.2.3+build-5`) is not a prerelease separator, and reading it as one
+    /// once classified a rebuild of `1.2.3` as a downgrade.
+    pub(crate) fn prerelease(&self) -> Option<&str> {
+        let without_build = self
+            .raw
+            .split_once('+')
+            .map_or(self.raw.as_str(), |(v, _)| v);
+        without_build.split_once('-').map(|(_, pre)| pre)
+    }
+
+    /// Parse a version the user typed — `--base-version` / `--head-version` —
+    /// where a leading `v` is the common spelling and a value that does not
+    /// parse is a mistake to report, not a hint to ignore.
+    pub(crate) fn parse_override(flag: &str, value: &str) -> anyhow::Result<Self> {
+        let trimmed = value.trim();
+        Self::parse(trimmed.strip_prefix(['v', 'V']).unwrap_or(trimmed)).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{flag} `{}` is not a version (expected MAJOR.MINOR[.PATCH…][-PRERELEASE][+BUILD])",
+                crate::printable(value)
+            )
+        })
     }
 
     /// Extract the most complete version-like token from a filename, e.g.
@@ -127,8 +166,9 @@ impl Version {
     }
 }
 
-/// Which version component moved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which version component moved. Serialized by name, as the report's `bump`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum BumpKind {
     Major,
     Minor,
@@ -141,82 +181,94 @@ pub(crate) enum BumpKind {
     Downgrade,
 }
 
+/// What a release's version number promises about new behavior — the bar the
+/// shape rules scale with. One reading of [`BumpKind`] rather than a pressure
+/// number spelled out at each rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Promise {
+    /// Same version, patch, prerelease, or downgrade: nothing new should ship.
+    Nothing,
+    /// A minor release: new features, within reason.
+    Features,
+    /// A major release: anything may change.
+    Anything,
+}
+
+impl BumpKind {
+    /// What this kind of release promises. A downgrade promises less than
+    /// anything, so it reads as the strictest promise.
+    pub(crate) fn promise(self) -> Promise {
+        match self {
+            Self::Same | Self::Patch | Self::Prerelease | Self::Downgrade => Promise::Nothing,
+            Self::Minor => Promise::Features,
+            Self::Major => Promise::Anything,
+        }
+    }
+}
+
 /// How the new version relates to the old one, including *how far* it moved:
 /// `5.4.5 → 5.6.0` is `Minor` with `steps = 2` (two minor releases), which the
 /// report states honestly rather than calling it "a minor release".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Bump {
     pub kind: BumpKind,
-    pub steps: u64,
+    /// How many releases of `kind` the bump spans. Only a numeric move has a
+    /// distance; [`Bump::new`] keeps it zero for every other kind.
+    steps: u64,
 }
 
 impl Bump {
+    /// A bump of `kind` spanning `steps` releases. A distance is recorded only
+    /// for a major, minor, or patch move: "two same-version releases" is not a
+    /// thing, so any other kind carries none.
+    pub(crate) fn new(kind: BumpKind, steps: u64) -> Self {
+        let steps = match kind {
+            BumpKind::Major | BumpKind::Minor | BumpKind::Patch => steps,
+            BumpKind::Prerelease | BumpKind::Same | BumpKind::Downgrade => 0,
+        };
+        Self { kind, steps }
+    }
+
+    /// The distance, for a numeric move.
+    pub(crate) fn steps(self) -> Option<u64> {
+        (self.steps > 0).then_some(self.steps)
+    }
+
     pub(crate) fn classify(old: &Version, new: &Version) -> Bump {
         let width = old.component_count().max(new.component_count());
         for index in 0..width {
             let old_part = old.component(index);
             let new_part = new.component(index);
             if new_part < old_part {
-                return Bump {
-                    kind: BumpKind::Downgrade,
-                    steps: 0,
-                };
+                return Bump::new(BumpKind::Downgrade, 0);
             }
             if new_part > old_part {
-                return Bump {
-                    kind: match index {
-                        0 => BumpKind::Major,
-                        1 => BumpKind::Minor,
-                        _ => BumpKind::Patch,
-                    },
-                    steps: new_part - old_part,
+                let kind = match index {
+                    0 => BumpKind::Major,
+                    1 => BumpKind::Minor,
+                    _ => BumpKind::Patch,
                 };
+                return Bump::new(kind, new_part - old_part);
             }
         }
-        fn prerelease(version: &Version) -> Option<&str> {
-            version
-                .raw
-                .split_once('-')
-                .map(|(_, suffix)| suffix.split('+').next().unwrap_or(suffix))
+        // Same numeric version: SemVer precedence over the prerelease tags
+        // decides. A release outranks every prerelease of it, so `1.0.0` →
+        // `1.0.0-rc.1` moves backwards, and so does `rc.2` → `rc.1`.
+        match prerelease_order(old.prerelease(), new.prerelease()) {
+            std::cmp::Ordering::Less => {
+                return Bump::new(BumpKind::Prerelease, 0);
+            }
+            std::cmp::Ordering::Greater => {
+                return Bump::new(BumpKind::Downgrade, 0);
+            }
+            std::cmp::Ordering::Equal => {}
         }
-        let old_prerelease = prerelease(old);
-        let new_prerelease = prerelease(new);
-        if old_prerelease != new_prerelease {
-            return Bump {
-                kind: if old_prerelease.is_none() {
-                    BumpKind::Downgrade
-                } else {
-                    BumpKind::Prerelease
-                },
-                steps: 0,
-            };
-        }
-        Bump {
-            kind: BumpKind::Same,
-            steps: 0,
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self.kind {
-            BumpKind::Major => "major",
-            BumpKind::Minor => "minor",
-            BumpKind::Patch => "patch",
-            BumpKind::Prerelease => "prerelease",
-            BumpKind::Same => "same",
-            BumpKind::Downgrade => "downgrade",
-        }
+        Bump::new(BumpKind::Same, 0)
     }
 
     /// Human phrase: `minor release` for one step, `2 minor releases` for more.
     pub(crate) fn describe(self) -> String {
-        match self.kind {
-            BumpKind::Same => "same version".to_string(),
-            BumpKind::Prerelease => "prerelease transition".to_string(),
-            BumpKind::Downgrade => "downgrade".to_string(),
-            _ if self.steps > 1 => format!("{} {} releases", self.steps, self.label()),
-            _ => format!("{} release", self.label()),
-        }
+        self.to_string()
     }
 
     /// Highest behavioral-capability severity considered *proportionate* for
@@ -235,17 +287,103 @@ impl Bump {
     }
 }
 
+/// SemVer precedence of two prerelease tags on the same numeric version: `Less`
+/// when `old` precedes `new`. No tag (a release) outranks any tag; otherwise
+/// dot-separated identifiers compare left to right, numeric ones numerically
+/// and below alphanumeric ones, and a shorter tag that is a prefix of a longer
+/// one comes first.
+fn prerelease_order(old: Option<&str>, new: Option<&str>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (old, new) = match (old, new) {
+        (None, None) => return Ordering::Equal,
+        (None, Some(_)) => return Ordering::Greater,
+        (Some(_), None) => return Ordering::Less,
+        (Some(old), Some(new)) => (old, new),
+    };
+    let identifier = |id: &str| -> (bool, u64) {
+        match id.parse::<u64>() {
+            Ok(n) if id.bytes().all(|b| b.is_ascii_digit()) => (false, n),
+            _ => (true, 0),
+        }
+    };
+    let mut a = old.split('.');
+    let mut b = new.split('.');
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let order = match (identifier(x), identifier(y)) {
+                    ((false, m), (false, n)) => m.cmp(&n),
+                    ((false, _), (true, _)) => Ordering::Less,
+                    ((true, _), (false, _)) => Ordering::Greater,
+                    ((true, _), (true, _)) => x.cmp(y),
+                };
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+        }
+    }
+}
+
+impl BumpKind {
+    /// The kind's name, as the report's `bump` field spells it.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Major => "major",
+            Self::Minor => "minor",
+            Self::Patch => "patch",
+            Self::Prerelease => "prerelease",
+            Self::Same => "same",
+            Self::Downgrade => "downgrade",
+        }
+    }
+}
+
+impl std::fmt::Display for BumpKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `minor release` for one step, `2 minor releases` for more.
+impl std::fmt::Display for Bump {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.kind, self.steps()) {
+            (BumpKind::Same, _) => f.write_str("same version"),
+            (BumpKind::Prerelease, _) => f.write_str("prerelease transition"),
+            (BumpKind::Downgrade, _) => f.write_str("downgrade"),
+            (kind, Some(steps)) if steps > 1 => write!(f, "{steps} {kind} releases"),
+            (kind, _) => write!(f, "{kind} release"),
+        }
+    }
+}
+
+/// Archive extensions a published filename can end in, compound ones first so
+/// `.tar.gz` is stripped whole rather than leaving `.tar` behind. One list for
+/// every place a name is read, so the version and the display name agree on
+/// where the name ends.
+pub(crate) const ARCHIVE_SUFFIXES: [&str; 12] = [
+    ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tgz", ".txz", ".tbz2", ".tar", ".whl", ".zip",
+    ".gz", ".xz",
+];
+
+/// The name without its archive extension, if it has one.
+pub(crate) fn strip_archive_suffix(name: &str) -> Option<&str> {
+    ARCHIVE_SUFFIXES
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+}
+
 /// Preserve common SemVer prerelease suffixes after the numeric token without
 /// mistaking platform tags such as `-linux-x64` for versions. Archive suffixes
-/// are removed first so `-rc.1.tgz` becomes exactly `-rc.1`.
+/// are removed first so `-rc.1.tgz` becomes exactly `-rc.1`; so is the
+/// `.sample` a quarantine store appends.
 fn common_prerelease_suffix<'a>(name: &'a str, numeric: &str) -> Option<&'a str> {
-    let stem = [
-        ".tar.gz", ".tar.xz", ".tar.bz2", ".tgz", ".txz", ".tbz2", ".whl", ".zip", ".gz", ".xz",
-        ".sample",
-    ]
-    .iter()
-    .find_map(|extension| name.strip_suffix(extension))
-    .unwrap_or(name);
+    let stem = name.strip_suffix(".sample").unwrap_or(name);
+    let stem = strip_archive_suffix(stem).unwrap_or(stem);
     let start = stem.find(numeric)? + numeric.len();
     let suffix = stem.get(start..)?;
     let prerelease = suffix.strip_prefix('-')?;
@@ -316,7 +454,7 @@ mod tests {
         // 5.4.5 → 5.6.0 is TWO minor releases, not one.
         let b = Bump::classify(&v("5.4.5").unwrap(), &v("5.6.0").unwrap());
         assert_eq!(b.kind, BumpKind::Minor);
-        assert_eq!(b.steps, 2);
+        assert_eq!(b.steps(), Some(2));
         assert_eq!(b.describe(), "2 minor releases");
 
         assert_eq!(
@@ -348,20 +486,55 @@ mod tests {
         );
     }
 
+    /// Build metadata is not a prerelease, even when it contains a hyphen.
+    #[test]
+    fn build_metadata_never_reads_as_a_prerelease() {
+        let v = |s| Version::parse(s).unwrap();
+        assert_eq!(v("1.2.3+build-5").prerelease(), None);
+        assert_eq!(v("1.2.3-rc.1+build-5").prerelease(), Some("rc.1"));
+        assert_eq!(
+            Bump::classify(&v("1.2.3"), &v("1.2.3+build-5")).kind,
+            BumpKind::Same
+        );
+        assert_eq!(v("1.2.3"), v("1.2.3+build-5"));
+        assert_eq!(v("1.2"), v("1.2.0"));
+        assert_ne!(v("1.2.0"), v("1.2.0-rc.1"));
+    }
+
+    #[test]
+    fn prerelease_moves_follow_semver_precedence() {
+        let kind =
+            |a, b| Bump::classify(&Version::parse(a).unwrap(), &Version::parse(b).unwrap()).kind;
+        assert_eq!(kind("1.0.0-rc.1", "1.0.0-rc.2"), BumpKind::Prerelease);
+        assert_eq!(kind("1.0.0-rc.2", "1.0.0-rc.1"), BumpKind::Downgrade);
+        assert_eq!(kind("1.0.0-rc.9", "1.0.0-rc.10"), BumpKind::Prerelease);
+        assert_eq!(kind("1.0.0-alpha", "1.0.0-beta"), BumpKind::Prerelease);
+        assert_eq!(kind("1.0.0-alpha.1", "1.0.0-alpha"), BumpKind::Downgrade);
+        assert_eq!(kind("1.0.0", "1.0.0-rc.1"), BumpKind::Downgrade);
+        assert_eq!(kind("1.0.0-rc.1", "1.0.0"), BumpKind::Prerelease);
+    }
+
+    #[test]
+    fn version_overrides_accept_a_v_prefix_and_reject_junk() {
+        assert_eq!(
+            Version::parse_override("--base-version", "v1.2.3")
+                .unwrap()
+                .raw,
+            "1.2.3"
+        );
+        assert!(Version::parse_override("--base-version", "7").is_err());
+        assert!(Version::parse_override("--base-version", "latest").is_err());
+    }
+
     #[test]
     fn tolerance_tightens_for_smaller_bumps() {
-        let b = |kind| Bump { kind, steps: 1 };
+        let b = |kind| Bump::new(kind, 1);
         assert_eq!(b(BumpKind::Patch).tolerance(), Severity::None);
         assert_eq!(b(BumpKind::Minor).tolerance(), Severity::Medium);
         assert_eq!(b(BumpKind::Major).tolerance(), Severity::High);
         // Two minor releases still don't license a High capability.
-        assert_eq!(
-            Bump {
-                kind: BumpKind::Minor,
-                steps: 2
-            }
-            .tolerance(),
-            Severity::Medium
-        );
+        assert_eq!(Bump::new(BumpKind::Minor, 2).tolerance(), Severity::Medium);
+        // A same-version bump has no distance to report.
+        assert_eq!(Bump::new(BumpKind::Same, 3).steps(), None);
     }
 }

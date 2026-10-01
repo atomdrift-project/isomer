@@ -1,33 +1,25 @@
 //! `isomer fs` — differential analysis of two local trees.
 //!
-//! The verb is deliberately thin: [`crate::analysis`] does the judging and the
-//! renderers do the talking. `fs` only names the two sides and prints one
+//! The verb is deliberately thin: the analysis does the judging and the
+//! renderers do the talking. `fs` only names the two sides and renders one
 //! format.
 
 use std::path::Path;
 
 use anyhow::Result;
 
-use crate::analysis::{self, Analysis};
+use crate::Outcome;
+use crate::analysis::{Comparison, Framing, Verb};
 use crate::options::Options;
 
-/// Diff `old` against `new`, emit the report, and return whether the delta is
+/// Diff `old` against `new`: the report in `--format`, and whether the delta is
 /// clean at `--fail-on`.
-pub fn run(old: &Path, new: &Path, opts: &Options) -> Result<bool> {
-    // Source archives often carry meaningful non-program members: build
-    // macros, test fixtures, and opaque payloads. Keep them in the
-    // differential so source-only attacks are not reduced to the subset of
-    // members with a recognized executable/source file type. Directory
-    // comparisons retain cleave's safer recognized-file policy; direct scans
-    // of source trees can legitimately contain corrupt fixtures.
-    let all_source_members = analysis::is_source_archive(old) && analysis::is_source_archive(new);
-    let options = cleave::AnalysisOptions {
-        all_files: all_source_members,
-        ..cleave::AnalysisOptions::default()
-    };
-    let report = analysis::diff(old, new, &options)?;
-    let mut a = Analysis::new("fs", old, new, &options, &report, opts)?;
-    a.finish(opts);
-    crate::write_stdout(&a.render(opts.format, opts)?)?;
-    Ok(a.clean)
+pub fn run(old: &Path, new: &Path, opts: &Options) -> Result<Outcome> {
+    opts.validate()?;
+    let comparison = Comparison::run(old, new)?;
+    let a = comparison.judge(Verb::Fs, old, new, opts, Framing::default())?;
+    Ok(Outcome {
+        report: a.render(opts.format)?,
+        clean: a.clean(),
+    })
 }

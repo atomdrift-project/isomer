@@ -7,37 +7,26 @@ use std::path::Path;
 use cleave::Criticality;
 use cleave::types::{
     Changed, DiffReportV1, DiffSummary, FileDiffEntry, FileStatus, KvChange, MetricChange,
-    ScopeDiff, ScopeDiffs, ScopeRocs, TraitChange,
+    ScopeDiff, ScopeDiffs, ScopeRocs,
 };
 
-use super::{
-    Naming, Proportionality, Remediation, capability_mass_escalation, capability_shape,
-    change_shape_escalation, deterministic_verdicts, normalized_archive_diff,
-    remediation_cleanup_context, significant_risk_escalation,
-    source_download_write_execute_anomaly,
+use super::detectors::{change_shape_escalation_for, source_download_write_execute_anomaly};
+use super::naming::Naming;
+use super::normalize::normalized_archive_diff;
+use super::remediation::{Remediation, remediation_cleanup_context};
+use super::verdict::{
+    Proportionality, Verdicts, capability_mass_escalation, deterministic_verdicts,
+    significant_risk_escalation,
 };
 use crate::Severity;
 use crate::risk::Risk;
 use crate::rubric::{Assessment, assess};
 use crate::version::{Bump, BumpKind};
 
-fn finding(id: &str, crit: Criticality) -> TraitChange {
-    TraitChange {
-        id: id.to_owned(),
-        trait_section: id.split('/').next().unwrap().to_owned(),
-        crit,
-        conf: 1.0,
-        count: 1,
-        desc: id.to_owned(),
-    }
-}
+use crate::testkit::finding;
 
 fn source(path: &str, traits: &[&str]) -> FileDiffEntry {
     FileDiffEntry {
-        path: format!("<root>!!package/{path}"),
-        file_type: Some("javascript".to_owned()),
-        status: FileStatus::Added,
-        identity: None,
         scopes: ScopeDiffs {
             traits: Some(ScopeDiff {
                 added: traits
@@ -48,36 +37,50 @@ fn source(path: &str, traits: &[&str]) -> FileDiffEntry {
             }),
             ..Default::default()
         },
-        old_formula: None,
-        new_formula: None,
+        ..crate::testkit::entry(
+            format!("<root>!!package/{path}"),
+            "javascript",
+            FileStatus::Added,
+        )
     }
 }
 
+/// The release shape every simulation is judged under unless it says
+/// otherwise: a compact patch — two files added, four changed, a hundred
+/// untouched — moving 12% of the artifact. The shape rules read this summary
+/// and the rubric reads the files, so it is fixed rather than counted from
+/// them: a simulation states which behavior arrived, and this states how big
+/// the release around it was.
+fn compact_patch() -> DiffSummary {
+    DiffSummary {
+        files_added: 2,
+        files_changed: 4,
+        files_unchanged: 100,
+        overall_roc: 0.12,
+        scope_roc: ScopeRocs {
+            traits: 0.12,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// `files` inside a [`compact_patch`].
 fn report(files: Vec<FileDiffEntry>) -> DiffReportV1 {
     DiffReportV1 {
         old_root: "before.zip".to_owned(),
         new_root: "after.zip".to_owned(),
-        summary: DiffSummary {
-            files_added: 2,
-            files_changed: 4,
-            files_unchanged: 100,
-            overall_roc: 0.12,
-            scope_roc: ScopeRocs {
-                traits: 0.12,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
+        summary: compact_patch(),
         files,
         scopes: ScopeDiffs::default(),
     }
 }
 
 fn shape(diff: &DiffReportV1, kind: BumpKind) -> Severity {
-    change_shape_escalation(
+    change_shape_escalation_for(
         &assess(diff, &HashSet::new()),
         diff,
-        Some(Bump { kind, steps: 1 }),
+        Some(Bump::new(kind, 1)),
         false,
         false,
         &HashSet::new(),
@@ -93,44 +96,56 @@ fn encoded_execution_cluster_uses_namespaces_and_requires_all_four_legs() {
         "micro-behaviors/fs/write/file::write",
     ];
     let complete = report(vec![source("library.js", &ids)]);
-    assert!(super::gained_encoded_execution_cluster(&complete));
+    assert!(super::detectors::gained_encoded_execution_cluster(
+        &complete
+    ));
     assert_eq!(shape(&complete, BumpKind::Patch), Severity::High);
     let mut detached = complete.clone();
     detached.files[0].scopes.traits.as_mut().unwrap().added[3].id =
         "micro-behaviors/process/daemonize/detach::detaches-child".to_owned();
-    assert!(super::gained_encoded_execution_cluster(&detached));
+    assert!(super::detectors::gained_encoded_execution_cluster(
+        &detached
+    ));
     let mut url_only = complete.clone();
     url_only.files[0].scopes.traits.as_mut().unwrap().added[3].id =
         "micro-behaviors/communications/http/url/forge::url".to_owned();
-    assert!(!super::gained_encoded_execution_cluster(&url_only));
+    assert!(!super::detectors::gained_encoded_execution_cluster(
+        &url_only
+    ));
     for missing in 0..ids.len() {
         let partial: Vec<_> = ids
             .iter()
             .enumerate()
             .filter_map(|(index, id)| (index != missing).then_some(*id))
             .collect();
-        assert!(!super::gained_encoded_execution_cluster(&report(vec![
-            source("library.js", &partial)
-        ])));
+        assert!(!super::detectors::gained_encoded_execution_cluster(
+            &report(vec![source("library.js", &partial)])
+        ));
     }
     let split = report(vec![
         source("encoding.js", &ids[..2]),
         source("worker.js", &ids[2..]),
     ]);
-    assert!(!super::gained_encoded_execution_cluster(&split));
+    assert!(!super::detectors::gained_encoded_execution_cluster(&split));
     let mut aggregate = complete.clone();
     aggregate.files[0].file_type = Some("npm".to_owned());
-    assert!(!super::gained_encoded_execution_cluster(&aggregate));
+    assert!(!super::detectors::gained_encoded_execution_cluster(
+        &aggregate
+    ));
     let mut removed = complete.clone();
     removed.files[0].status = FileStatus::Removed;
-    assert!(!super::gained_encoded_execution_cluster(&removed));
+    assert!(!super::detectors::gained_encoded_execution_cluster(
+        &removed
+    ));
     let mut noise = complete.clone();
     noise.files[0].scopes.traits.as_mut().unwrap().added[0].crit = Criticality::Component;
-    assert!(!super::gained_encoded_execution_cluster(&noise));
+    assert!(!super::detectors::gained_encoded_execution_cluster(&noise));
     let mut lookalike = complete;
     lookalike.files[0].scopes.traits.as_mut().unwrap().added[0].id =
         "metadata/file/encoded-unrelated::label".to_owned();
-    assert!(!super::gained_encoded_execution_cluster(&lookalike));
+    assert!(!super::detectors::gained_encoded_execution_cluster(
+        &lookalike
+    ));
 }
 
 #[test]
@@ -151,10 +166,16 @@ fn network_interface_and_folder_write_do_not_establish_targeting() {
             assessment.new_severity(),
             Severity::None,
             Severity::None,
-            false,
+            None,
         )
     };
-    assert_eq!(verdict(&diff), (Severity::Medium, Severity::Medium));
+    assert_eq!(
+        verdict(&diff),
+        Verdicts {
+            overall: Severity::Medium,
+            new: Severity::Medium
+        }
+    );
     assert_eq!(shape(&diff, BumpKind::Patch), Severity::None);
 
     // Independent evidence of hostile impact must still fail the gate.
@@ -168,7 +189,13 @@ fn network_interface_and_folder_write_do_not_establish_targeting() {
             "objectives/impact/deface/user-folder::library-plants-file-in-user-folders",
             Criticality::Hostile,
         ));
-    assert_eq!(verdict(&diff), (Severity::Critical, Severity::Critical));
+    assert_eq!(
+        verdict(&diff),
+        Verdicts {
+            overall: Severity::Critical,
+            new: Severity::Critical
+        }
+    );
 }
 
 #[test]
@@ -191,9 +218,12 @@ fn personal_folder_report_saving_does_not_establish_hostile_planting() {
             assessment.new_severity(),
             Severity::None,
             Severity::None,
-            false
+            None
         ),
-        (Severity::Medium, Severity::Medium)
+        Verdicts {
+            overall: Severity::Medium,
+            new: Severity::Medium
+        }
     );
 }
 
@@ -229,13 +259,10 @@ fn native_build_hook_requires_syscall_or_signal_capability() {
         assert_eq!(shape(&diff, BumpKind::Patch), Severity::High, "{id}");
         // Source archives still require independent build-macro evidence.
         assert_eq!(
-            change_shape_escalation(
+            change_shape_escalation_for(
                 &assess(&diff, &HashSet::new()),
                 &diff,
-                Some(Bump {
-                    kind: BumpKind::Patch,
-                    steps: 1
-                }),
+                Some(Bump::new(BumpKind::Patch, 1)),
                 true,
                 false,
                 &HashSet::new()
@@ -270,13 +297,13 @@ fn structural_linker_facts_require_exact_elf_fields() {
         "elf.needed_unrelated",
         "elf.ifuncs_unrelated",
     ] {
-        assert_eq!(structure(path, "json").severity, Severity::None, "{path}");
+        assert_eq!(structure(path, "json").severity(), Severity::None, "{path}");
     }
     for path in ["elf.needed[]=ld-linux-x86-64.so.2", "elf.ifuncs[]=resolve"] {
-        assert_eq!(structure(path, "elf").severity, Severity::High, "{path}");
+        assert_eq!(structure(path, "elf").severity(), Severity::High, "{path}");
     }
     assert_eq!(
-        structure("elf.dynsym_funcs[name=read].type", "elf").severity,
+        structure("elf.dynsym_funcs[name=read].type", "elf").severity(),
         Severity::Medium
     );
 }
@@ -301,7 +328,7 @@ fn structural_audit_hook_requires_exact_positive_metric() {
         assert_eq!(
             assess(&report(vec![file]), &HashSet::new())
                 .structure
-                .severity,
+                .severity(),
             expected,
             "{path}={value}"
         );
@@ -329,13 +356,10 @@ fn secret_egress_requires_file_local_secret_evidence_and_routine_release() {
         let base_classes = baseline.into_iter().map(str::to_owned).collect();
         let assessment = assess(&together, &base_classes);
         assert_eq!(
-            change_shape_escalation(
+            change_shape_escalation_for(
                 &assessment,
                 &together,
-                Some(Bump {
-                    kind: BumpKind::Patch,
-                    steps: 1
-                }),
+                Some(Bump::new(BumpKind::Patch, 1)),
                 false,
                 false,
                 &HashSet::new(),
@@ -382,7 +406,7 @@ fn native_format_markers_require_whole_tokens() {
         "micro-behaviors/data/control-flow/module-exec::module-scope-zero-arg-call",
     ] {
         assert!(
-            !capability_shape(&source("bundle.js", &[id])).executable,
+            !super::capability::capability_shape(&source("bundle.js", &[id])).executable,
             "{id}"
         );
     }
@@ -394,7 +418,7 @@ fn native_format_markers_require_whole_tokens() {
         "micro-behaviors/linking/macho::load-command",
     ] {
         assert!(
-            capability_shape(&source("payload", &[id])).executable,
+            super::capability::capability_shape(&source("payload", &[id])).executable,
             "{id}"
         );
     }
@@ -402,10 +426,7 @@ fn native_format_markers_require_whole_tokens() {
 
 #[test]
 fn download_execution_chain_requires_platform_branch_not_system_information() {
-    let patch = Some(Bump {
-        kind: BumpKind::Patch,
-        steps: 1,
-    });
+    let patch = Some(Bump::new(BumpKind::Patch, 1));
     let entrypoints = HashSet::from(["package/tool.js".to_owned()]);
     for (platform, expected) in [
         ("runtime::os-release-call", false),
@@ -462,13 +483,10 @@ fn generic_capability_churn_is_release_pressure_not_a_major_upgrade_blocker() {
         .collect();
     let assessment = assess(&diff, &all_existing);
     assert_eq!(
-        change_shape_escalation(
+        change_shape_escalation_for(
             &assessment,
             &diff,
-            Some(Bump {
-                kind: BumpKind::Patch,
-                steps: 1
-            }),
+            Some(Bump::new(BumpKind::Patch, 1)),
             false,
             false,
             &HashSet::new(),
@@ -479,10 +497,7 @@ fn generic_capability_churn_is_release_pressure_not_a_major_upgrade_blocker() {
     // Keep the cluster predicate isolated from the focused-edit branches.
     diff.summary.files_changed = 8;
     diff.summary.scope_roc.traits = 0.45;
-    let patch = Some(Bump {
-        kind: BumpKind::Patch,
-        steps: 1,
-    });
+    let patch = Some(Bump::new(BumpKind::Patch, 1));
     for existing in [
         HashSet::new(),
         HashSet::from([
@@ -492,7 +507,7 @@ fn generic_capability_churn_is_release_pressure_not_a_major_upgrade_blocker() {
     ] {
         let assessment = assess(&diff, &existing);
         assert_eq!(
-            change_shape_escalation(&assessment, &diff, patch, false, false, &HashSet::new(),),
+            change_shape_escalation_for(&assessment, &diff, patch, false, false, &HashSet::new(),),
             if existing.is_empty() {
                 Severity::High
             } else {
@@ -513,7 +528,7 @@ fn author_credit_replacement_is_reviewable_not_a_publisher_takeover() {
     ));
     let mut diff = report(vec![file]);
     let assessment = assess(&diff, &HashSet::new());
-    assert_eq!(assessment.identity.severity, Severity::Medium);
+    assert_eq!(assessment.identity.severity(), Severity::Medium);
     assert_eq!(assessment.new_severity(), Severity::Medium);
     assert_eq!(assessment.identity.changes.len(), 1);
     assert_eq!(assessment.identity.changes[0].old, "SDK generator");
@@ -610,7 +625,7 @@ fn content_hashes_are_not_publisher_identity() {
         assert_eq!(
             assess(&report(vec![file]), &HashSet::new())
                 .identity
-                .severity,
+                .severity(),
             Severity::None
         );
     }
@@ -632,7 +647,7 @@ fn content_hashes_are_not_publisher_identity() {
         assert_eq!(
             assess(&report(vec![file]), &HashSet::new())
                 .identity
-                .severity,
+                .severity(),
             Severity::High
         );
     }
@@ -692,8 +707,11 @@ fn substantial_probability_increases_remain_independent_signals() {
             new_classification: scan::Classification::Hostile,
         });
         assert_eq!(
-            deterministic_verdicts(&assessment, Severity::None, risk, Severity::None, false),
-            (want, want)
+            deterministic_verdicts(&assessment, Severity::None, risk, Severity::None, None),
+            Verdicts {
+                overall: want,
+                new: want
+            }
         );
     }
 }
@@ -740,13 +758,19 @@ fn calibrated_model_decision_caps_probability_escalation() {
         assert_eq!(jump, expected);
         let assessment = assess(&report(vec![]), &HashSet::new());
         assert_eq!(
-            deterministic_verdicts(&assessment, Severity::None, jump, Severity::None, false),
-            (expected, expected)
+            deterministic_verdicts(&assessment, Severity::None, jump, Severity::None, None),
+            Verdicts {
+                overall: expected,
+                new: expected
+            }
         );
         // A benign model decision cannot veto independent structural evidence.
         assert_eq!(
-            deterministic_verdicts(&assessment, Severity::None, jump, Severity::Critical, false),
-            (Severity::Critical, Severity::Critical)
+            deterministic_verdicts(&assessment, Severity::None, jump, Severity::Critical, None),
+            Verdicts {
+                overall: Severity::Critical,
+                new: Severity::Critical
+            }
         );
     }
 }
@@ -766,9 +790,12 @@ fn facts_can_fail_both_verdicts_without_any_traits_or_model() {
             Severity::None,
             Severity::None,
             shape(&diff, BumpKind::Patch),
-            false
+            None
         ),
-        (Severity::High, Severity::High)
+        Verdicts {
+            overall: Severity::High,
+            new: Severity::High
+        }
     );
     // A small cleanup or a broad replacement is not this destruction shape.
     diff.summary.files_removed = 5;
@@ -792,9 +819,12 @@ fn known_hostile_behavior_survives_a_flat_or_missing_model() {
             assessment.new_severity(),
             Severity::None,
             Severity::None,
-            false
+            None
         ),
-        (Severity::Critical, Severity::Critical)
+        Verdicts {
+            overall: Severity::Critical,
+            new: Severity::Critical
+        }
     );
 }
 
@@ -908,7 +938,10 @@ fn hierarchy_rules_ignore_local_names_but_require_real_category_gains() {
     let mut diff = external_html_diff();
     for file in &mut diff.files {
         for item in &mut file.scopes.traits.as_mut().unwrap().added {
-            item.id = format!("{}::renamed-42", super::trait_namespace(&item.id));
+            item.id = format!(
+                "{}::renamed-42",
+                crate::taxonomy::TraitId::new(&item.id).namespace()
+            );
             item.desc = "Unstable presentation text".to_owned();
         }
     }
@@ -944,10 +977,12 @@ fn local_trait_names_and_descriptions_cannot_supply_binary_capabilities() {
     );
     file.scopes.traits.as_mut().unwrap().added[0].desc =
         "encrypted archive executable member socket spawn password".to_owned();
-    let shape = capability_shape(&file);
+    let shape = super::capability::capability_shape(&file);
     assert!(!shape.executable);
-    assert!(shape.families.is_empty());
-    assert!(!super::package_payload_context(&report(vec![file])));
+    assert_eq!(shape.families.len(), 0);
+    assert!(!super::detectors::package_payload_context(&report(vec![
+        file
+    ])));
 }
 
 #[test]
@@ -974,8 +1009,8 @@ fn disguised_encrypted_archive_uses_metrics_without_traits() {
         ..Default::default()
     });
     let diff = report(vec![archive]);
-    assert!(super::added_disguised_encrypted_archive(&diff));
-    assert!(super::package_payload_context(&diff));
+    assert!(super::detectors::added_disguised_encrypted_archive(&diff));
+    assert!(super::detectors::package_payload_context(&diff));
     for index in 0..fields.len() {
         let mut missing = diff.clone();
         missing.files[0]
@@ -985,18 +1020,22 @@ fn disguised_encrypted_archive_uses_metrics_without_traits() {
             .unwrap()
             .added
             .remove(index);
-        assert!(!super::added_disguised_encrypted_archive(&missing));
+        assert!(!super::detectors::added_disguised_encrypted_archive(
+            &missing
+        ));
         let mut zero = diff.clone();
         zero.files[0].scopes.metrics.as_mut().unwrap().added[index].value = serde_json::json!(0);
-        assert!(!super::added_disguised_encrypted_archive(&zero));
+        assert!(!super::detectors::added_disguised_encrypted_archive(&zero));
     }
     let mut few = diff.clone();
     few.files[0].scopes.metrics.as_mut().unwrap().added[0].value = serde_json::json!(4);
-    assert!(!super::added_disguised_encrypted_archive(&few));
+    assert!(!super::detectors::added_disguised_encrypted_archive(&few));
     let mut existing = diff.clone();
     existing.files[0].status = FileStatus::Unchanged;
-    assert!(!super::added_disguised_encrypted_archive(&existing));
-    assert!(!super::package_payload_context(&existing));
+    assert!(!super::detectors::added_disguised_encrypted_archive(
+        &existing
+    ));
+    assert!(!super::detectors::package_payload_context(&existing));
     let mut split = diff.clone();
     let mut member = split.files[0].clone();
     member.path.push_str("!!other.zip");
@@ -1009,10 +1048,10 @@ fn disguised_encrypted_archive_uses_metrics_without_traits() {
         .remove(0);
     member.scopes.metrics.as_mut().unwrap().added = vec![metric];
     split.files.push(member);
-    assert!(!super::added_disguised_encrypted_archive(&split));
+    assert!(!super::detectors::added_disguised_encrypted_archive(&split));
     // Neither archive has both executable and encrypted-member evidence.
     split.files[0].scopes.metrics.as_mut().unwrap().added.pop();
-    assert!(!super::package_payload_context(&split));
+    assert!(!super::detectors::package_payload_context(&split));
 }
 
 #[test]
@@ -1113,6 +1152,10 @@ fn model_recovery_requires_a_high_baseline_and_a_large_drop() {
     }
 }
 
+fn counts(diff: &DiffReportV1) -> (usize, usize) {
+    super::remediation::cleanup_member_counts(diff, &super::remediation::expanded_containers(diff))
+}
+
 #[test]
 fn cleanup_budget_counts_members_not_expanded_containers() {
     let mut files: Vec<_> = (0..4)
@@ -1122,26 +1165,26 @@ fn cleanup_budget_counts_members_not_expanded_containers() {
             file
         })
         .collect();
-    assert_eq!(super::cleanup_member_counts(&report(files.clone())), (4, 0));
+    assert_eq!(counts(&report(files.clone())), (4, 0));
     let mut root = source("ignored", &[]);
     root.path = "<root>".to_owned();
     root.file_type = Some("zip".to_owned());
     root.status = FileStatus::Changed;
     files.push(root);
-    assert_eq!(super::cleanup_member_counts(&report(files.clone())), (4, 0));
+    assert_eq!(counts(&report(files.clone())), (4, 0));
     let mut opaque = source("opaque.zip", &[]);
     opaque.file_type = Some("zip".to_owned());
     files.push(opaque.clone());
-    assert_eq!(super::cleanup_member_counts(&report(files.clone())), (4, 1));
+    assert_eq!(counts(&report(files.clone())), (4, 1));
     let mut nested = source("ignored", &[]);
     nested.path = format!("{}!!child.js", opaque.path);
     files.push(nested);
-    assert_eq!(super::cleanup_member_counts(&report(files.clone())), (4, 1));
+    assert_eq!(counts(&report(files.clone())), (4, 1));
     // A similarly named file is not a descendant; the !! boundary is required.
     let mut extra = source("ignored", &[]);
     extra.path = format!("{}-other", opaque.path);
     files.push(extra);
-    assert_eq!(super::cleanup_member_counts(&report(files)), (4, 2));
+    assert_eq!(counts(&report(files)), (4, 2));
 }
 
 #[test]
@@ -1149,7 +1192,13 @@ fn cleanup_behavior_budget_counts_unknowns_and_gains_not_baseline_churn() {
     let mut unchanged_behavior = source("library.js", &[]);
     unchanged_behavior.status = FileStatus::Changed;
     let mut diff = report(vec![unchanged_behavior.clone(); 8]);
-    assert_eq!(super::cleanup_behavior_changes(&diff), 0);
+    assert_eq!(
+        super::remediation::cleanup_behavior_changes(
+            &diff,
+            &super::remediation::expanded_containers(&diff)
+        ),
+        0
+    );
     diff.files[0]
         .scopes
         .traits
@@ -1160,12 +1209,24 @@ fn cleanup_behavior_budget_counts_unknowns_and_gains_not_baseline_churn() {
             "micro-behaviors/communications/http/client::request",
             Criticality::Notable,
         ));
-    assert_eq!(super::cleanup_behavior_changes(&diff), 1);
+    assert_eq!(
+        super::remediation::cleanup_behavior_changes(
+            &diff,
+            &super::remediation::expanded_containers(&diff)
+        ),
+        1
+    );
     diff.files[1].scopes.traits = None;
     diff.files[2].scopes.traits.as_mut().unwrap().truncated = true;
     diff.files[3].status = FileStatus::Added;
-    assert_eq!(super::cleanup_behavior_changes(&diff), 4);
-    assert!(super::focused_cleanup_budget(&diff));
+    assert_eq!(
+        super::remediation::cleanup_behavior_changes(
+            &diff,
+            &super::remediation::expanded_containers(&diff)
+        ),
+        4
+    );
+    assert!(super::remediation::focused_cleanup_budget(&diff));
     diff.files[4]
         .scopes
         .traits
@@ -1176,7 +1237,13 @@ fn cleanup_behavior_budget_counts_unknowns_and_gains_not_baseline_churn() {
             "metadata/file/format::marker",
             Criticality::Baseline,
         ));
-    assert_eq!(super::cleanup_behavior_changes(&diff), 4);
+    assert_eq!(
+        super::remediation::cleanup_behavior_changes(
+            &diff,
+            &super::remediation::expanded_containers(&diff)
+        ),
+        4
+    );
     diff.files[5]
         .scopes
         .traits
@@ -1187,43 +1254,87 @@ fn cleanup_behavior_budget_counts_unknowns_and_gains_not_baseline_churn() {
             old: finding("objectives/execution::example", Criticality::Notable),
             new: finding("objectives/execution::example", Criticality::Suspicious),
         });
-    assert_eq!(super::cleanup_behavior_changes(&diff), 5);
-    assert!(!super::focused_cleanup_budget(&diff));
+    assert_eq!(
+        super::remediation::cleanup_behavior_changes(
+            &diff,
+            &super::remediation::expanded_containers(&diff)
+        ),
+        5
+    );
+    assert!(!super::remediation::focused_cleanup_budget(&diff));
     let broad = report(vec![unchanged_behavior.clone(); 17]);
-    assert!(!super::focused_cleanup_budget(&broad));
+    assert!(!super::remediation::focused_cleanup_budget(&broad));
     let additions = report(vec![source("one.js", &[]), source("two.js", &[])]);
-    assert!(!super::focused_cleanup_budget(&additions));
+    assert!(!super::remediation::focused_cleanup_budget(&additions));
 }
 
 #[test]
 fn remediation_preserves_independent_danger_signals() {
     let empty = || assess(&report(vec![]), &HashSet::new());
     let final_severity = |a: &Assessment, rubric, model| {
-        deterministic_verdicts(a, rubric, model, Severity::None, true)
+        deterministic_verdicts(
+            a,
+            rubric,
+            model,
+            Severity::None,
+            Some(Remediation::BehaviorRemoval),
+        )
     };
     assert_eq!(
         final_severity(&empty(), Severity::High, Severity::None),
-        (Severity::Medium, Severity::Medium)
+        Verdicts {
+            overall: Severity::Medium,
+            new: Severity::Medium
+        }
     );
     for axis in 0..3 {
         let mut assessment = empty();
+        // One independent High signal on each axis in turn.
         match axis {
-            0 => assessment.identity.severity = Severity::High,
-            1 => assessment.structure.severity = Severity::High,
-            _ => assessment.signature.severity = Severity::High,
+            0 => assessment
+                .identity
+                .changes
+                .push(crate::rubric::IdentityChange {
+                    label: crate::rubric::IdentityField::Signer,
+                    old: "a".into(),
+                    new: "b".into(),
+                }),
+            1 => assessment.structure.facts.push(crate::rubric::StructFact {
+                severity: Severity::High,
+                kind: crate::rubric::FactKind::Added,
+                label: crate::rubric::FactLabel::LoaderDependency,
+                subject: None,
+                facts: Vec::new(),
+                caveat: None,
+            }),
+            _ => assessment.signature.ids.push(crate::rubric::SigMatch {
+                severity: Severity::High,
+                id: "third_party/x/y".into(),
+                desc: String::new(),
+                is_new: true,
+            }),
         }
         assert_eq!(
             final_severity(&assessment, Severity::None, Severity::None),
-            (Severity::High, Severity::High)
+            Verdicts {
+                overall: Severity::High,
+                new: Severity::High
+            }
         );
     }
     assert_eq!(
         final_severity(&empty(), Severity::Critical, Severity::None),
-        (Severity::Critical, Severity::Critical)
+        Verdicts {
+            overall: Severity::Critical,
+            new: Severity::Critical
+        }
     );
     assert_eq!(
         final_severity(&empty(), Severity::None, Severity::Critical),
-        (Severity::Critical, Severity::Critical)
+        Verdicts {
+            overall: Severity::Critical,
+            new: Severity::Critical
+        }
     );
 }
 
@@ -1273,7 +1384,10 @@ fn decoded_offset_churn_does_not_introduce_existing_behavior() {
     let mut promoted = raw.clone();
     promoted.files[0].scopes.traits.as_mut().unwrap().removed[0].crit = Criticality::Notable;
     let promoted = normalized_archive_diff(&promoted);
-    assert_eq!(assess(&promoted, &HashSet::new()).severity, Severity::High);
+    assert_eq!(
+        assess(&promoted, &HashSet::new()).severity(),
+        Severity::High
+    );
 
     // The same capability in a different source file is still new there.
     let mut other = raw.files[1].clone();
@@ -1320,13 +1434,18 @@ fn preexisting_escalated_behavior_is_not_new_release_pressure() {
         name: "example".to_owned(),
         old: None,
         new: None,
-        bump: Some(Bump {
-            kind: BumpKind::Patch,
-            steps: 1,
-        }),
+        bump: Some(Bump::new(BumpKind::Patch, 1)),
     };
+    let shape = super::detectors::change_shape_escalation_for(
+        &assessment,
+        &diff,
+        naming.bump,
+        false,
+        false,
+        &HashSet::new(),
+    );
     assert!(
-        !Proportionality::eval(&assessment, &naming, &diff, false, false, &HashSet::new())
+        !Proportionality::eval(&assessment, &naming, &diff, shape)
             .drift
             .is_disproportionate()
     );
@@ -1336,9 +1455,12 @@ fn preexisting_escalated_behavior_is_not_new_release_pressure() {
             assessment.new_severity(),
             Severity::None,
             Severity::None,
-            false
+            None
         ),
-        (Severity::High, Severity::None)
+        Verdicts {
+            overall: Severity::High,
+            new: Severity::None
+        }
     );
 }
 
@@ -1370,10 +1492,7 @@ fn injected_behavior_mass_is_judged_against_the_release_promise() {
     diff.summary.files_added = 1;
     diff.summary.files_removed = 0;
 
-    let patch = Some(Bump {
-        kind: BumpKind::Patch,
-        steps: 1,
-    });
+    let patch = Some(Bump::new(BumpKind::Patch, 1));
     assert_eq!(
         capability_mass_escalation(&shift, &diff.summary, patch, true),
         Severity::High
@@ -1384,10 +1503,7 @@ fn injected_behavior_mass_is_judged_against_the_release_promise() {
         capability_mass_escalation(
             &shift,
             &diff.summary,
-            Some(Bump {
-                kind: BumpKind::Major,
-                steps: 1
-            }),
+            Some(Bump::new(BumpKind::Major, 1)),
             true
         ),
         Severity::None
