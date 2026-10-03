@@ -712,12 +712,13 @@ fn obfuscated_remote_loader_requires_convergence_on_one_file() {
 
 #[test]
 fn terminal_claim_diff_omits_unchanged_root_identity_and_version() {
-    let identity = |version: &str, organization: Option<&str>| filefacts::Identity {
-        name: Some(filefacts::Claim::claimed("node-ipc", "test")),
-        identifier: Some(filefacts::Claim::claimed("node-ipc", "test")),
-        version: Some(filefacts::Claim::claimed(version, "test")),
-        organization: organization.map(|value| filefacts::Claim::claimed(value, "test")),
-        ..Default::default()
+    let identity = |version: &str, organization: Option<&str>| {
+        let mut identity = filefacts::Identity::default();
+        identity.name = Some(filefacts::Claim::claimed("node-ipc", "test"));
+        identity.identifier = Some(filefacts::Claim::claimed("node-ipc", "test"));
+        identity.version = Some(filefacts::Claim::claimed(version, "test"));
+        identity.organization = organization.map(|value| filefacts::Claim::claimed(value, "test"));
+        identity
     };
     let old = identity("12.0.0", None);
     let new = identity("12.0.1", None);

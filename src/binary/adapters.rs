@@ -237,8 +237,7 @@ fn macho(parsed: &ParsedFile<'_>, v: &Values) -> Result<Layout> {
 
 pub(super) fn inspect(bytes: &[u8]) -> Result<Image<'_>> {
     let format = Format::of(bytes).context("unsupported native image")?;
-    let _no_disassembly = filefacts::rizin::scoped_disable_current_thread();
-    let parsed = filefacts::open(bytes)?;
+    let parsed = filefacts::OpenOptions::new().rizin(false).open(bytes);
     let v = parsed.values();
     let layout = match format {
         Format::Elf => elf(&parsed, v)?,
@@ -294,8 +293,7 @@ pub(super) fn inspect_all(bytes: &[u8]) -> Result<Vec<Image<'_>>> {
     ) {
         return inspect(bytes).map(|i| vec![i]);
     }
-    let _no_disassembly = filefacts::rizin::scoped_disable_current_thread();
-    let parsed = filefacts::open(bytes)?;
+    let parsed = filefacts::OpenOptions::new().rizin(false).open(bytes);
     // Java class files share CAFEBABE with universal Mach-O. They remain
     // handled by normal analysis, not a failed native-comparison warning.
     if parsed.fileid().file_type() == filefacts::FileType::JavaClass {

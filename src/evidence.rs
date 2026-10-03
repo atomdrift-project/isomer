@@ -183,10 +183,9 @@ pub(crate) fn hunks(
     }
     // The members the diff reports as actually changed. isomer is differential:
     // a gained trait's proof lives in a file that *moved*, not in an unchanged
-    // bundled library that happened to already carry the same construct
-    // (unrealircd's backdoor `memcmp` in `s_bsd.c`, not the identical `memcmp`
-    // in the untouched `c-ares` copy). Members outside this set are excluded so
-    // the evidence tracks the change, not the whole artifact. A root-level pair
+    // bundled library that happened to already carry the same construct.
+    // Members outside this set are excluded so the evidence tracks the change,
+    // not the whole artifact. A root-level pair
     // (a plain source file, no `!!`) is always its own changed file, so an empty
     // set never filters those — [`file_hunks`] only consults it for members.
     let changed: HashSet<&str> = diff
@@ -205,20 +204,25 @@ pub(crate) fn hunks(
         };
         file_hunks(pair, &report, gained_ids, &changed, &mut all);
     }
+    distill(&mut all);
+    all
+}
 
+/// Rank the collected hunks, strongest first, keeping what proves the change.
+fn distill(all: &mut Vec<Hunk>) {
     // Match windows merge and trim to a short excerpt around their hit;
     // addition runs already carry the whole change, contiguity-grouped and
     // per-run capped, so both passes leave them untouched.
-    merge_contiguous(&mut all);
-    for h in &mut all {
+    merge_contiguous(all);
+    for h in all.iter_mut() {
         if !h.is_additions() {
             trim(h);
         }
     }
     // Notable+ owns the slots — a baseline *match window* is context, not proof,
     // and is culled when anything stronger exists. Addition runs are exempt:
-    // they are the change itself, and a sub-notable added line (unrealircd's
-    // `system()` macro) is exactly what must not be dropped.
+    // they are the change itself, and a sub-notable added line is exactly what
+    // must not be dropped. See `unrealircd_sub_notable_added_line_survives_the_cull`.
     if all.iter().any(|h| h.severity >= Severity::Medium) {
         all.retain(|h| h.severity >= Severity::Medium || h.is_additions());
     }
@@ -228,8 +232,7 @@ pub(crate) fn hunks(
             .then(b.score.total_cmp(&a.score))
             .then(a.loc.cmp(&b.loc))
     });
-    one_per_rule(&mut all);
-    all
+    one_per_rule(all);
 }
 
 /// Keep the first (strongest) window per rule — five hunks show five
@@ -333,9 +336,9 @@ pub(crate) fn groups<'a>(hunks: &'a [&'a Hunk]) -> impl Iterator<Item = Group<'a
 /// The distilled hunks as plain text for the LLM payload — strongest rule
 /// first, one per rule, each a small diff excerpt (`+` new, `>` matched, ` `
 /// context). This replaces the old dump-every-match window `render` on the
-/// LLM path: there, one broad trait matching dozens of benign files
-/// (unrealircd's `substr: SYSTEM`) produced dozens of windows and buried the
-/// real change, which then read to the model as a false positive.
+/// LLM path: there, one broad trait matching dozens of benign files produced
+/// dozens of windows and buried the real change, which then read to the model
+/// as a false positive.
 pub(crate) fn render_hunks(out: &mut impl Write, hunks: &[&Hunk]) -> std::fmt::Result {
     for group in groups(hunks) {
         match group {
@@ -403,7 +406,7 @@ fn file_hunks(
             // A member of an archive inside this one: its bytes are not
             // reachable by name in the outer archive, and a same-named outer
             // file would be read in its place.
-            MemberPath::new(&fa.path).depth() > 1,
+            MemberPath::new(&fa.path).is_nested(),
             Scanned {
                 findings: &fa.findings,
                 context: &fa.context,
@@ -446,8 +449,7 @@ fn file_hunks(
         };
         // Source-additions path: when both sides' text is in reach, the change
         // *is* the added lines — show them whole (matched or not), so an attack
-        // whose payload sits a few lines from the trait hit (unrealircd's
-        // `system()` macro) stays in view. Needs a text new side and the old
+        // whose payload sits a few lines from the trait hit stays in view. Needs a text new side and the old
         // text as the line-diff baseline; archive members are pulled per side.
         let (new_src, old_src) = match member {
             _ if nested => (None, None),
@@ -1644,6 +1646,10 @@ mod tests {
 
     /// Rules without a description all read "matched"; deduplicating on that
     /// text would show one of them and hide the rest.
+    /// unrealircd 3.2.8.1: one broad rule (`substr: SYSTEM`) matched dozens of
+    /// benign files, and with every window dumped the model read the real
+    /// backdoor as a false positive. One window per rule keeps five hunks
+    /// showing five behaviors.
     #[test]
     fn evidence_keeps_one_window_per_rule_id_not_per_description() {
         let mut all = vec![
@@ -1654,5 +1660,42 @@ mod tests {
         one_per_rule(&mut all);
         let kept: Vec<_> = all.iter().map(|h| (h.id.as_str(), h.line)).collect();
         assert_eq!(kept, [("a/rule::x", Some(1)), ("b/rule::y", Some(9))]);
+    }
+
+    /// unrealircd 3.2.8.1: the backdoor's `system()` call was a `#define`
+    /// added a few lines from where any rule fired, and on its own it rated
+    /// below notable. Ranked as just another weak hit it would have been culled
+    /// in favor of the stronger windows — dropping the very line that was the
+    /// attack. Added lines are the change itself, so they survive the floor
+    /// that culls weak match windows.
+    #[test]
+    fn unrealircd_sub_notable_added_line_survives_the_cull() {
+        let weak = |mut h: Hunk| {
+            h.severity = Severity::Low;
+            h
+        };
+        let added = Hunk {
+            kind: HunkKind::Additions,
+            id: String::new(),
+            desc: "added code".into(),
+            lines: vec![HunkLine {
+                locator: "35".into(),
+                text: "#define DEBUG3_DOLOG_SYSTEM(x) system(x)".into(),
+                added: LineMark::Added,
+                is_match: false,
+            }],
+            ..weak(window("", "", 0.1, 35, 35, 35))
+        };
+        let mut all = vec![
+            window("strong/rule::exec", "matched", 2.0, 1, 3, 2),
+            weak(window("weak/rule::compare", "matched", 0.5, 50, 52, 51)),
+            added,
+        ];
+        distill(&mut all);
+        let kept: Vec<_> = all
+            .iter()
+            .map(|h| (h.id.as_str(), h.is_additions()))
+            .collect();
+        assert_eq!(kept, [("strong/rule::exec", false), ("", true)]);
     }
 }

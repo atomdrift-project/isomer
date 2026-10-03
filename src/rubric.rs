@@ -622,12 +622,10 @@ fn structural_facts(diff: &DiffReportV1) -> Structure {
     let (mut deps, mut ifuncs, mut dynsyms): (Vec<String>, Vec<String>, Vec<String>) =
         (Vec::new(), Vec::new(), Vec::new());
     // Newly-declared source-package runtime dependencies (npm `dependencies`,
-    // etc.). A gained external dependency is the event-stream / node-ipc
-    // supply-chain shape — the version pulls in code it never shipped before.
+    // etc.): the version pulls in code it never shipped before.
     let mut pkg_deps: Vec<String> = Vec::new();
     // GitHub Actions `uses:` references — third-party code that runs in CI with
-    // repo secrets. A newly-added action, or a moved `@ref`, is the
-    // tj-actions/changed-files supply-chain surface.
+    // repo secrets. A newly-added action or a moved `@ref` is reported.
     let (mut actions_new, mut actions_moved): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
     let mut audit = false;
     // Added sections tracked apart from existing ones that changed state, so
@@ -653,15 +651,14 @@ fn structural_facts(diff: &DiffReportV1) -> Structure {
                     push_val(&mut deps, &k.value);
                 } else if p == "elf.ifuncs" || p.starts_with("elf.ifuncs[]=") {
                     push_val(&mut ifuncs, &k.value);
-                } else if let Some(rest) = p.strip_prefix("elf.dynsym_funcs[name=")
+                } else if let Some(rest) = p.strip_prefix("elf.dynsym_functions[name=")
                     && let Some((name, _)) = rest.split_once(']')
                 {
                     dynsyms.push(name.to_string());
                 }
             }
-            // A moved `@ref` on an existing action — the mutable-tag surface the
-            // tj-actions compromise abused (the tag was repointed to a malicious
-            // commit). Reported with the ref it moved *to*.
+            // A moved `@ref` on an existing action, reported with the ref it
+            // moved *to*.
             for c in &kv.changed {
                 if c.new.path.ends_with(".uses")
                     && let Some(a) = github_action(&c.new.value)
@@ -670,7 +667,8 @@ fn structural_facts(diff: &DiffReportV1) -> Structure {
                 }
             }
         }
-        // A newly-set dynamic-linker auditor hook — xz's interception surface.
+        // A newly-set dynamic-linker auditor hook: it sees every symbol
+        // resolution in the process.
         if let Some(m) = file.scopes.metrics.as_ref() {
             for a in &m.added {
                 if matches!(a.path.as_str(), "elf.has_dt_audit" | "elf.has_dt_depaudit")
@@ -763,8 +761,9 @@ fn structural_facts(diff: &DiffReportV1) -> Structure {
             &["DT_AUDIT — intercepts symbol resolution".to_string()],
         );
     }
-    // A library that gains a *direct* dependency on the dynamic loader is the
-    // xz tell — high on its own.
+    // A library that gains a *direct* dependency on the dynamic loader, or
+    // turns functions into ifunc resolvers, runs code before `main` — high on
+    // its own. See `incidents::xz_utils_5_6_0_liblzma_gains_loader_tells`.
     push(Severity::High, Added, LoaderDependency, &deps);
     push(Severity::High, Added, IfuncResolvers, &ifuncs);
     push(Severity::High, Added, WritableExecutable, &rwx_new);
@@ -773,13 +772,14 @@ fn structural_facts(diff: &DiffReportV1) -> Structure {
     push(Severity::Medium, Added, HighEntropyRegion, &entropy_new);
     push(Severity::Medium, Became, HighEntropyRegion, &entropy_became);
     // A gained runtime dependency is the supply-chain event isomer exists to
-    // surface (event-stream added `flatmap-stream`; node-ipc added
-    // `peacenotwar`). Medium: it makes the diff speak so a reviewer sees the
-    // new dependency, but stays below the default `--fail-on high` so a routine
-    // dependency bump doesn't break CI on its own.
+    // surface. Medium: it makes the diff speak so a reviewer sees the new
+    // dependency, but stays below the default `--fail-on high` so a routine
+    // dependency bump doesn't break CI on its own. See
+    // `incidents::event_stream_and_node_ipc_new_runtime_dependencies_are_reported`.
     push(Severity::Medium, Added, Dependency, &pkg_deps);
     // Third-party CI code, same reasoning as a runtime dependency: a new action
-    // — or one whose mutable tag was repointed — runs with repo secrets.
+    // — or one whose mutable tag was repointed — runs with repo secrets. See
+    // `incidents::tj_actions_changed_files_unpinned_refs_are_reported`.
     push(Severity::Medium, Added, GithubAction, &actions_new);
     push(Severity::Medium, Became, GithubAction, &actions_moved);
     Structure { facts }
@@ -826,8 +826,8 @@ pub(crate) fn dependency_name(path: &str) -> Option<&str> {
 
 /// A GitHub Actions `uses:` value that references *remote* third-party code —
 /// `owner/repo@ref` (optionally with a `/subpath`). Returns the reference,
-/// flagging a mutable `@tag`/`@branch` (the surface the tj-actions tag-move
-/// abused) apart from an immutable `@<40-hex-sha>` pin. Local (`./…`) and
+/// flagging a mutable `@tag`/`@branch`, which its owner can repoint, apart
+/// from an immutable `@<40-hex-sha>` pin. Local (`./…`) and
 /// container (`docker://…`) uses are not fetchable third-party code and return
 /// `None`.
 fn github_action(v: &serde_json::Value) -> Option<String> {
@@ -1070,11 +1070,9 @@ pub(crate) fn filename_only_identity(identity: &filefacts::Identity) -> bool {
     // two basename claims, rather than as a field-by-field list: a field
     // filefacts adds later is then covered without anyone remembering to
     // extend the list here.
-    let only_the_basename = filefacts::Identity {
-        name: identity.name.clone(),
-        version: identity.version.clone(),
-        ..filefacts::Identity::default()
-    };
+    let mut only_the_basename = filefacts::Identity::default();
+    only_the_basename.name.clone_from(&identity.name);
+    only_the_basename.version.clone_from(&identity.version);
     identity.name.is_some()
         && basename_claim(&identity.name)
         && basename_claim(&identity.version)
@@ -1330,7 +1328,7 @@ mod tests {
     #[test]
     fn github_action_flags_remote_refs_and_pinning() {
         let a = |s: &str| github_action(&serde_json::Value::String(s.into()));
-        // Remote action on a mutable tag — the tj-actions surface.
+        // Remote action on a mutable tag.
         assert_eq!(
             a("tj-actions/changed-files@v44").as_deref(),
             Some("tj-actions/changed-files@v44 (unpinned)")
@@ -1350,24 +1348,18 @@ mod tests {
 
     #[test]
     fn removing_filename_only_identity_is_not_publisher_removal() {
-        let fallback = filefacts::Identity {
-            name: Some(filefacts::Claim::claimed("example", "file.basename")),
-            version: Some(filefacts::Claim::claimed("1.2.3", "file.basename")),
-            ..Default::default()
-        };
+        let mut fallback = filefacts::Identity::default();
+        fallback.name = Some(filefacts::Claim::claimed("example", "file.basename"));
+        fallback.version = Some(filefacts::Claim::claimed("1.2.3", "file.basename"));
         assert!(meaningful_identity_changes(Some(&fallback), None).is_empty());
         assert!(meaningful_identity_changes(None, Some(&fallback)).is_empty());
 
         // Actual manifest claims must remain evidence, including when the
         // artifact also carries a filename-derived name.
-        let manifest = filefacts::Identity {
-            name: Some(filefacts::Claim::claimed("example", "npm.name")),
-            ..Default::default()
-        };
-        let with_publisher = filefacts::Identity {
-            organization: Some(filefacts::Claim::claimed("Example", "npm.author.name")),
-            ..fallback
-        };
+        let mut manifest = filefacts::Identity::default();
+        manifest.name = Some(filefacts::Claim::claimed("example", "npm.name"));
+        let mut with_publisher = fallback;
+        with_publisher.organization = Some(filefacts::Claim::claimed("Example", "npm.author.name"));
         for identity in [&manifest, &with_publisher] {
             let changes = meaningful_identity_changes(Some(identity), None);
             assert_eq!(changes.len(), 1);
@@ -1378,28 +1370,22 @@ mod tests {
 
     #[test]
     fn filename_fallback_is_not_treated_as_package_identity_drift() {
-        let reconstructed = filefacts::Identity {
-            name: Some(filefacts::Claim::claimed("@bitwarden-cli", "file.basename")),
-            version: Some(filefacts::Claim::claimed(
-                "2026.4.0-RECONSTRUCTED",
-                "file.basename",
-            )),
-            ..Default::default()
-        };
+        let mut reconstructed = filefacts::Identity::default();
+        reconstructed.name = Some(filefacts::Claim::claimed("@bitwarden-cli", "file.basename"));
+        reconstructed.version = Some(filefacts::Claim::claimed(
+            "2026.4.0-RECONSTRUCTED",
+            "file.basename",
+        ));
 
-        let package = filefacts::Identity {
-            name: Some(filefacts::Claim::claimed("@bitwarden/cli", "npm.name")),
-            ..Default::default()
-        };
+        let mut package = filefacts::Identity::default();
+        package.name = Some(filefacts::Claim::claimed("@bitwarden/cli", "npm.name"));
 
         assert!(meaningful_identity_changes(Some(&reconstructed), Some(&package)).is_empty());
         assert!(filename_only_identity(&reconstructed));
         assert!(!filename_only_identity(&package));
 
-        let renamed_package = filefacts::Identity {
-            name: Some(filefacts::Claim::claimed("@bitwarden/sdk", "npm.name")),
-            ..Default::default()
-        };
+        let mut renamed_package = filefacts::Identity::default();
+        renamed_package.name = Some(filefacts::Claim::claimed("@bitwarden/sdk", "npm.name"));
         let changes = meaningful_identity_changes(Some(&package), Some(&renamed_package));
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].label, IdentityField::PackageName);

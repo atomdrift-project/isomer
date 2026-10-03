@@ -162,6 +162,16 @@ mod tests {
         assert!(err.to_string().contains("--base-version"), "{err}");
     }
 
+    /// What an embedding caller relies on: the error boxes as a standard
+    /// error with `?`, and both it and the judgement cross threads.
+    #[test]
+    fn the_api_travels_across_threads_and_error_boxes() {
+        fn standard_error<E: std::error::Error + Send + Sync + 'static>() {}
+        fn sendable<T: Send + Sync + 'static>() {}
+        standard_error::<Error>();
+        sendable::<Judgement>();
+    }
+
     #[test]
     fn an_unreadable_side_is_an_analysis_failure() {
         let opts = Options {

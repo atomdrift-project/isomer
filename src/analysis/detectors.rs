@@ -79,46 +79,74 @@ pub(super) const COMPACT: Movement = Movement {
     ..Movement::ANY
 };
 
-/// A focused source-file implant: new capabilities arriving in one or two
-/// files, with enough overall and behavioral movement that this is not just a
-/// metadata touch.
-const FOCUSED_SOURCE: Movement = Movement {
-    max_changed: 2,
-    max_added: 2,
-    max_removed: 2,
-    min_overall: 0.20,
-    min_traits: 0.40,
-    ..Movement::ANY
+/// A [`Movement`] that must also have brought wholly new capability classes.
+/// The two are one rule: a shape checked without its class floor would fire
+/// on any edit of the right size.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ClassShape {
+    movement: Movement,
+    new_classes: usize,
+}
+
+impl ClassShape {
+    fn fits(&self, s: &DiffSummary, new_classes: usize) -> bool {
+        self.movement.fits(s) && new_classes >= self.new_classes
+    }
+}
+
+/// A focused source-file implant: three new capability classes arriving in
+/// one or two files, with enough overall and behavioral movement that this is
+/// not just a metadata touch.
+const FOCUSED_SOURCE: ClassShape = ClassShape {
+    movement: Movement {
+        max_changed: 2,
+        max_added: 2,
+        max_removed: 2,
+        min_overall: 0.20,
+        min_traits: 0.40,
+        ..Movement::ANY
+    },
+    new_classes: 3,
 };
 
 /// A focused implant that also deletes a modest amount of stale package
-/// content. Kept apart from [`FOCUSED_SOURCE`]: the higher movement floors keep
-/// routine patch cleanup from escalating.
-const FOCUSED_SOURCE_WITH_CLEANUP: Movement = Movement {
-    max_changed: 4,
-    max_churn: 16,
-    min_overall: 0.60,
-    min_traits: 0.60,
-    ..Movement::ANY
+/// content. Kept apart from [`FOCUSED_SOURCE`]: the higher movement floors and
+/// the fourth class keep routine patch cleanup from escalating.
+const FOCUSED_SOURCE_WITH_CLEANUP: ClassShape = ClassShape {
+    movement: Movement {
+        max_changed: 4,
+        max_churn: 16,
+        min_overall: 0.60,
+        min_traits: 0.60,
+        ..Movement::ANY
+    },
+    new_classes: 4,
 };
 
-/// A compact cross-domain capability cluster. The floors are low because the
-/// rule's weight is in which classes arrived together, not in how much moved.
-const CROSS_DOMAIN_CLUSTER: Movement = Movement {
-    min_overall: 0.05,
-    min_traits: 0.15,
-    ..COMPACT
+/// A compact cross-domain capability cluster. The movement floors are low
+/// because the rule's weight is in how many classes arrived together — six —
+/// and which ones, not in how much moved.
+const CROSS_DOMAIN_CLUSTER: ClassShape = ClassShape {
+    movement: Movement {
+        min_overall: 0.05,
+        min_traits: 0.15,
+        ..COMPACT
+    },
+    new_classes: 6,
 };
 
 /// A same-version rebuild that swapped most of an archive's members while
-/// editing almost nothing in place.
-const SAME_VERSION_ARCHIVE_REPLACEMENT: Movement = Movement {
-    min_added: 32,
-    min_removed: 32,
-    max_changed: 2,
-    min_overall: 0.75,
-    min_traits: 0.20,
-    ..Movement::ANY
+/// editing almost nothing in place, and gained at least two new classes.
+const SAME_VERSION_ARCHIVE_REPLACEMENT: ClassShape = ClassShape {
+    movement: Movement {
+        min_added: 32,
+        min_removed: 32,
+        max_changed: 2,
+        min_overall: 0.75,
+        min_traits: 0.20,
+        ..Movement::ANY
+    },
+    new_classes: 2,
 };
 
 /// Hundreds of files deleted and almost nothing added: a package reduced to a
@@ -276,8 +304,8 @@ pub(crate) enum SourceBuild {
     /// evaluates it through the shell.
     MacroShellEval,
     /// A suspicious build loader stayed byte-identical while one of its
-    /// compressed test-data carriers changed: the two-release xz shape, stable
-    /// activation logic with a refreshed hidden stage.
+    /// compressed test-data carriers changed: stable activation logic with a
+    /// refreshed hidden stage, across two releases.
     PayloadRefresh,
 }
 
@@ -349,21 +377,20 @@ pub(super) fn change_shape_escalation(shape: &Shape<'_>, signals: &Signals) -> S
         .filter(|c| a.behavioral.is_new_category(c))
         .filter(|c| c.new_ids.iter().any(|id| !TraitId::new(id).is_metadata()))
         .count();
-    let focused_source = routine_release(bump) && FOCUSED_SOURCE.fits(s) && new_classes >= 3;
+    let focused_source = routine_release(bump) && FOCUSED_SOURCE.fits(s, new_classes);
     // A release can also delete a modest amount of stale package content
     // while concentrating several new capabilities in a few changed files.
     // Keep this separate from the small focused branch: the higher movement
     // and four-class floor prevent routine patch cleanup from escalating.
     let focused_source_with_cleanup =
-        routine_release(bump) && FOCUSED_SOURCE_WITH_CLEANUP.fits(s) && new_classes >= 4;
+        routine_release(bump) && FOCUSED_SOURCE_WITH_CLEANUP.fits(s, new_classes);
     // A compact cross-domain capability cluster is suspicious even when the
     // individual rules remain medium: HTTP plus scheduling and serialization
     // in a small patch is a common dormant-loader shape. The class count and
     // movement floors keep ordinary single-purpose WordPress changes below
     // this branch.
     let cross_domain_cluster = routine_release(bump)
-        && CROSS_DOMAIN_CLUSTER.fits(s)
-        && new_classes >= 6
+        && CROSS_DOMAIN_CLUSTER.fits(s, new_classes)
         && [class::HTTP, "time/schedule", "data/serialize"]
             .iter()
             .all(|class| a.behavioral.new_categories.contains(*class));
@@ -399,18 +426,16 @@ pub(super) fn change_shape_escalation(shape: &Shape<'_>, signals: &Signals) -> S
     // desktop trojans whose payload is spread across a rebuilt app bundle and
     // never produces one high trait.
     let same_version_archive_replacement = same_version
-        && SAME_VERSION_ARCHIVE_REPLACEMENT.fits(s)
-        && new_classes >= 2
+        && SAME_VERSION_ARCHIVE_REPLACEMENT.fits(s, new_classes)
         && has_new_class(a, "data/archive")
         && has_new_class(a, "anti-analysis");
     // A payload can be hidden one archive layer below the package and look
-    // like a harmless resource (OpenX's PHP-in-JavaScript case is the model).
-    // Keep this content-agnostic: require the same nested member to gain all
-    // three independent signals — concealment/encoding, execution, and a
-    // delivery or filesystem effect.
+    // like a harmless resource. Keep this content-agnostic: require the same
+    // nested member to gain all three independent signals —
+    // concealment/encoding, execution, and a delivery or filesystem effect.
     let nested_payload_cluster = compact
         && diff.files.iter().any(|file| {
-            if MemberPath::new(&file.path).depth() < 2 {
+            if !MemberPath::new(&file.path).is_nested() {
                 return false;
             }
             let Some(traits) = file.scopes.traits.as_ref() else {
@@ -460,7 +485,7 @@ pub(super) fn change_shape_escalation(shape: &Shape<'_>, signals: &Signals) -> S
         });
     let nested_capability_cluster = compact
         && diff.files.iter().any(|file| {
-            if MemberPath::new(&file.path).depth() < 2 {
+            if !MemberPath::new(&file.path).is_nested() {
                 return false;
             }
             let Some(traits) = file.scopes.traits.as_ref() else {
@@ -493,7 +518,6 @@ pub(super) fn change_shape_escalation(shape: &Shape<'_>, signals: &Signals) -> S
     //
     // * build-time/native hook + low-level syscall + network + anti-analysis;
     // * wallet/private-key material + encoding + an external HTTP destination.
-    // These describe the xz and xrpl families without naming either campaign.
     // A class at or below `hierarchy` that gained traits. Segment-aware, so
     // `os/signal` is not `os/signals`.
     let has_prefix = |hierarchy: &str| {
@@ -517,11 +541,7 @@ pub(super) fn change_shape_escalation(shape: &Shape<'_>, signals: &Signals) -> S
         && (!source_archive || source_build_anomaly);
     // Release-pressure evidence, like `remote_script_loader` above: the legs
     // below are a wallet library's ordinary job description, so they only
-    // indict a release whose version number promised nothing new. xrpl.js
-    // 2.14.1 -> 4.2.0 satisfies every leg — HTTP, base64, seed generation and
-    // a remote host URL — because that is what an XRP Ledger client does
-    // across two major versions; 2.14.1 -> 2.14.2, the real key-exfiltration
-    // patch, is where the same conjunction means something.
+    // indict a release whose version number promised nothing new.
     let secret_egress_cluster = secret_egress_cluster(a, diff, bump);
     let executable_capability_bundle = executable_capability_escalation(diff, bump);
     let binary_replacement = signals.binary_replacement.is_some();
@@ -609,9 +629,9 @@ pub(super) fn binary_replacement_anomaly(
                     continue;
                 };
                 let large = if old == 0.0 {
-                    new.abs() >= 2.0
+                    new.abs() >= LARGE_MOVE_FROM_ZERO
                 } else {
-                    (new - old).abs() / old.abs() >= 0.65
+                    (new - old).abs() / old.abs() >= LARGE_MOVE
                 };
                 if !large {
                     continue;
@@ -620,13 +640,23 @@ pub(super) fn binary_replacement_anomaly(
                 families.insert(path.split(['.', '/']).next().unwrap_or(path));
             }
 
-            (large_moves >= 4 && families.len() >= 3).then_some(BinaryReplacementAnomaly {
-                large_moves,
-                metric_families: families.len(),
-            })
+            (large_moves >= REPLACEMENT_LARGE_MOVES && families.len() >= REPLACEMENT_FAMILIES)
+                .then_some(BinaryReplacementAnomaly {
+                    large_moves,
+                    metric_families: families.len(),
+                })
         })
         .max_by_key(|anomaly| (anomaly.metric_families, anomaly.large_moves))
 }
+
+/// A metric moved a lot: by at least this fraction of its old value…
+const LARGE_MOVE: f64 = 0.65;
+/// …or, from zero, to at least this.
+const LARGE_MOVE_FROM_ZERO: f64 = 2.0;
+/// Large moves, across this many metric families (`elf`, `sections`, …), make
+/// a rebuild a replacement. One family moving is a toolchain change.
+const REPLACEMENT_LARGE_MOVES: usize = 4;
+const REPLACEMENT_FAMILIES: usize = 3;
 
 #[derive(Debug)]
 pub(crate) struct OpaqueRuntimePayloadAnomaly {
@@ -637,6 +667,32 @@ pub(crate) struct OpaqueRuntimePayloadAnomaly {
     pub encoded_ratio: f64,
     pub max_string: u64,
 }
+
+/// What an opaque payload member looks like, in cleave's text metrics: a
+/// kilobyte or more on a handful of very long lines, mostly encoded strings,
+/// and digit- or hex-heavy content.
+struct Opacity {
+    /// The package grew by at least this fraction.
+    min_root_growth: f64,
+    min_size: f64,
+    max_lines: f64,
+    min_line_length: f64,
+    min_encoded_ratio: f64,
+    min_string_length: f64,
+    min_digit_ratio: f64,
+    min_hex_strings: f64,
+}
+
+const OPAQUE: Opacity = Opacity {
+    min_root_growth: 0.50,
+    min_size: 1_024.0,
+    max_lines: 4.0,
+    min_line_length: 1_000.0,
+    min_encoded_ratio: 0.50,
+    min_string_length: 1_000.0,
+    min_digit_ratio: 0.30,
+    min_hex_strings: 4.0,
+};
 
 /// Detect a compact release that wires a highly opaque new source member into
 /// an existing package runtime entrypoint. This deliberately uses graph,
@@ -654,7 +710,7 @@ pub(super) fn opaque_runtime_payload_anomaly(
 ) -> Option<OpaqueRuntimePayloadAnomaly> {
     if !routine_release(bump)
         || !COMPACT_PAYLOAD.fits(&diff.summary)
-        || root_size_growth(diff).is_none_or(|growth| growth < 0.50)
+        || root_size_growth(diff).is_none_or(|growth| growth < OPAQUE.min_root_growth)
     {
         return None;
     }
@@ -672,12 +728,12 @@ pub(super) fn opaque_runtime_payload_anomaly(
             let max_string = new_metric_value(file, "strings.max_length")?;
             let digit_ratio = new_metric_value(file, "text.digit_ratio").unwrap_or(0.0);
             let hex_strings = new_metric_value(file, "strings.hex_strings").unwrap_or(0.0);
-            (size >= 1_024.0
-                && lines <= 4.0
-                && max_line >= 1_000.0
-                && encoded_ratio >= 0.50
-                && max_string >= 1_000.0
-                && (digit_ratio >= 0.30 || hex_strings >= 4.0))
+            (size >= OPAQUE.min_size
+                && lines <= OPAQUE.max_lines
+                && max_line >= OPAQUE.min_line_length
+                && encoded_ratio >= OPAQUE.min_encoded_ratio
+                && max_string >= OPAQUE.min_string_length
+                && (digit_ratio >= OPAQUE.min_digit_ratio || hex_strings >= OPAQUE.min_hex_strings))
                 .then_some((
                     file,
                     as_count(size)?,
@@ -838,6 +894,13 @@ pub(crate) struct RuntimeGraftAnomaly {
     pub timestamp_spread: f64,
 }
 
+/// The archive's members were all written within this many seconds: one
+/// scripted repack rather than a release built over time.
+const GRAFT_BUILD_WINDOW_SECS: f64 = 300.0;
+/// Smaller than this, a new source member is a stub or a re-export, not a
+/// payload.
+const GRAFT_MIN_PAYLOAD_BYTES: f64 = 512.0;
+
 /// Detect a focused package repack that grafts a new externally-facing source
 /// member onto the package's identity-bearing runtime entrypoint. Unlike the
 /// opaque-payload branch, this catches readable implants. The archive timing
@@ -852,7 +915,7 @@ pub(super) fn runtime_graft_anomaly(
         return None;
     }
     let timestamp_spread = archive_timestamp_spread(diff)?;
-    if timestamp_spread > 300.0 {
+    if timestamp_spread > GRAFT_BUILD_WINDOW_SECS {
         return None;
     }
     // Gathered once, ahead of the loops: the alternative is re-scanning every
@@ -862,7 +925,8 @@ pub(super) fn runtime_graft_anomaly(
     for payload in diff.files.iter().filter(|file| {
         matches!(file.status, FileStatus::Added)
             && member_type(file).is_some_and(|t| t.is_source_code())
-            && new_metric_value(file, "file.size").is_some_and(|size| size >= 512.0)
+            && new_metric_value(file, "file.size")
+                .is_some_and(|size| size >= GRAFT_MIN_PAYLOAD_BYTES)
     }) {
         let payload_path = display_member_path(&payload.path);
         // Cheapest discriminator first — it rejects nearly every candidate, and
@@ -1034,6 +1098,10 @@ pub(super) fn secret_egress_cluster(
         })
 }
 
+/// Dependency-name tokens shorter than this (`js`, `io`) say nothing about
+/// which API the package exposes.
+const MIN_NAME_TOKEN: usize = 3;
+
 #[derive(Debug)]
 pub(crate) struct DependencyApiExpansion {
     pub dependency: String,
@@ -1078,7 +1146,7 @@ pub(super) fn dependency_backed_public_api_anomaly(
             .split(|character: char| !character.is_ascii_alphanumeric())
             .map(str::to_ascii_lowercase)
             .filter(|token| {
-                token.len() >= 3
+                token.len() >= MIN_NAME_TOKEN
                     && !matches!(
                         token.as_str(),
                         "api" | "core" | "js" | "lib" | "node" | "plugin" | "sdk" | "stream"
@@ -1196,13 +1264,17 @@ pub(super) fn source_download_write_execute_anomaly<'a>(
     })
 }
 
+/// Enough encrypted entries that the archive is a container for them, not a
+/// project that password-protects one file.
+const DISGUISED_ARCHIVE_MIN_ENCRYPTED: f64 = 5.0;
+
 /// Structural evidence on one newly added archive, independent of trait names
 /// or whether YAML traits were loaded. Missing measurements are not positives.
 pub(super) fn added_disguised_encrypted_archive(diff: &DiffReportV1) -> bool {
     diff.files.iter().any(|file| {
         file.status == FileStatus::Added
             && new_metric_value(file, "archive.security.encrypted_count")
-                .is_some_and(|count| count >= 5.0)
+                .is_some_and(|count| count >= DISGUISED_ARCHIVE_MIN_ENCRYPTED)
             && new_metric_value(file, "archive.executable_count").is_some_and(|count| count >= 1.0)
             && new_metric_flag(
                 file,
@@ -1305,6 +1377,20 @@ pub(super) fn restored_endgame_package_shape(diff: &DiffReportV1) -> bool {
     entrypoint_restored && RESTORED_ENDGAME.fits(&diff.summary)
 }
 
+/// The capability-shape score at which a new executable is worth naming.
+const EXECUTABLE_MEDIUM_SCORE: u32 = 7;
+
+/// The score at which it is high. The floor rises with what the release was
+/// allowed to bring; past a patch, the package's own payload context must
+/// corroborate it as well.
+const fn executable_high_score(promise: Promise) -> u32 {
+    match promise {
+        Promise::Nothing => 10,
+        Promise::Features => 13,
+        Promise::Anything => 16,
+    }
+}
+
 /// A newly-added executable can be an implant even when every individual API
 /// looks ordinary. Score capability *families* and their combinations on the
 /// file that gained them, then apply the version/package context here. The
@@ -1353,14 +1439,12 @@ pub(super) fn executable_capability_escalation(
     // also carries the strongest packaging concealment signal.
     // No readable version is treated as the loosest promise here: without one
     // there is no release claim for the executable to contradict.
-    let high = match bump.map_or(Promise::Anything, |b| b.kind.promise()) {
-        Promise::Nothing => best >= 10,
-        Promise::Features => best >= 13 && package_context,
-        Promise::Anything => best >= 16 && package_context,
-    };
+    let promise = bump.map_or(Promise::Anything, |b| b.kind.promise());
+    let high = best >= executable_high_score(promise)
+        && (package_context || matches!(promise, Promise::Nothing));
     if high {
         Severity::High
-    } else if best >= 7 {
+    } else if best >= EXECUTABLE_MEDIUM_SCORE {
         Severity::Medium
     } else {
         Severity::None
@@ -1423,7 +1507,7 @@ pub(crate) fn is_source_archive(path: &Path) -> bool {
 /// Detect a newly introduced build macro whose shell-execution surface grows
 /// sharply. This reads only source archives and only members that cleave could
 /// not type as a recognized program; it is deliberately a content-shape
-/// signal, not an xz filename or hash signature.
+/// signal, not a filename or hash signature.
 pub(super) fn source_build_macro_anomaly(new_root: &Path, diff: &DiffReportV1) -> bool {
     diff.files.iter().any(|file| {
         if !matches!(file.status, FileStatus::Added | FileStatus::Changed)
@@ -1564,12 +1648,28 @@ mod tests {
 
     #[test]
     fn floors_and_ceilings_are_inclusive() {
-        assert!(FOCUSED_SOURCE.fits(&summary(2, 2, 2, 0.20, 0.40)));
-        assert!(!FOCUSED_SOURCE.fits(&summary(2, 2, 2, 0.19, 0.40)));
-        assert!(!FOCUSED_SOURCE.fits(&summary(3, 0, 0, 0.50, 0.50)));
+        assert!(FOCUSED_SOURCE.fits(&summary(2, 2, 2, 0.20, 0.40), 3));
+        assert!(!FOCUSED_SOURCE.fits(&summary(2, 2, 2, 0.19, 0.40), 3));
+        assert!(!FOCUSED_SOURCE.fits(&summary(3, 0, 0, 0.50, 0.50), 3));
         assert!(QUIET_DEPENDENCY_CHANGE.fits(&summary(1, 0, 0, 0.25, 0.0)));
         assert!(!QUIET_DEPENDENCY_CHANGE.fits(&summary(1, 0, 0, 0.26, 0.0)));
         // A derived shape keeps its base's bounds.
-        assert!(!CROSS_DOMAIN_CLUSTER.fits(&summary(17, 0, 0, 0.50, 0.50)));
+        assert!(!CROSS_DOMAIN_CLUSTER.fits(&summary(17, 0, 0, 0.50, 0.50), 6));
+    }
+
+    #[test]
+    fn a_class_shape_needs_its_classes_as_well_as_its_movement() {
+        let moved = summary(1, 0, 0, 0.50, 0.50);
+        assert!(FOCUSED_SOURCE.fits(&moved, 3));
+        assert!(!FOCUSED_SOURCE.fits(&moved, 2));
+    }
+
+    #[test]
+    fn a_new_executable_needs_more_score_as_the_release_promises_more() {
+        assert!(executable_high_score(Promise::Nothing) < executable_high_score(Promise::Features));
+        assert!(
+            executable_high_score(Promise::Features) < executable_high_score(Promise::Anything)
+        );
+        assert!(EXECUTABLE_MEDIUM_SCORE < executable_high_score(Promise::Nothing));
     }
 }

@@ -174,7 +174,7 @@ pub(crate) fn metric_move(
     };
     Some(MetricMove {
         member: member.map(str::to_owned),
-        // A metric path can carry artifact text (`elf.dynsym_funcs[name=…]`).
+        // A metric path can carry artifact text (`elf.dynsym_functions[name=…]`).
         label: crate::printable(label),
         old: compact_metric_number(old),
         new: compact_metric_number(new),

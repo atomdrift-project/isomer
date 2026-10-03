@@ -365,20 +365,10 @@ impl<'a> Analysis<'a> {
             remediation_cleanup_context(old, new, &assessment, &judged_diff, diff, risk);
         let is_remediation = remediation.is_some();
 
-        // A capability the version bump does not license *is* the supply-chain
-        // signal — so a disproportionate gain is escalated to a gate-failing
-        // severity even when the gained trait's own criticality is only medium.
-        // The bump's tolerance already scopes this: `Minor`/`Major` are only
-        // disproportionate on a High+ gain (already gate-failing, so this is a
-        // no-op), and it bites exactly where it should — a `patch`/`same`
-        // (repack) release that has no business gaining behavior at all
-        // (unrealircd: a same-version repack that gained byte-comparison and
-        // privilege-escalation traits, medium each, under the high gate).
-        let escalation = if prop.drift.is_disproportionate() && !is_remediation {
-            Severity::High
-        } else {
-            Severity::None
-        };
+        // Disproportionate drift — a gain the version bump does not license — is
+        // reported rather than escalated here. It only fires on a gate-worthy
+        // gain or a High change shape, and each of those already carries the
+        // verdict an escalation would set.
         let rubric_new = if is_remediation {
             assessment.new_severity_without_signatures()
         } else {
@@ -400,9 +390,9 @@ impl<'a> Analysis<'a> {
             shape_escalation.max(mass_escalation)
         };
         // The human-facing deterministic verdict must include the same
-        // escalation signals as the gate. Otherwise a shape-only attack can
-        // fail a High gate while the masthead still says NOTABLE (faker's
-        // endgame package deletion was the concrete example). Keep the raw
+        // escalation signals as the gate. Otherwise a shape-only attack fails
+        // the gate while the masthead still says NOTABLE (pinned by
+        // `incidents::faker_6_6_6_endgame_deletion_reads_hostile_in_the_masthead`). Keep the raw
         // Azoth probability visible but use only a worsening band in the
         // change verdict. A wallet or security package can have a high
         // absolute score on both sides without this release being an attack.
@@ -413,13 +403,7 @@ impl<'a> Analysis<'a> {
         let Verdicts {
             overall: verdict,
             new: new_verdict,
-        } = deterministic_verdicts(
-            &assessment,
-            rubric_new,
-            risk_jump,
-            escalation.max(shape_new),
-            remediation,
-        );
+        } = deterministic_verdicts(&assessment, rubric_new, risk_jump, shape_new, remediation);
 
         let a = Self {
             verb,
@@ -884,6 +868,8 @@ fn member_type(file: &FileDiffEntry) -> Option<filefacts::FileType> {
 #[cfg(test)]
 mod simulations;
 
+#[cfg(test)]
+mod incidents;
 #[cfg(test)]
 mod render_tests;
 #[cfg(test)]

@@ -303,7 +303,7 @@ fn structural_linker_facts_require_exact_elf_fields() {
         assert_eq!(structure(path, "elf").severity(), Severity::High, "{path}");
     }
     assert_eq!(
-        structure("elf.dynsym_funcs[name=read].type", "elf").severity(),
+        structure("elf.dynsym_functions[name=read].type", "elf").severity(),
         Severity::Medium
     );
 }
@@ -563,9 +563,10 @@ fn deleted_member_is_not_identity_drift_but_stripping_surviving_member_is() {
         file.file_type = Some("tar.gz".to_owned());
         file.status = status;
         file.identity = Some(cleave::types::IdentityDiff {
-            old: Some(filefacts::Identity {
-                name: Some(filefacts::Claim::claimed("example", claim_source)),
-                ..Default::default()
+            old: Some({
+                let mut old = filefacts::Identity::default();
+                old.name = Some(filefacts::Claim::claimed("example", claim_source));
+                old
             }),
             new: None,
             changed: true,

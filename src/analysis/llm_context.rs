@@ -145,9 +145,7 @@ impl Analysis<'_> {
 
         // The distilled top hunks — strongest rule first, one per rule, tiered
         // context — not every match. A broad trait hitting dozens of benign
-        // files must not bury the one change that matters (unrealircd's
-        // `substr: SYSTEM` read to the model as a false positive when all 30
-        // windows were dumped).
+        // files must not bury the one change that matters.
         let hunks = self.hunks(crate::evidence::LLM_HUNKS);
         if !hunks.is_empty() {
             writeln!(

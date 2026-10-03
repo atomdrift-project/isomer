@@ -113,7 +113,7 @@ pub(crate) enum Drift {
 }
 
 impl Drift {
-    /// Whether the gain outran what the bump promised — the escalation signal.
+    /// Whether the gain outran what the bump promised.
     pub(crate) fn is_disproportionate(&self) -> bool {
         matches!(self, Self::Disproportionate(_))
     }
@@ -145,7 +145,7 @@ pub(crate) struct Proportionality {
     pub drift: Drift,
     /// Behavioral change far outpacing content change — the implant tell. A
     /// rewrite moves both together; a surgical backdoor moves behavior on a
-    /// small edit (xz: 99% of behavior on a ~20% content change).
+    /// small edit.
     pub skew: Option<String>,
 }
 
@@ -214,9 +214,10 @@ impl Proportionality {
 
 /// Skew read over the per-scope rates of change: fires when the traits scope
 /// (behavior) moved at least `SKEW_RATIO`× the mean of the content scopes and
-/// a judged capability actually appeared. Calibrated on the bundled cases: the
-/// xz backdoor sits at 4.5×; full rewrites (behavior and content moving
-/// together) sit below 2.5×.
+/// a judged capability actually appeared. Calibrated on the bundled cases: a
+/// surgical implant sat at 4.5×, full rewrites (behavior and content moving
+/// together) below 2.5× — `incidents::xz_utils_5_6_0_behavior_outran_content`
+/// pins both sides.
 pub(super) fn skew_note(a: &Assessment, diff: &DiffReportV1) -> Option<String> {
     const SKEW_RATIO: f32 = 3.0;
     // A broad release can legitimately change many traits while its metric

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 fn main() -> Result<()> {
     let paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     ensure!(!paths.is_empty(), "provide one or more files to score");
-    let model_dir = scan::models_repo::model_dir()?;
+    let model_dir = scan::models_repo::ensure_model_dir()?;
     let analyzer = scan::Analyzer::load(&model_dir)?;
     for path in paths {
         let name = path

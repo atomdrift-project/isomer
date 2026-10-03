@@ -232,9 +232,9 @@ pub(super) fn diff_source_bytes(root: &Path, diff_path: &str) -> Option<Vec<u8>>
 }
 
 pub(super) fn immediate_entry_return_count(path: &str, bytes: &[u8]) -> usize {
-    let Ok(parsed) = filefacts::open_with_path(Path::new(path), bytes) else {
-        return 0;
-    };
+    let parsed = filefacts::OpenOptions::new()
+        .path(Path::new(path))
+        .open(bytes);
     let Some(ast) = parsed.source_ast() else {
         return 0;
     };

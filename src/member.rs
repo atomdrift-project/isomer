@@ -45,6 +45,12 @@ impl<'a> MemberPath<'a> {
         self.0.matches(SEPARATOR).count()
     }
 
+    /// Whether this is a member of an archive that is itself inside the
+    /// artifact: one layer further in than the artifact's own members.
+    pub(crate) fn is_nested(self) -> bool {
+        self.depth() > 1
+    }
+
     /// The outermost container and everything inside it: `("a.tgz",
     /// "package/x.js")`, or `("a.tgz", "inner.zip!!x.js")` when nested.
     pub(crate) fn split(self) -> Option<(&'a str, &'a str)> {

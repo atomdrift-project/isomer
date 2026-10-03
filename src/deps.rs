@@ -188,9 +188,8 @@ fn profile(dep: &Added, options: &AnalysisOptions, progress: bool) -> DepProfile
     let coord = crate::printable(&format!("{}@{}", dep.name, dep.spec));
     // Exact pins identify one immutable release. A range (`^0.1.0`) does not:
     // fetching its floor would miss the later compatible release an installer
-    // actually resolves — precisely the event-stream/flatmap-stream failure
-    // mode. Resolve within the declared range, never to unconstrained latest;
-    // lockfiles, when present, contribute exact pins.
+    // actually resolves. Resolve within the declared range, never to
+    // unconstrained latest; lockfiles, when present, contribute exact pins.
     let mut out = DepProfile {
         coord,
         ecosystem: dep.ecosystem,
@@ -503,6 +502,9 @@ mod tests {
         }
     }
 
+    /// event-stream 3.3.6 declared `flatmap-stream@^0.1.0`. The malicious code
+    /// shipped in 0.1.1, a later release inside that range — fetching the
+    /// range's floor would have profiled the clean 0.1.0 and missed it.
     #[test]
     fn dependency_fetch_only_pins_exact_versions() {
         assert_eq!(exact_version("1.2.3").as_deref(), Some("1.2.3"));

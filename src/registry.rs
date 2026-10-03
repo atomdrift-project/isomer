@@ -393,7 +393,8 @@ pub(crate) fn packument(package: &str) -> Option<serde_json::Value> {
 fn catalogue(sources: &[fletch::fetch::RecordedSource]) -> Option<serde_json::Value> {
     sources
         .iter()
-        .filter_map(|s| serde_json::from_slice::<serde_json::Value>(&s.bytes).ok())
+        // `bytes` is `None` for a document past the cache's size limit.
+        .filter_map(|s| serde_json::from_slice::<serde_json::Value>(s.bytes.as_deref()?).ok())
         .find(|doc| doc.get("versions").is_some())
 }
 
@@ -709,15 +710,12 @@ mod tests {
             "version":"3", "files":[{"id":0,"path":"sample.tgz","depth":0,"file_type":"npm","sha256":"a".repeat(64),"size":100}]
         })).unwrap();
         report.files[0].filefacts = Some(cleave::types::FilefactsView {
-            references: vec![filefacts::Reference {
-                locator: filefacts::RefLocator::Purl("pkg:npm/%40scope/dep".into()),
-                kind: filefacts::RefKind::Dependency,
-                source: "package.json".into(),
-                evidence: "@scope/dep@^2.0.0".into(),
-                offset: 0,
-                pinned_hash: None,
-                content_sha256: None,
-            }],
+            references: vec![filefacts::Reference::new(
+                filefacts::RefLocator::Purl("pkg:npm/%40scope/dep".into()),
+                filefacts::RefKind::Dependency,
+                "package.json",
+                "@scope/dep@^2.0.0",
+            )],
             ..Default::default()
         });
         let mut collected = Coordinates::new();

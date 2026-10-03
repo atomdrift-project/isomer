@@ -363,7 +363,7 @@ fn refresh_rules(cli: &Cli) {
     // `--offline` switch; a host that cannot reach the bucket scores without
     // the model rather than failing.
     if !cli.offline
-        && let Err(e) = scan::models_repo::model_dir()
+        && let Err(e) = scan::models_repo::ensure_model_dir()
     {
         eprintln!("isomer: ML model unavailable, risk scoring skipped: {e:#}");
     }

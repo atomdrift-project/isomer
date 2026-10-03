@@ -54,11 +54,10 @@ fn report() -> AnalysisReport {
 
 fn signed_by(name: &str) -> filefacts::Identity {
     let signer = serde_json::json!({"common_name": name, "source": "pe.signer"});
-    filefacts::Identity {
-        signer: Some(serde_json::from_value(signer).unwrap()),
-        trust: filefacts::Trust::CaSigned,
-        ..Default::default()
-    }
+    let mut identity = filefacts::Identity::default();
+    identity.signer = Some(serde_json::from_value(signer).unwrap());
+    identity.trust = filefacts::Trust::CaSigned;
+    identity
 }
 
 /// Judge the synthetic change offline, as the `fs` verb would.
