@@ -293,13 +293,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn list_skips_special_files_and_keeps_raw_names() {
-        use std::os::unix::ffi::OsStrExt;
+    fn list_skips_special_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/a.js"), b"x").unwrap();
-        let raw = std::ffi::OsStr::from_bytes(b"b\xff.js");
-        std::fs::write(dir.path().join(raw), b"x").unwrap();
         // A FIFO with no writer would block `open` forever.
         let fifo = dir.path().join("pipe");
         assert!(
@@ -311,8 +308,18 @@ mod tests {
         );
         std::os::unix::fs::symlink(dir.path().join("sub/a.js"), dir.path().join("link")).unwrap();
 
-        let got = list(dir.path()).unwrap();
-        assert_eq!(got, vec![PathBuf::from(raw), PathBuf::from("sub/a.js")]);
+        assert_eq!(list(dir.path()).unwrap(), vec![PathBuf::from("sub/a.js")]);
+    }
+
+    // APFS refuses a name that is not UTF-8 (EILSEQ), so macOS cannot hold one.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn list_keeps_raw_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = std::ffi::OsStr::from_bytes(b"b\xff.js");
+        std::fs::write(dir.path().join(raw), b"x").unwrap();
+        assert_eq!(list(dir.path()).unwrap(), vec![PathBuf::from(raw)]);
     }
 
     #[test]
