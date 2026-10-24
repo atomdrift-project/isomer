@@ -438,6 +438,8 @@ fn file_hunks(
         // proves. Keep this member-local: a common atom in another changed
         // member is not evidence for a composite that fired here.
         let promotions = composite_promotions(scanned.findings, gained_ids);
+        // The notes on each context window, derived as cleave renders them.
+        let notes = cleave::context::notes(scanned.findings, scanned.context);
         let keep = |id: &str| gained_ids.contains(id) || promotions.contains_key(id);
         // The member as a reader sees it. A member name is chosen by whoever
         // built the archive, so it is neutralized for display — and only for
@@ -463,22 +465,14 @@ fn file_hunks(
             && !new_src.is_empty()
             && !looks_binary(&new_src)
         {
-            addition_hunks(
-                &new_src,
-                &old_src,
-                scanned.context,
-                &keep,
-                &promotions,
-                site,
-                all,
-            );
+            addition_hunks(&new_src, &old_src, &notes, &keep, &promotions, site, all);
             continue;
         }
 
         // Binary / added-file fallback: match windows, cleave's presentation.
-        for chunk in scanned.context {
+        for (chunk, notes) in scanned.context.iter().zip(&notes) {
             let kept: Vec<&cleave::types::Note> =
-                chunk.notes.iter().filter(|n| keep(n.id.as_str())).collect();
+                notes.iter().filter(|n| keep(n.id.as_str())).collect();
             // Rank on the cheap key; only the winner's full attribution (two
             // allocated strings) is built, by the hunk constructor below.
             let Some(top) = kept
@@ -598,7 +592,7 @@ pub(crate) fn line_key(line: &str) -> &str {
 fn addition_hunks(
     new: &[u8],
     old: &[u8],
-    context: &[cleave::types::ContextLine],
+    notes: &[Vec<cleave::types::Note>],
     keep: &impl Fn(&str) -> bool,
     promotions: &HashMap<&str, Attribution>,
     site: Site<'_>,
@@ -616,7 +610,7 @@ fn addition_hunks(
     // each on its line.
     let newlines = newline_offsets(new);
     let mut hit: HashMap<usize, &cleave::types::Note> = HashMap::new();
-    for note in context.iter().flat_map(|c| &c.notes) {
+    for note in notes.iter().flatten() {
         if !keep(note.id.as_str()) {
             continue;
         }
@@ -1468,28 +1462,19 @@ mod tests {
         }
         let target = "added-129";
         let off = new.find(target).expect("late added line") as u64;
-        let file = cleave::types::FileAnalysis {
-            context: vec![cleave::types::ContextLine {
-                loc: off,
-                line: Some(260),
-                col: Some(1),
-                data: target.as_bytes().to_vec(),
-                notes: vec![cleave::types::Note {
-                    crit: Criticality::Hostile,
-                    id: "objectives/impact/destroy::late".into(),
-                    desc: "late destructive behavior".into(),
-                    off,
-                    len: u32::try_from(target.len()).unwrap(),
-                    conf: 1.0,
-                }],
-            }],
-            ..Default::default()
-        };
+        let notes = vec![vec![cleave::types::Note {
+            crit: Criticality::Hostile,
+            id: "objectives/impact/destroy::late".into(),
+            desc: "late destructive behavior".into(),
+            off,
+            len: u32::try_from(target.len()).unwrap(),
+            conf: 1.0,
+        }]];
         let mut hunks = Vec::new();
         addition_hunks(
             new.as_bytes(),
             old.as_bytes(),
-            &file.context,
+            &notes,
             &|_| true,
             &HashMap::new(),
             Site {

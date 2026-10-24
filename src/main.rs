@@ -352,12 +352,14 @@ fn run(cli: &Cli) -> anyhow::Result<Outcome> {
 /// rather than blocking.
 fn refresh_rules(cli: &Cli) {
     scan::traits_repo::prepare_runtime_env();
-    scan::auto_update::refresh_if_stale(
+    if let Err(e) = scan::auto_update::refresh_if_stale(
         false,
         cli.offline,
         scan::Mode::default(),
         cli.format == Format::Terminal,
-    );
+    ) {
+        eprintln!("isomer: rules refresh failed, using the installed rules: {e:#}");
+    }
     // The ML model bundle, installed on first use. The library only ever loads
     // what is installed, so the one network step lives here, behind the same
     // `--offline` switch; a host that cannot reach the bucket scores without
