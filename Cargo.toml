@@ -6,6 +6,12 @@ rust-version = "1.97"
 license = "Apache-2.0"
 description = "Supply-chain attack detection at a molecular level"
 repository = "https://github.com/atomdrift-project/isomer"
+default-run = "isomer"
+
+[workspace]
+members = ["tools"]
+default-members = [".", "tools"]
+resolver = "3"
 
 # isomer is a library with a thin command line over it: `main.rs` parses the
 # arguments and calls the verbs, everything else lives in the lib so another

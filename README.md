@@ -218,9 +218,10 @@ re-derived every run and not "fixed" by loosening a gate.
 The comparisons come from the corpus. Each record in the tree ships a `pairs.yaml`
 naming every comparison it supports and what a detector should conclude from each, so the
 audit reads them rather than deriving them from sample manifests. `make validate-manifests`
-resolves every stated comparison against the tree without running the scanner; it requires
-PyYAML and fails explicitly if unavailable. For an isolated environment, run
-`uv run --with pyyaml python scripts/validate-samples.py --check-corpus`.
+resolves the corpus comparisons against the tree without running the scanner.
+The audit and its regression tests run entirely in Rust; no Python environment is required.
+To invoke it directly, run
+`cargo run -p isomer-tools --bin validate-samples -- --check-corpus`.
 
 The tree is generated from the records repository (`make artifacts` there) and published
 to R2. It is not the records repository, which holds the text and no payload bytes.
@@ -237,10 +238,10 @@ during copying abort the run. Failures include
 the verdict and change summary from the original run, so a later rerun does not
 erase intermittent evidence.
 The default worker count leaves room for each scanner's own threads and memory;
-use the audit script's `--jobs` option to override it.
+use the audit tool's `--jobs` option to override it.
 
 For long runs, add `--stream-results /tmp/isomer-audit.jsonl` when invoking
-`python3 scripts/validate-samples.py --isomer ./target/quick/isomer`.
+`cargo run -p isomer-tools --bin validate-samples -- --isomer ./target/quick/isomer`.
 With make, use `ISOMER_AUDIT_STREAM_RESULTS=/tmp/isomer-audit.jsonl make validate-samples`.
 The path must be new. Each completed comparison is flushed immediately with its
 artifact name, original input paths, captured SHA-256 digests and sizes, expected
@@ -262,11 +263,6 @@ resume is not implemented. The audit is offline; live registry checks require a
 separate comparison.
 If the scanner warns that it skipped unparseable trait files, the comparison
 is an audit error even when its verdict matches the expected outcome.
-When multiple captures tie on classification, format, and version proximity,
-selection prefers verified complete captures over partial reconstructions.
-The fallback manifest reader retains verification status and original archive
-filenames as well as sample identity fields, so selection and archive staging
-also work without PyYAML. Inline comments do not change those values.
 
 ## Warts
 

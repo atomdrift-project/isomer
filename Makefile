@@ -23,52 +23,51 @@ TRAITS_DIR ?= $(if $(CLEAVE_TRAITS_DIR),$(CLEAVE_TRAITS_DIR),$(if $(wildcard ../
 all: build
 
 build:
-	$(CARGO) build
+	$(CARGO) build --bin $(BINARY)
 
 release:
-	$(CARGO) build --release
+	$(CARGO) build --release --bin $(BINARY)
 
 # Optimized but un-LTO'd, for targets that build then immediately run the
 # binary. See [profile.quick] in Cargo.toml.
 quick:
-	$(CARGO) build --profile quick
+	$(CARGO) build --profile quick --bin $(BINARY)
 
 install: release
 	$(CARGO) install --path .
 
-# Three gates, cheapest first. `--check` (not `--all`) keeps rustfmt inside this
-# package: `cargo fmt --all` also reformats local path dependencies, which would
+# Three gates, cheapest first. Explicit packages keep rustfmt inside this
+# workspace: `cargo fmt --all` also reformats local path dependencies, which would
 # drag ../scan and ../cleave into isomer's lint run. `--all-targets` puts tests
 # and examples under the same lints as the binary — clippy.toml relaxes only the
 # panic lints there. `--locked` fails on a stale Cargo.lock instead of quietly
 # rewriting it, so a lint run can't move a pinned git dep.
 lint: lint-trait-ids
-	$(CARGO) fmt --check
-	$(CARGO) clippy --locked --all-targets -- -D warnings
+	$(CARGO) fmt -p isomer -p isomer-tools --check
+	$(CARGO) clippy --locked --workspace --all-targets -- -D warnings
 
 # No legacy allowlist: scorer dependencies on local trait names must migrate.
 .PHONY: lint-trait-ids
 lint-trait-ids:
-	python3 scripts/lint_trait_ids.py
+	$(CARGO) run --quiet --locked -p isomer-tools --bin lint-trait-ids
 
 # Auto-fix what clippy and rustfmt can fix on their own; fmt last so it tidies
 # any code clippy rewrote. Same target set as `lint`.
 fix:
-	$(CARGO) clippy --fix --all-targets --allow-dirty --allow-staged
-	$(CARGO) fmt
+	$(CARGO) clippy --fix --workspace --all-targets --allow-dirty --allow-staged
+	$(CARGO) fmt -p isomer -p isomer-tools
 
 test:
-	$(CARGO) test --quiet
-	python3 -m unittest discover -s scripts -p 'test_*.py'
+	$(CARGO) test --quiet --workspace
 
 # Fast scoring regressions over synthetic differentials. No samples, model
 # bundle, trait checkout, or network required; also included in `make test`.
 test-simulations:
-	$(CARGO) test --quiet analysis::simulations
-	$(CARGO) test --quiet binary::tests
-	$(CARGO) test --quiet registry::tests
-	$(CARGO) test --quiet deps::tests
-	python3 -m unittest discover -s scripts -p 'test_*.py'
+	$(CARGO) test --quiet --workspace analysis::simulations
+	$(CARGO) test --quiet --workspace binary::tests
+	$(CARGO) test --quiet --workspace registry::tests
+	$(CARGO) test --quiet --workspace deps::tests
+	$(CARGO) test --quiet -p isomer-tools
 
 # Run the curated real-world supply-chain attacks — command in, verdict out,
 # nothing else. Doubles as a smoke test: fails if any case drops below notable.
@@ -78,10 +77,10 @@ demo: quick
 	@sh scripts/demo.sh "./target/quick/$(BINARY)"
 
 # Resolves every comparison the corpus states against the artifact tree, without
-# scanning anything. Requires PyYAML; fails if the tree is missing or a stated
+# scanning anything. Fails if the tree is missing or a stated
 # comparison names a file that is not there.
 validate-manifests:
-	python3 scripts/validate-samples.py --check-corpus
+	$(CARGO) run --quiet --locked -p isomer-tools --bin validate-samples -- --check-corpus
 
 # Self-audit against the supply-chain corpus: for every attack, before->during
 # must be detected, and during->after / before->after must not. Prints a
@@ -90,7 +89,7 @@ validate-manifests:
 # it skips cleanly (exit 2) when the corpus is absent.
 validate-samples: quick
 	@CLEAVE_TRAITS_DIR="$(TRAITS_DIR)" \
-		python3 scripts/validate-samples.py --isomer "./target/quick/$(BINARY)"
+		$(CARGO) run --quiet --locked -p isomer-tools --bin validate-samples -- --isomer "./target/quick/$(BINARY)"
 
 # Install the pre-commit gate (no [patch] path overrides + make lint + make
 # test). Bypass an individual commit with `git commit --no-verify`.

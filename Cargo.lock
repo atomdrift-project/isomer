@@ -310,7 +310,7 @@ dependencies = [
 [[package]]
 name = "atomdrift-scan"
 version = "2.13.0"
-source = "git+https://github.com/atomdrift-project/scan.git#ff73a7cd5c73c7233983fcfad937585949315956"
+source = "git+https://github.com/atomdrift-project/scan.git#6413bf0474863612ede2592247fd3d25258f522d"
 dependencies = [
  "anyhow",
  "axum",
@@ -2884,6 +2884,24 @@ dependencies = [
  "serde_json",
  "tempfile",
  "unicode-width 0.2.2",
+]
+
+[[package]]
+name = "isomer-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nix",
+ "proc-macro2",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "syn 2.0.119",
+ "tempfile",
+ "which",
 ]
 
 [[package]]
