@@ -99,7 +99,7 @@ fn analyzer() -> Option<&'static scan::Analyzer> {
         .get_or_init(|| {
             // `install_target`, not `model_dir`: the latter downloads a missing
             // bundle, and the library must not touch the network on its own.
-            let dir = scan::models_repo::install_target();
+            let dir = scan::models_repo::install_target().ok()?;
             if !dir.is_dir() {
                 return None;
             }
