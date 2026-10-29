@@ -352,9 +352,13 @@ fn run(cli: &Cli) -> anyhow::Result<Outcome> {
 /// rather than blocking.
 fn refresh_rules(cli: &Cli) {
     scan::traits_repo::prepare_runtime_env();
+    let refresh = if cli.offline {
+        scan::cli::Refresh::Skip
+    } else {
+        scan::cli::Refresh::IfStale
+    };
     if let Err(e) = scan::auto_update::refresh_if_stale(
-        false,
-        cli.offline,
+        refresh,
         scan::Mode::default(),
         cli.format == Format::Terminal,
     ) {
