@@ -187,7 +187,7 @@ tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
 # Mirrors cleave's patch section — patches only apply at the workspace root,
 # so isomer must carry them itself. tree-sitter 0.28 is unpublished
 # (crates.io tops out at 0.27.x) and cleave requires it; both tree-sitter
-# crates must come from the same source. Keep the rev in lockstep with
+# crates must come from the same source. Keep the source in lockstep with
 # cleave/scan; remove when a crates.io release lands.
-tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
-tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+tree-sitter = { git = "https://github.com/tstromberg/tree-sitter" }
+tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter" }
