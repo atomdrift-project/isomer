@@ -7,7 +7,7 @@
 //! read as two.
 
 use anyhow::{Result, anyhow};
-use fletch::purl::{Purl, PurlComponents};
+use fletch::purl::Purl;
 
 /// A package ecosystem a manifest declares runtime dependencies in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
@@ -54,17 +54,10 @@ impl Ecosystem {
 /// `version`, or versionless.
 pub(crate) fn package(ecosystem: Ecosystem, name: &str, version: Option<&str>) -> Result<String> {
     let (namespace, leaf) = match name.rsplit_once('/') {
-        Some((namespace, leaf)) => (namespace.split('/').map(str::to_owned).collect(), leaf),
-        None => (Vec::new(), name),
+        Some((namespace, leaf)) => (Some(namespace), leaf),
+        None => (None, name),
     };
-    build(PurlComponents {
-        typ: ecosystem.purl_type().to_owned(),
-        namespace,
-        name: leaf.to_owned(),
-        version: version.map(str::to_owned),
-        qualifiers: Default::default(),
-        subpath: Vec::new(),
-    })
+    build(ecosystem.purl_type(), namespace, leaf, version, [])
 }
 
 /// Normalize an `oci` argument to a purl. A bare image reference
@@ -93,27 +86,29 @@ pub(crate) fn oci(image: &str) -> Result<String> {
         Some((registry, leaf)) => (Some(registry), leaf),
         None => (None, path),
     };
-    build(PurlComponents {
-        typ: "oci".to_owned(),
-        namespace: Vec::new(),
-        name: leaf.to_ascii_lowercase(),
-        version: Some(tag.to_owned()),
-        qualifiers: registry
-            .map(|r| ("repository_url".to_owned(), r.to_owned()))
-            .into_iter()
-            .collect(),
-        subpath: Vec::new(),
-    })
+    build(
+        "oci",
+        None,
+        &leaf.to_ascii_lowercase(),
+        Some(tag),
+        registry.map(|r| ("repository_url", r)),
+    )
 }
 
-fn build(components: PurlComponents) -> Result<String> {
-    let shown = format!("{}/{}", components.typ, components.name);
-    Purl::from_components(components)
-        .map(|purl| purl.canonical())
+/// The canonical purl (its `Display` form) for decoded components.
+fn build<'a>(
+    typ: &str,
+    namespace: Option<&str>,
+    name: &str,
+    version: Option<&str>,
+    qualifiers: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<String> {
+    Purl::build(typ, namespace, name, version, qualifiers, None)
+        .map(|purl| purl.to_string())
         .map_err(|e| {
             anyhow!(
                 "cannot form a package URL for {}: {e}",
-                crate::printable(&shown)
+                crate::printable(&format!("{typ}/{name}"))
             )
         })
 }

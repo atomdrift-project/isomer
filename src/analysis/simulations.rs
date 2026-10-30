@@ -591,8 +591,9 @@ fn signer_changes_and_author_stripping_still_block() {
             serde_json::json!({"signer": {"common_name": "Other publisher", "source": "certificate"}}),
         ),
         (
-            serde_json::json!({"authors": [{"name": "Publisher", "role": "publisher", "source": "manifest"}]}),
-            serde_json::json!({"authors": [{"name": "Other publisher", "role": "publisher", "source": "manifest"}]}),
+            // A registry owner, the non-author party the publisher check covers.
+            serde_json::json!({"authors": [{"name": "Publisher", "role": "owner", "source": "manifest"}]}),
+            serde_json::json!({"authors": [{"name": "Other publisher", "role": "owner", "source": "manifest"}]}),
         ),
     ] {
         let mut file = source("package.json", &[]);

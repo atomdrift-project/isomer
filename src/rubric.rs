@@ -1011,7 +1011,7 @@ fn meaningful_identity_changes(
             .authors
             .iter()
             .chain(&n.authors)
-            .all(|p| p.role == "author");
+            .all(|p| p.role == filefacts::PartyRole::Author);
         push(
             if credits_only {
                 IdentityField::Authors
