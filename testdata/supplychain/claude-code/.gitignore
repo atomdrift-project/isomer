@@ -1,0 +1,3 @@
+# Original benign VSIXs include 120+ MiB of platform tooling.
+# The unmodified entrypoints and provenance below are the tracked demo corpus.
+/downloads/

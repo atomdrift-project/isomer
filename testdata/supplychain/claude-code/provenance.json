@@ -1,0 +1,83 @@
+{
+  "case": "claude-code-cursor-marketplace",
+  "retrieved_at": "2026-10-30T14:32:49.187696+00:00",
+  "sources": [
+    "https://cursor.com/blog/claude-code-extension-security-notice",
+    "https://phorion.io/blog/offical-claude-code-vsx-compromise/"
+  ],
+  "artifacts": {
+    "before": {
+      "version": "2.1.312",
+      "path": "before/extension.js",
+      "sha256": "1195816b6ecc944f25763a586d9e437a3e9a57342b5fdee543b59e1bb3d72e29",
+      "size_bytes": 3685536,
+      "status": "benign-control",
+      "registry_metadata": "before/registry.json",
+      "source_url": "https://open-vsx.org/api/Anthropic/claude-code/darwin-arm64/2.1.312/file/Anthropic.claude-code-2.1.312@darwin-arm64.vsix",
+      "published_at": "2026-10-27T20:27:13.052210Z",
+      "original_vsix": {
+        "path": "downloads/claude-code-2.1.312-darwin-arm64.vsix",
+        "sha256": "b851e43b35b634987ef794fbddc759a7eeabd662088511a276f6063a598373d2",
+        "size_bytes": 127409262,
+        "sha256_url": "https://open-vsx.org/api/Anthropic/claude-code/darwin-arm64/2.1.312/file/Anthropic.claude-code-2.1.312@darwin-arm64.sha256"
+      },
+      "member": "extension/extension.js"
+    },
+    "during": {
+      "version": "2.1.313",
+      "path": "during/extension.js",
+      "sha256": "ecb58cb29078d9646ad1dcdbe51526f2d9cfea06be5fb2ab183e8ecc3ab6bf15",
+      "size_bytes": 3692922,
+      "status": "compromised",
+      "purl": "pkg:vscode-extension/Anthropic/claude-code@2.1.313",
+      "provenance": "during/extension.js.forage.json",
+      "full_vsix_recovered": false,
+      "reported_vsix_sha256": {
+        "darwin-arm64": "432ccdee3801f99e52b8fe31f69ea9870118e96ea7ef9ecabed1479621b5ab62",
+        "win32-x64": "3de1722901165769893bef57c72594e9a54459faa23f3091b136b79966edd081"
+      }
+    },
+    "after": {
+      "version": "2.1.314",
+      "path": "after/extension.js",
+      "sha256": "927fe02283d2f6c9c9ecfb25413711b7c391eda6bec0c5ca33a1ff5dc6b85e6e",
+      "size_bytes": 3384860,
+      "status": "benign-control",
+      "registry_metadata": "after/registry.json",
+      "source_url": "https://open-vsx.org/api/Anthropic/claude-code/darwin-arm64/2.1.314/file/Anthropic.claude-code-2.1.314@darwin-arm64.vsix",
+      "published_at": "2026-10-30T01:08:47.435154Z",
+      "original_vsix": {
+        "path": "downloads/claude-code-2.1.314-darwin-arm64.vsix",
+        "sha256": "c1017ec0339e60b3eb762c4497d6448a9d0b3d6d0cbb09f86264bc219e73e6f4",
+        "size_bytes": 128975065,
+        "sha256_url": "https://open-vsx.org/api/Anthropic/claude-code/darwin-arm64/2.1.314/file/Anthropic.claude-code-2.1.314@darwin-arm64.sha256"
+      },
+      "member": "extension/extension.js"
+    }
+  },
+  "relationship": {
+    "during_suffix_equals_before": true,
+    "injected_prefix_bytes": 7386
+  },
+  "comparisons": [
+    {
+      "base": "before/extension.js",
+      "head": "during/extension.js",
+      "expected": "attack",
+      "fail_on": "medium"
+    },
+    {
+      "base": "before/extension.js",
+      "head": "after/extension.js",
+      "expected": "clean",
+      "fail_on": "high"
+    },
+    {
+      "base": "during/extension.js",
+      "head": "after/extension.js",
+      "expected": "clean",
+      "fail_on": "high"
+    }
+  ],
+  "recovery_limit": "The malicious VSIX was unavailable by PURL, Cursor URL, published archive hashes, or Wayback. The actual malicious entrypoint was recovered by PURL plus its own SHA-256, not reconstructed."
+}

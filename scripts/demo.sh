@@ -38,11 +38,19 @@ failures=0
 
 run() { # run <old> <new>
     printf '%s\n$ isomer fs %s %s\n%s\n' "$DIV" "$1" "$2" "$DIV"
-    if $ISOMER $NET --color always --fail-on medium fs "$1" "$2"; then
-        # Exit 0 at --fail-on medium means nothing reached notable — a miss.
-        printf 'NOT DETECTED — below notable (demo failure)\n'
-        failures=$((failures + 1))
-    fi
+    status=0
+    $ISOMER $NET --color always --fail-on medium fs "$1" "$2" || status=$?
+    case "$status" in
+        1) ;; # Expected: the comparison reached the configured risk gate.
+        0)
+            printf 'NOT DETECTED — below notable (demo failure)\n'
+            failures=$((failures + 1))
+            ;;
+        *)
+            printf 'SCAN ERROR — exit %s (demo failure)\n' "$status"
+            failures=$((failures + 1))
+            ;;
+    esac
     printf '\n\n'
 }
 
@@ -71,5 +79,12 @@ run "$D/$O/before/openapi-react-query-codegen-3.0.2.tgz"     "$D/$O/during/opena
 # same publisher, same packaging as the pair above, no payload: exactly the
 # upgrade a false positive here would block.
 clean "$D/$O/before/openapi-react-query-codegen-2.2.0.tgz"   "$D/$O/before/openapi-react-query-codegen-3.0.2.tgz"
+
+# Cursor Marketplace compromise: the recovered malicious entrypoint is exactly
+# the preceding release plus a 7,386-byte SSH-backdoor loader. The newer release
+# is an independent clean control, also checked in the remediation direction.
+run "$D/claude-code/before/extension.js"  "$D/claude-code/during/extension.js"
+clean "$D/claude-code/before/extension.js" "$D/claude-code/after/extension.js"
+clean "$D/claude-code/during/extension.js" "$D/claude-code/after/extension.js"
 
 exit "$failures"

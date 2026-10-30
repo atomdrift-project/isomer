@@ -1,0 +1,216 @@
+{
+  "schema_version": "1.0",
+  "artifact": {
+    "filename": "extension.js",
+    "sha256": "ecb58cb29078d9646ad1dcdbe51526f2d9cfea06be5fb2ab183e8ecc3ab6bf15",
+    "size_bytes": 3692922
+  },
+  "fetch": {
+    "collector": "forager",
+    "category": "bad",
+    "at": "2026-10-30T14:31:46.705532Z",
+    "url": "https://mb-api.abuse.ch/api/v1/"
+  },
+  "feed": {
+    "source_id": "bazaar",
+    "ecosystem": "js",
+    "format": "bazaar.v1",
+    "url": "https://mb-api.abuse.ch/api/v1/",
+    "at": "2026-10-30T14:31:31.455081Z",
+    "status": "complete",
+    "raw": {
+      "sha256_hash": "ecb58cb29078d9646ad1dcdbe51526f2d9cfea06be5fb2ab183e8ecc3ab6bf15",
+      "sha3_384_hash": "846e65836036aeb89b08220221e4ad5b7afe8d61342d74faa9af0c44fc011a3628428862b3eea1ca3041652337036915",
+      "sha1_hash": "7d52fa561468f0c77bca112f8393399dec078d02",
+      "md5_hash": "f49bcd657ef1e626e85ce858958c1769",
+      "first_seen": "2026-10-30 11:29:15",
+      "last_seen": null,
+      "file_name": "extension.js",
+      "file_size": 3692922,
+      "file_type_mime": "application\/javascript",
+      "file_type": "js",
+      "file_format": null,
+      "file_arch": null,
+      "reporter": "ffforward",
+      "origin_country": "SE",
+      "anonymous": 0,
+      "signature": null,
+      "imphash": null,
+      "tlsh": "T1A6067CD6B3DBB6370FE560B4947B0202F37D6D549448842DF2A8A4CB366884996F3F78",
+      "telfhash": null,
+      "gimphash": null,
+      "ssdeep": "49152:CGGoyfcH1m+b6Xm\/fTz9mEVZohK3KDxIoIo3LCHKtUJi1anlulfmpH5Xk9JCnUY\/:\/c\/I34+O4Q8VtiNwD8c",
+      "magika": "javascript",
+      "dhash_icon": null,
+      "trid": [
+        "70.3% (.) AGraph input data (with rem) (9500\/1\/3)",
+        "29.6% (.DII) Summation Document Image Information Load File (4000\/1\/1)"
+      ],
+      "comment": "This is the JavaScript from the malicious Claude Code 2.1.313 extension published on the Cursor Marketplace. Evidence points to that this was an isolated Cursor marketplace infrastructure compromise. Upstream NPM (@anthropic-ai\/claude-code), Open-VSX, Anthropic accounts, and the Microsoft VS Code marketplace were likely never compromised or affected.",
+      "archive_pw": null,
+      "tags": [
+        "2.1.313",
+        "ClaudeCode",
+        "CursorCompromise",
+        "Extension",
+        "js",
+        "VSCode"
+      ],
+      "code_sign": null,
+      "delivery_method": null,
+      "intelligence": {
+        "clamav": null,
+        "downloads": "108",
+        "uploads": "1",
+        "mail": null
+      },
+      "file_information": [
+        {
+          "context": "links",
+          "value": "https:\/\/cursor.com\/blog\/claude-code-extension-security-notice"
+        }
+      ],
+      "ole_information": [],
+      "yara_rules": [
+        {
+          "rule_name": "CP_Script_Inject_Detector",
+          "author": "DiegoAnalytics",
+          "description": "Detects attempts to inject code into another process across PE, ELF, Mach-O binaries",
+          "reference": null
+        },
+        {
+          "rule_name": "DetectEncryptedVariants",
+          "author": "Zinyth",
+          "description": "Detects 'encrypted' in ASCII, Unicode, base64, or hex-encoded",
+          "reference": null
+        },
+        {
+          "rule_name": "Detect_all_IPv6_variants",
+          "author": "Bierchermuesli",
+          "description": "Generic IPv6 catcher",
+          "reference": null
+        },
+        {
+          "rule_name": "FreddyBearDropper",
+          "author": "Dwarozh Hoshiar",
+          "description": "Freddy Bear Dropper is dropping a malware through base63 encoded powershell scrip.",
+          "reference": null
+        },
+        {
+          "rule_name": "html_auto_download_b64",
+          "author": "Tdawg",
+          "description": "html auto download",
+          "reference": null
+        },
+        {
+          "rule_name": "Hunt_KiraAsciiObfuscator",
+          "author": "Serhii Kocherhan",
+          "description": "Detects files and scripts obfuscated using KiraAsciiObfuscator patterns and structural artifacts",
+          "reference": null
+        },
+        {
+          "rule_name": "LLM_API_Anthropic",
+          "author": "llm-api-abuse-pilot",
+          "description": "References Anthropic API",
+          "reference": null
+        },
+        {
+          "rule_name": "LLM_API_OpenAI",
+          "author": "llm-api-abuse-pilot",
+          "description": "References OpenAI API endpoints or key material",
+          "reference": null
+        },
+        {
+          "rule_name": "mht_inside_word",
+          "author": "dPhish",
+          "description": "Detect embedded mht files inside microsfot word.",
+          "reference": null
+        },
+        {
+          "rule_name": "MULTI_Malware_RemcosRAT_ForgeAuto_4785f0c3",
+          "author": "Marjoriefort",
+          "description": "Detects RemcosRAT (inconnu, etat binaire)",
+          "reference": null
+        },
+        {
+          "rule_name": "NET",
+          "author": "malware-lu",
+          "description": null,
+          "reference": null
+        },
+        {
+          "rule_name": "RANSOMWARE",
+          "author": "ToroGuitar",
+          "description": null,
+          "reference": null
+        },
+        {
+          "rule_name": "Suspicious_Process",
+          "author": "Security Research Team",
+          "description": "Suspicious process creation",
+          "reference": null
+        },
+        {
+          "rule_name": "SUSP_HTML_XMLHTTP_Redirect_Kit",
+          "author": "Marjoriefort",
+          "description": "HTML avec exfiltration XMLHTTP + redirection window.location - kit phishing frais",
+          "reference": "Veille fraicheur 2026-09-14 \/ cluster HTML"
+        },
+        {
+          "rule_name": "Sus_CMD_Powershell_Usage",
+          "author": "XiAnzheng",
+          "description": "May Contain(Obfuscated or no) Powershell or CMD Command that can be abused by threat actor(can create FP)",
+          "reference": null
+        },
+        {
+          "rule_name": "telebot_framework",
+          "author": "vietdx.mb",
+          "description": null,
+          "reference": null
+        }
+      ],
+      "vendor_intel": {
+        "CERT-PL_MWDB": {
+          "detection": null,
+          "link": "https:\/\/mwdb.cert.pl\/sample\/ecb58cb29078d9646ad1dcdbe51526f2d9cfea06be5fb2ab183e8ecc3ab6bf15\/"
+        },
+        "Triage": {
+          "malware_family": null,
+          "score": "3",
+          "link": "https:\/\/tria.ge\/reports\/261030-nlpq1ayw7q\/",
+          "tags": [
+            "execution"
+          ],
+          "signatures": [
+            {
+              "signature": "Command and Scripting Interpreter: JavaScript",
+              "score": "3"
+            }
+          ],
+          "malware_config": []
+        },
+        "ReversingLabs": {
+          "threat_name": null,
+          "status": "KNOWN",
+          "first_seen": "2026-10-30 09:36:05",
+          "scanner_count": "36",
+          "scanner_match": "0",
+          "scanner_percent": "0.00"
+        },
+        "Spamhaus_HBL": [
+          {
+            "detection": "suspicious",
+            "link": "https:\/\/www.spamhaus.org\/hbl\/"
+          }
+        ],
+        "FileScan-IO": {
+          "verdict": "LIKELY_MALICIOUS",
+          "threatlevel": "0.75",
+          "confidence": "1.0",
+          "report_link": "https:\/\/www.filescan.io\/uploads\/6ae47f91399f187aa0c5accf\/reports\/d8db3ff2-2b11-49d2-a7bf-60d6e75de4cc\/overview"
+        }
+      },
+      "comments": null
+    }
+  }
+}

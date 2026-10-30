@@ -74,7 +74,7 @@ test-simulations:
 # Builds once, then hands the binary to the demo script so the output isn't
 # interleaved with cargo's.
 demo: quick
-	@sh scripts/demo.sh "./target/quick/$(BINARY)"
+	@CLEAVE_TRAITS_DIR="$(TRAITS_DIR)" sh scripts/demo.sh "./target/quick/$(BINARY)"
 
 # Resolves every comparison the corpus states against the artifact tree, without
 # scanning anything. Fails if the tree is missing or a stated
