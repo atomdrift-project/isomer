@@ -2834,6 +2834,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
+ "similar",
  "tempfile",
  "unicode-width 0.2.3",
 ]
