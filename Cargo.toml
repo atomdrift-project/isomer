@@ -71,6 +71,9 @@ atomdrift-scan = { git = "https://github.com/atomdrift-project/scan.git" }
 # `isomer ci` materializes the changed files into a scratch tree; tempfile
 # owns its lifetime and permissions. Already in the graph via scan.
 tempfile = "3"
+# Line diffs for scoring a change's added and removed lines on their own.
+# No dependencies of its own; already in the graph via insta.
+similar = "2.7"
 
 [dev-dependencies]
 # Renderer snapshots: the whole report, reviewed as a diff when it moves.
