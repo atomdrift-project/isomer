@@ -508,6 +508,10 @@ impl<'a> Analysis<'a> {
         // read from the member list rather than any trait about the files.
         let arrivals = arrivals::found(&judged_diff, naming.bump);
         let arrived = arrivals.first().map_or(Severity::None, |a| a.severity);
+        log::debug!(
+            "shape: rules={shape_escalation:?} mass={mass_escalation:?} frameworks={framework_drift:?} \
+             injection={injected:?} install_hook={hooked:?} arrivals={arrived:?} remediation={is_remediation}"
+        );
         let shape_new = if is_remediation {
             Severity::None
         } else {

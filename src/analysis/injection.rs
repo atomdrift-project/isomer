@@ -13,8 +13,8 @@
 //!
 //! * **input to execution** — the changed lines put request input within a
 //!   few lines of an execution the file never had.
-//! * **concentrated execution** — an execution capability the file never had
-//!   arrives in a handful of lines, and it is the only new capability the
+//! * **concentrated execution** — an execution capability the release never
+//!   had arrives in a handful of lines, and it is the only new capability the
 //!   release brings.
 //!
 //! Both are read against the release promise: a patch has no business adding
@@ -270,7 +270,9 @@ fn judge(
     // added, and it fits in a few lines of a file large enough for that to be
     // a sliver of it. Independent of any input. A new class found on those
     // same lines — a composite naming what they do — is the execution
-    // described again, not a second feature.
+    // described again, not a second feature. An execution whose class the
+    // release already had is a new call site of an old capability: a tool
+    // that always spawned `dotnet` and now also probes `dotnet --version`.
     let spans: HashSet<usize> = executions.iter().map(|(l, _)| l.line).collect();
     let classes: HashSet<String> = located
         .iter()
@@ -278,7 +280,12 @@ fn judge(
         .filter_map(|l| crate::rubric::capability_class(l.id))
         .collect();
     let alone = context.new_classes.iter().all(|c| classes.contains(c));
-    let strongest = executions.iter().max_by_key(|(_, power)| *power);
+    let strongest = executions
+        .iter()
+        .filter(|(l, _)| {
+            crate::rubric::capability_class(l.id).is_some_and(|c| context.new_classes.contains(&c))
+        })
+        .max_by_key(|(_, power)| *power);
     if let Some(&(at, power)) = strongest
         && lines >= MIN_FILE_LINES
         && spans.len() <= CONCENTRATED
@@ -419,6 +426,23 @@ mod tests {
         let patch = Some(Bump::new(BumpKind::Patch, 1));
         let known = [at(COOKIE, 513, false), at(CALL, 513, false)];
         assert_eq!(judged(&known, &[], patch), []);
+    }
+
+    #[test]
+    fn a_new_call_site_of_an_existing_capability_is_not_concentrated() {
+        // @uipath/packager-tool-workflowcompiler 0.0.17: a compiler that
+        // always spawned `dotnet` adds an `execSync("dotnet --version")`
+        // probe. The rule is new to the file; process creation is not new
+        // to the release, so nothing new arrived in those lines.
+        let patch = Some(Bump::new(BumpKind::Patch, 2));
+        let probe = [at(SPAWN, 1245, true)];
+        assert_eq!(judged(&probe, &[], patch), []);
+        // Request data reaching it is still read, whatever the class.
+        let fed = [at(COOKIE, 1244, false), at(SPAWN, 1245, true)];
+        assert_eq!(
+            kinds(&judged(&fed, &[], patch)),
+            [(Kind::InputToExecution, Severity::Critical)]
+        );
     }
 
     #[test]
