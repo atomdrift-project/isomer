@@ -43,6 +43,23 @@ struct Cli {
     #[arg(long, global = true)]
     offline: bool,
 
+    /// Insist on Atomdrift Uplink: zero-hour rules the moment they clear QA,
+    /// remote dependency verdicts, and a default hosted LLM endpoint. A
+    /// computer that holds a token (`ISOTOPE13_TOKEN`, or the one saved when
+    /// it was connected) uses Uplink without this flag. With it, a computer
+    /// that holds none is connected — a terminal shows a code to approve at
+    /// dash.isotope13.io — and a refused token stops the run instead of
+    /// falling back to the open-source rules. Ignored under `--offline`. Also
+    /// settable via `ATOMDRIFT_UPLINK=1`; `=0` keeps the open-source rules.
+    #[arg(
+        long,
+        alias = "enriched",
+        global = true,
+        env = "ATOMDRIFT_UPLINK",
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
+    uplink: bool,
+
     /// When to colorize output. `auto` (the default) colors only when stdout
     /// is a terminal; `always` forces color through pipes (e.g. into a pager
     /// or CI log); `never` disables it.
@@ -75,20 +92,6 @@ struct Cli {
     /// autodetected if omitted.
     #[arg(long, global = true, value_name = "NAME", env = "ISOMER_LLM_MODEL")]
     llm_model: Option<String>,
-
-    /// Bearer token for `--llm`; omit for local endpoints.
-    #[arg(
-        long,
-        global = true,
-        value_name = "KEY",
-        env = "ISOMER_LLM_KEY",
-        hide_env_values = true
-    )]
-    llm_key: Option<isomer::options::Secret>,
-
-    /// Per-request LLM timeout in seconds.
-    #[arg(long, global = true, value_name = "SECS")]
-    llm_timeout: Option<u64>,
 
     /// Fetch added and changed runtime dependencies. Compare behavioral/risk
     /// profiles for changed versions and unambiguous replacements. A network
@@ -135,8 +138,12 @@ impl From<&Cli> for Options {
             progress: cli.progress(),
             llm: cli.llm.clone(),
             llm_model: cli.llm_model.clone(),
-            llm_key: cli.llm_key.clone(),
-            llm_timeout: cli.llm_timeout,
+            // A secret on the command line lands in `ps` and shell history,
+            // so the bearer token is taken from the environment only.
+            llm_key: std::env::var("ISOMER_LLM_KEY")
+                .ok()
+                .filter(|key| !key.is_empty())
+                .map(isomer::options::Secret::new),
             base_version: cli.base_version.clone(),
             head_version: cli.head_version.clone(),
         }
@@ -266,14 +273,23 @@ impl Diagnostics {
         // Fails only when a logger is already set, which leaves that one in
         // charge — the right outcome either way.
         if log::set_logger(&LOGGER).is_ok() {
-            log::set_max_level(log::LevelFilter::Info);
+            log::set_max_level(Self::level());
+        }
+    }
+
+    /// `ISOMER_LOG=debug` adds the decisions behind a verdict — what each
+    /// reading scored, which changed lines were read — to the diagnostics.
+    fn level() -> log::LevelFilter {
+        match std::env::var("ISOMER_LOG").as_deref() {
+            Ok("debug") => log::LevelFilter::Debug,
+            _ => log::LevelFilter::Info,
         }
     }
 }
 
 impl log::Log for Diagnostics {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::max_level()
             && (metadata.target() == "isomer" || metadata.target().starts_with("isomer::"))
     }
 
@@ -308,7 +324,7 @@ fn disable_analysis_cache_if_requested() {
 /// Runs the selected verb: its report, and whether the delta is clean at
 /// `--fail-on`.
 fn run(cli: &Cli) -> anyhow::Result<Outcome> {
-    refresh_rules(cli);
+    refresh_rules(cli)?;
     let opts = Options::from(cli);
     match &cli.command {
         Command::Ci {
@@ -350,7 +366,19 @@ fn run(cli: &Cli) -> anyhow::Result<Outcome> {
 /// scan's own `SCAN_NO_UPDATE`; a refresh that cannot reach the bucket stamps
 /// the attempt and moves on, so an offline host degrades to whatever it has
 /// rather than blocking.
-fn refresh_rules(cli: &Cli) {
+fn refresh_rules(cli: &Cli) -> anyhow::Result<()> {
+    cleave::enriched::resolve(!cli.offline && cli.uplink)?;
+    if !cli.uplink && uplink_opted_out() {
+        cleave::enriched::set_enabled(false);
+    }
+    if cli.offline {
+        let installed = cleave::traits_repo::installed_dir(true);
+        if cleave::enriched::enabled() && cleave::rule_update::installed(&installed).is_none() {
+            cleave::enriched::set_enabled(false);
+        }
+    } else if cleave::enriched::required() {
+        cleave::rule_update::sign_in().map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
     scan::traits_repo::prepare_runtime_env();
     let refresh = if cli.offline {
         scan::cli::Refresh::Skip
@@ -362,6 +390,9 @@ fn refresh_rules(cli: &Cli) {
         scan::Mode::default(),
         cli.format == Format::Terminal,
     ) {
+        if cleave::enriched::required() {
+            return Err(e);
+        }
         eprintln!("isomer: rules refresh failed, using the installed rules: {e:#}");
     }
     // The ML model bundle, installed on first use. The library only ever loads
@@ -373,6 +404,19 @@ fn refresh_rules(cli: &Cli) {
     {
         eprintln!("isomer: ML model unavailable, risk scoring skipped: {e:#}");
     }
+    Ok(())
+}
+
+/// Whether `ATOMDRIFT_UPLINK` explicitly opted out (`0`, `false`, `no`, `off`),
+/// so `--uplink`'s env switch disables a held token even before cleave's own
+/// `ENABLE_ENV` advances in `Cargo.lock`.
+fn uplink_opted_out() -> bool {
+    std::env::var("ATOMDRIFT_UPLINK").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | "n" | "f"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -419,5 +463,18 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn uplink_and_legacy_enriched_alias_parse() {
+        use clap::Parser;
+        for flag in ["--uplink", "--enriched"] {
+            let cli = Cli::try_parse_from(["isomer", flag, "fs", "a", "b"]).unwrap();
+            assert!(cli.uplink, "{flag}");
+        }
+        // `--offline` and `--uplink` do not conflict at parse time so
+        // `ATOMDRIFT_UPLINK=1` in the environment never breaks `--offline`.
+        let cli = Cli::try_parse_from(["isomer", "--offline", "--uplink", "fs", "a", "b"]).unwrap();
+        assert!(cli.offline && cli.uplink);
     }
 }

@@ -406,7 +406,7 @@ pub(super) fn change_shape_escalation(shape: &Shape<'_>, signals: &Signals) -> S
             &[
                 "micro-behaviors/communications/http/request/json",
                 "micro-behaviors/communications/http/request/client",
-                "micro-behaviors/ui/window/manage/html-insert",
+                "micro-behaviors/ui/window/insert-html",
                 "micro-behaviors/communications/http/request/plugin-install",
             ],
         );
@@ -1076,25 +1076,37 @@ pub(super) fn secret_egress_cluster(
                         a.behavioral.new_categories.contains(&class)
                             && [
                                 class::HTTP,
-                                class::CRYPTO_LIBRARY,
+                                class::CRYPTO_PROVIDER,
                                 class::CRYPTO_ASYMMETRIC,
+                                class::CRYPTO_KEY,
                                 "credential-access",
                             ]
                             .iter()
                             .any(|prefix| under(&class, prefix))
                     });
+            // Secrets a file can hold, where the taxonomy files them: wallet
+            // files, seed phrases, keys, credential access. Signing a
+            // transaction is every wallet client's job, not a secret.
             let has_secret = ids().any(|id| {
-                TraitId::new(id).is_under("micro-behaviors/crypto/library/blockchain/wallet")
-                    || TraitId::new(id).is_under("objectives/credential-access")
+                [
+                    "micro-behaviors/fs/path/wallet",
+                    "micro-behaviors/crypto/mnemonic",
+                    "micro-behaviors/crypto/key",
+                    "objectives/credential-access",
+                ]
+                .iter()
+                .any(|secret| TraitId::new(id).is_under(secret))
             });
             gains_core_capability
                 && has_secret
                 && has_class(class::HTTP)
                 && (has_class("data/encode")
                     || has_class("data/decode")
-                    || has_class("file/encoded"))
-                && (has_class(class::CRYPTO_LIBRARY) || has_class(class::CRYPTO_ASYMMETRIC))
-                && ids().any(|id| TraitId::new(id).is_under(trait_::URL_DOMAIN))
+                    || has_class("file/encoding"))
+                && (has_class(class::CRYPTO_PROVIDER)
+                    || has_class(class::CRYPTO_ASYMMETRIC)
+                    || has_class(class::CRYPTO_KEY))
+                && ids().any(|id| TraitId::new(id).is_under(trait_::URL_HOST))
         })
 }
 
@@ -1256,10 +1268,7 @@ pub(super) fn source_download_write_execute_anomaly<'a>(
             || has("micro-behaviors/communications/http/client/response-body");
         // A system-information read is not a conditional platform gate.
         let platform_gated = has("micro-behaviors/os/sysinfo/platform/branch");
-        (fetches_response
-            && has(trait_::PROCESS_CREATE)
-            && (has(trait_::FS_WRITE) || has(trait_::FILE_WRITE))
-            && platform_gated)
+        (fetches_response && has(trait_::PROCESS_CREATE) && has(trait_::FS_WRITE) && platform_gated)
             .then_some(path)
     })
 }
@@ -1316,7 +1325,7 @@ pub(super) fn file_gained_all_hierarchies(diff: &DiffReportV1, hierarchies: &[&s
 }
 
 /// Correlate four new evidence families in one source file. Metadata class
-/// names include their leaf (`file/encoded::...`), so exact class equality
+/// names include their leaf (`file/encoding::...`), so exact class equality
 /// silently disabled this rule. Read taxonomy namespaces instead. Encoding
 /// alone is not execution, and an archive's pooled traits are not one file.
 pub(super) fn gained_encoded_execution_cluster(diff: &DiffReportV1) -> bool {
@@ -1335,12 +1344,11 @@ pub(super) fn gained_encoded_execution_cluster(diff: &DiffReportV1) -> bool {
                     && TraitId::new(&finding.id).is_under(hierarchy)
             })
         };
-        has("metadata/file/encoded")
+        has("metadata/file/encoding")
             && has("objectives/anti-static/obfuscation")
             && (has(trait_::PROCESS_CREATE) || has(trait_::INTERPRETER))
             && (has("micro-behaviors/communications/http/client")
                 || has("micro-behaviors/communications/http/request")
-                || has(trait_::FILE_WRITE)
                 || has(trait_::FS_WRITE)
                 || has("micro-behaviors/process/daemonize"))
     })
@@ -1358,7 +1366,7 @@ pub(super) fn gained_encoded_script_loading(diff: &DiffReportV1) -> bool {
 /// This catches a payload appended plainly to a distributed browser bundle;
 /// the modest-release guard belongs to [`change_shape_escalation`].
 pub(super) fn gained_script_loading_with_host(diff: &DiffReportV1) -> bool {
-    file_gained_all_hierarchies(diff, &[trait_::URL_DOMAIN, trait_::SCRIPT_LOAD])
+    file_gained_all_hierarchies(diff, &[trait_::URL_HOST, trait_::SCRIPT_LOAD])
 }
 
 /// The inverse of [`endgame_package_shape`], strengthened with direct evidence

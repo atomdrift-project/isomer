@@ -245,6 +245,61 @@ pub(super) fn skew_note(a: &Assessment, diff: &DiffReportV1) -> Option<String> {
     })
 }
 
+/// Escalation from how much of an artifact's MITRE ATT&CK and MBC coverage a
+/// change introduced.
+///
+/// The frameworks name *techniques*, not rules: a dozen traits spelling one
+/// reverse shell are one technique, and an implant that persists, tunnels and
+/// beacons is three new ones however its traits are graded or suppressed. A
+/// release that brings a large share of the techniques its artifact now shows
+/// is a new kind of program, whatever the rubric made of each trait.
+///
+/// Either framework clearing its bar is High. Both clearing theirs, with at
+/// least [`MAJORITY`] of the ATT&CK techniques new, is Critical: the release
+/// brought most of what its artifact now does, by both catalogs' count.
+///
+/// The same honesty bounds as [`capability_mass_escalation`] apply: the change
+/// must add techniques rather than trade them, the bars scale with the release
+/// promise, and only whole artifacts are read, since a directory comparison's
+/// survey covers the touched files rather than the release. The caller also
+/// withholds a package that replaced all of its code, whose shares describe
+/// the replacement rather than a change to it.
+pub(super) fn framework_escalation(
+    attack: &crate::evidence::Sides,
+    mbc: &crate::evidence::Sides,
+    bump: Option<Bump>,
+    whole_artifact: bool,
+) -> Severity {
+    if !whole_artifact {
+        return Severity::None;
+    }
+    let ((attack_floor, attack_share), (mbc_floor, mbc_share)) =
+        match bump.map_or(Promise::Nothing, |b| b.kind.promise()) {
+            // MBC floors sit one above where WordPress plugin updates and
+            // smart-contract libraries routinely land: two new micro-behaviors
+            // (a hash, a request) out of three.
+            Promise::Nothing => ((3, 0.30), (3, 0.25)),
+            Promise::Features => ((4, 0.40), (4, 0.35)),
+            Promise::Anything => ((6, 0.50), (5, 0.50)),
+        };
+    let injected = |sides: &crate::evidence::Sides, floor: usize, share: f32| {
+        let gained = sides.gained().len();
+        gained >= floor && sides.lost().len() * 2 <= gained && sides.new_share() >= share
+    };
+    match (
+        injected(attack, attack_floor, attack_share),
+        injected(mbc, mbc_floor, mbc_share),
+    ) {
+        (true, true) if attack.new_share() >= MAJORITY => Severity::Critical,
+        (true, _) | (_, true) => Severity::High,
+        (false, false) => Severity::None,
+    }
+}
+
+/// The share of new ATT&CK techniques past which a release that clears both
+/// framework bars is read as a new program rather than a large feature.
+const MAJORITY: f32 = 0.5;
+
 /// Raise a gate on the *quantity* of behavior a release introduced, with no
 /// reference to which behavior it was.
 ///

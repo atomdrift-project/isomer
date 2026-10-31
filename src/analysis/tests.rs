@@ -681,7 +681,7 @@ fn obfuscated_remote_loader_requires_convergence_on_one_file() {
     };
     let complete = [
         "micro-behaviors/data/encode/char-code",
-        "micro-behaviors/process/create/load/script",
+        "micro-behaviors/os/module/load",
     ];
     assert!(gained_encoded_script_loading(&make_diff(&complete)));
     assert!(!gained_script_loading_with_host(&make_diff(&complete)));
@@ -695,8 +695,8 @@ fn obfuscated_remote_loader_requires_convergence_on_one_file() {
     }
 
     let literal = [
-        "micro-behaviors/communications/http/url/domain",
-        "micro-behaviors/process/create/load/script",
+        "micro-behaviors/communications/url/host",
+        "micro-behaviors/os/module/load",
     ];
     assert!(gained_script_loading_with_host(&make_diff(&literal)));
     assert!(!gained_encoded_script_loading(&make_diff(&literal)));

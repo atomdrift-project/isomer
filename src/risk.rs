@@ -6,11 +6,11 @@
 //! artifact. Preserve the model's decision rather than inferring maliciousness
 //! from a universal probability cutoff.
 //!
-//! Each side is read twice when its pair is text: the whole file, and the lines
-//! the change removed or added. The model judges a file as a whole, so an
-//! implant prepended to a multi-megabyte bundle is a sliver of the whole
-//! file's features — but all of its changed lines'. The graver of the two
-//! readings stands for the side.
+//! A side with [changed lines](crate::changed_lines) is read twice: the whole
+//! file, and the lines the change removed or added. The model judges a file as
+//! a whole, so an implant prepended to a multi-megabyte bundle is a sliver of
+//! the whole file's features — but all of its changed lines'. The graver of the
+//! two readings stands for the side.
 //!
 //! Scoring degrades gracefully: if no model bundle is installed, risk is simply
 //! absent from the report rather than an error. Installing one is a network
@@ -20,11 +20,9 @@
 use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use scan::Classification;
 use scan::model::Level;
-use similar::ChangeTag;
 
 /// Model malware-probabilities for the two sides of a diff, in `[0, 1]`.
 #[derive(Debug, Clone, Copy)]
@@ -133,7 +131,10 @@ fn analyzer() -> Option<&'static scan::Analyzer> {
 ///
 /// Returns `None` if the model is unavailable or nothing scored — risk is
 /// optional context, never a hard dependency.
-pub(crate) fn score(pairs: &[crate::analysis::Pair]) -> Option<Risk> {
+pub(crate) fn score(
+    pairs: &[crate::analysis::Pair],
+    changed: &crate::changed_lines::ChangedLines,
+) -> Option<Risk> {
     // Nothing to score is not a reason to load the model.
     if pairs.iter().all(|pair| pair.new.is_none()) {
         return None;
@@ -141,19 +142,21 @@ pub(crate) fn score(pairs: &[crate::analysis::Pair]) -> Option<Risk> {
     let analyzer = analyzer()?;
     // The worst new side first; only that file's base is then scored, rather
     // than running the model over every base for one number.
-    let (pair, removed, new) = pairs
+    let (index, pair, new) = pairs
         .iter()
-        .filter_map(|pair| {
-            let path = pair.new.as_deref()?;
-            let (removed, added) = pair
-                .old
-                .as_deref()
-                .and_then(|old| Hunks::read(old, path))
-                .map(|h| (h.removed, h.added))
-                .unzip();
-            Some((pair, removed, side(analyzer, path, added)?))
+        .enumerate()
+        .filter_map(|(index, pair)| {
+            let added = changed.of(index).filter_map(|lines| lines.new.as_deref());
+            Some((index, pair, side(analyzer, pair.new.as_deref()?, added)?))
         })
-        .reduce(|worst, next| if next.2.outranks(worst.2) { next } else { worst })?;
+        .reduce(|worst, next| {
+            if next.2.outranks(worst.2) {
+                next
+            } else {
+                worst
+            }
+        })?;
+    let removed = changed.of(index).filter_map(|lines| lines.old.as_deref());
     let old = pair
         .old
         .as_deref()
@@ -167,11 +170,17 @@ pub(crate) fn score(pairs: &[crate::analysis::Pair]) -> Option<Risk> {
     })
 }
 
-/// One side's reading: its whole file, or its `changed` lines when those read
-/// graver.
-fn side(analyzer: &scan::Analyzer, path: &Path, changed: Option<String>) -> Option<Reading> {
-    let name = crate::analysis::basename(path);
-    let read = |result: anyhow::Result<scan::ScanResult>, what: &str| match result {
+/// One side's reading: its whole file, or the gravest of its `changed` lines —
+/// the file's own, or each changed member's when the side is an archive — when
+/// those read graver.
+fn side<'p>(
+    analyzer: &scan::Analyzer,
+    path: &Path,
+    changed: impl Iterator<Item = &'p Path>,
+) -> Option<Reading> {
+    let read = |path: &Path, what: &str| match analyzer
+        .scan_file(path, &crate::analysis::basename(path))
+    {
         Ok(r) => {
             let reading = Reading {
                 class: r.classification,
@@ -192,20 +201,13 @@ fn side(analyzer: &scan::Analyzer, path: &Path, changed: Option<String>) -> Opti
             None
         }
     };
-    let whole = read(analyzer.scan_file(path, &name), "whole file");
-    let changed = changed
-        .filter(|c| !c.is_empty())
-        .and_then(|c| read(analyzer.scan_bytes(c.into_bytes(), &name), "changed lines"));
-    match (whole, changed) {
-        (Some(whole), Some(changed)) if changed.outranks(whole) => {
-            log::debug!(
-                "risk: {} changed lines outrank the whole file",
-                path.display()
-            );
-            Some(changed)
-        }
-        (whole, changed) => whole.or(changed),
-    }
+    let whole = read(path, "whole file");
+    changed
+        .filter_map(|lines| read(lines, "changed lines"))
+        .fold(whole, |worst, next| match worst {
+            Some(worst) if !next.outranks(worst) => Some(worst),
+            _ => Some(next),
+        })
 }
 
 /// One model verdict, reduced to what ranks it against another.
@@ -235,81 +237,9 @@ impl Reading {
     }
 }
 
-/// The lines a change removed from its old side and added to its new one.
-///
-/// A side's text is empty when it has nothing to add over the whole file: no
-/// line of it changed, or every line did.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Hunks {
-    removed: String,
-    added: String,
-}
-
-impl Hunks {
-    /// Bounds what a diff holds in memory: both sides and their hunks.
-    const MAX_BYTES: u64 = 32 << 20;
-    /// Myers diff is O(ND). Past this it settles for coarser hunks, which only
-    /// widens them toward the whole file already scored.
-    const TIMEOUT: Duration = Duration::from_secs(2);
-
-    /// The hunks between two text files, or `None` when they cannot be diffed
-    /// by line: unreadable, too large, or not UTF-8.
-    fn read(old: &Path, new: &Path) -> Option<Self> {
-        let text = |path: &Path| {
-            if std::fs::metadata(path).ok()?.len() > Self::MAX_BYTES {
-                return None;
-            }
-            String::from_utf8(std::fs::read(path).ok()?).ok()
-        };
-        Some(Self::between(&text(old)?, &text(new)?))
-    }
-
-    fn between(old: &str, new: &str) -> Self {
-        let diff = similar::TextDiff::configure()
-            .timeout(Self::TIMEOUT)
-            .diff_lines(old, new);
-        let mut hunks = Self::default();
-        for change in diff.iter_all_changes() {
-            match change.tag() {
-                ChangeTag::Delete => hunks.removed.push_str(change.value()),
-                ChangeTag::Insert => hunks.added.push_str(change.value()),
-                ChangeTag::Equal => {}
-            }
-        }
-        if hunks.removed.len() == old.len() {
-            hunks.removed.clear();
-        }
-        if hunks.added.len() == new.len() {
-            hunks.added.clear();
-        }
-        hunks
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hunks_are_the_changed_lines_alone() {
-        let old = "a\nb\nc\n";
-        let hunks = Hunks::between(old, "implant\na\nb\nc\n");
-        assert_eq!(hunks.added, "implant\n");
-        assert_eq!(hunks.removed, "");
-
-        let hunks = Hunks::between(old, "a\nB\nc\n");
-        assert_eq!(hunks.added, "B\n");
-        assert_eq!(hunks.removed, "b\n");
-    }
-
-    #[test]
-    fn a_hunk_that_is_the_whole_side_is_left_to_the_whole_file() {
-        assert_eq!(Hunks::between("a\nb\n", "a\nb\n"), Hunks::default());
-        // A single-line file that changed at all changed entirely.
-        assert_eq!(Hunks::between("old", "new"), Hunks::default());
-        let hunks = Hunks::between("a\nb\n", "x\ny\n");
-        assert_eq!((hunks.removed.as_str(), hunks.added.as_str()), ("", ""));
-    }
 
     #[test]
     fn readings_rank_by_class_then_level_then_probability() {

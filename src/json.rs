@@ -337,6 +337,16 @@ pub(crate) struct Verdict<'a> {
     /// catalog mapping them to prose, and a consumer that has one can join on
     /// these.
     pub frameworks: Frameworks<'a>,
+    /// Execution the change's own lines brought into a file, read by
+    /// taxonomy role rather than by any one rule.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub injections: &'a [crate::analysis::Injection],
+    /// An install-time hook the release brought in, read from the manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_hook: Option<&'a crate::analysis::InstallHook>,
+    /// Native binaries and top-level code a package release brought in.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub arrivals: &'a [crate::analysis::Arrival],
 }
 
 /// The behavior-quantity axis: weighed mass and blind id counts, each with
@@ -353,6 +363,8 @@ pub(crate) struct BehaviorMass {
 
 #[derive(Serialize)]
 pub(crate) struct Frameworks<'a> {
+    /// Whether the share of new techniques alone raised the gate.
+    pub severity: Severity,
     pub attack: Ids<'a>,
     pub mbc: Ids<'a>,
 }
@@ -365,6 +377,8 @@ pub(crate) struct Ids<'a> {
     pub removed: Vec<&'a str>,
     /// Present on both.
     pub unchanged: usize,
+    /// Share of the new side's ids that are new, in `[0, 1]`.
+    pub share: f32,
 }
 
 /// The CI exit decision, stated so a pipeline never re-derives it.
@@ -621,16 +635,22 @@ pub(crate) fn envelope(analysis: &Analysis<'_>) -> Result<String> {
                 severity: a.identity.severity(),
                 changes,
             },
+            injections: &analysis.injections,
+            install_hook: analysis.install_hook.as_ref(),
+            arrivals: &analysis.arrivals,
             frameworks: Frameworks {
+                severity: analysis.framework_drift,
                 attack: Ids {
                     new: analysis.survey.attack.gained(),
                     removed: analysis.survey.attack.lost(),
                     unchanged: analysis.survey.attack.kept(),
+                    share: analysis.survey.attack.new_share(),
                 },
                 mbc: Ids {
                     new: analysis.survey.mbc.gained(),
                     removed: analysis.survey.mbc.lost(),
                     unchanged: analysis.survey.mbc.kept(),
+                    share: analysis.survey.mbc.new_share(),
                 },
             },
             structure: Structure {

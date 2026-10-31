@@ -149,6 +149,41 @@ impl Assessment {
             .max(self.structure.severity())
     }
 
+    /// Fold in the assessment of a change's lines read on their own: their
+    /// capability classes and signature matches. Identity and structure
+    /// describe a file, not its lines, so they stay the whole file's.
+    pub(crate) fn absorb(&mut self, lines: Self) {
+        let categories = &mut self.behavioral.categories;
+        for c in lines.behavioral.categories {
+            let Some(into) = categories.iter_mut().find(|into| into.class == c.class) else {
+                categories.push(c);
+                continue;
+            };
+            into.severity = into.severity.max(c.severity);
+            into.namespaces.extend(c.namespaces);
+            into.new_ids.extend(c.new_ids);
+            into.escalated_ids.extend(c.escalated_ids);
+            for (id, note) in c.traits {
+                into.traits
+                    .entry(id)
+                    .and_modify(|kept| {
+                        kept.score = kept.score.max(note.score);
+                        kept.severity = kept.severity.max(note.severity);
+                    })
+                    .or_insert(note);
+            }
+        }
+        order_categories(categories);
+        self.behavioral
+            .new_categories
+            .extend(lines.behavioral.new_categories);
+        self.signature.ids.extend(lines.signature.ids);
+        order_signatures(&mut self.signature.ids);
+        if self.signature.cve.is_none() {
+            self.signature.cve = lines.signature.cve;
+        }
+    }
+
     fn new_behavioral_severity(&self) -> Severity {
         self.behavioral
             .categories
@@ -498,12 +533,18 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &HashSet<String>) -> Ass
         // deleting a whole member changes inventory, not its publisher claims.
         // In contrast, stripping identity from a file that remains Changed is
         // still drift and must keep its severity.
-        if let Some(idd) = file.identity.as_ref().filter(|i| i.changed).filter(|_| {
-            !matches!(
-                file.status,
-                cleave::types::FileStatus::Added | cleave::types::FileStatus::Removed
-            )
-        }) {
+        if let Some(idd) = file
+            .identity
+            .as_ref()
+            .filter(|i| i.changed)
+            .filter(|_| {
+                !matches!(
+                    file.status,
+                    cleave::types::FileStatus::Added | cleave::types::FileStatus::Removed
+                )
+            })
+            .filter(|i| !moved_to_container(diff, &file.path, i))
+        {
             identity_changes.extend(meaningful_identity_changes(
                 idd.old.as_ref(),
                 idd.new.as_ref(),
@@ -574,26 +615,8 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &HashSet<String>) -> Ass
     }
 
     let mut categories: Vec<Category> = groups.into_values().collect();
-    for c in &mut categories {
-        c.namespaces.sort();
-        c.namespaces.dedup();
-        c.new_ids.sort();
-        c.new_ids.dedup();
-        c.escalated_ids.sort();
-        c.escalated_ids.dedup();
-    }
-    // Worst severity first, then the most new traits, then stable by class.
-    categories.sort_by(|a, b| {
-        b.severity
-            .cmp(&a.severity)
-            .then(b.new_ids.len().cmp(&a.new_ids.len()))
-            .then(a.class.cmp(&b.class))
-    });
-
-    // One entry per rule with its worst criticality kept, then worst first.
-    sig_ids.sort_by(|a, b| a.id.cmp(&b.id).then(b.severity.cmp(&a.severity)));
-    sig_ids.dedup_by(|a, b| a.id == b.id);
-    sig_ids.sort_by(|a, b| b.severity.cmp(&a.severity).then(a.id.cmp(&b.id)));
+    order_categories(&mut categories);
+    order_signatures(&mut sig_ids);
 
     // A class is new when the base version carried no trait of it.
     let new_categories: HashSet<String> = categories
@@ -613,6 +636,32 @@ pub(crate) fn assess(diff: &DiffReportV1, base_classes: &HashSet<String>) -> Ass
         },
         structure: structural_facts(diff),
     }
+}
+
+/// Dedup each category's lists, then rank: worst severity first, then the most
+/// new traits, then stable by class.
+fn order_categories(categories: &mut [Category]) {
+    for c in categories.iter_mut() {
+        c.namespaces.sort();
+        c.namespaces.dedup();
+        c.new_ids.sort();
+        c.new_ids.dedup();
+        c.escalated_ids.sort();
+        c.escalated_ids.dedup();
+    }
+    categories.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then(b.new_ids.len().cmp(&a.new_ids.len()))
+            .then(a.class.cmp(&b.class))
+    });
+}
+
+/// One entry per rule with its worst criticality kept, then worst first.
+fn order_signatures(sig_ids: &mut Vec<SigMatch>) {
+    sig_ids.sort_by(|a, b| a.id.cmp(&b.id).then(b.severity.cmp(&a.severity)));
+    sig_ids.dedup_by(|a, b| a.id == b.id);
+    sig_ids.sort_by(|a, b| b.severity.cmp(&a.severity).then(a.id.cmp(&b.id)));
 }
 
 /// Structural anomalies from the changed files' kv scope. Every fact is an
@@ -856,6 +905,35 @@ fn push_val(out: &mut Vec<String>, v: &serde_json::Value) {
     } else if v.is_number() {
         out.push(v.to_string());
     }
+}
+
+/// Whether a member's identity left it only to be reported on its container:
+/// the member's manifest stopped carrying an identity while the archive it
+/// belongs to newly carries that same identity, version aside. Cleave reports
+/// a package's identity on whichever of the two its archive layout leads it
+/// to, so this is a change of where the claim is read, not of the claim. Any
+/// other difference — an author, a signer, a name — is still drift.
+fn moved_to_container(
+    diff: &DiffReportV1,
+    path: &str,
+    identity: &cleave::types::IdentityDiff,
+) -> bool {
+    let (Some(old), None) = (identity.old.as_ref(), identity.new.as_ref()) else {
+        return false;
+    };
+    let Some((root, _)) = crate::member::MemberPath::new(path).split() else {
+        return false;
+    };
+    let unversioned = |i: &filefacts::Identity| {
+        let mut i = i.clone();
+        i.version = None;
+        i
+    };
+    diff.files
+        .iter()
+        .filter(|f| f.path == root)
+        .filter_map(|f| f.identity.as_ref()?.new.as_ref())
+        .any(|container| unversioned(container) == unversioned(old))
 }
 
 /// Traits newly present (`true`) or escalated from a lower criticality

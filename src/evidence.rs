@@ -154,7 +154,10 @@ struct Attribution {
 /// Analyze one file. A file that cannot be analyzed costs its own evidence and
 /// nothing else: the verdict already stands on the diff, so this logs and moves
 /// on rather than failing the run.
-fn analyze(path: &Path, options: &cleave::AnalysisOptions) -> Option<cleave::AnalysisReport> {
+pub(crate) fn analyze(
+    path: &Path,
+    options: &cleave::AnalysisOptions,
+) -> Option<cleave::AnalysisReport> {
     match cleave::analyze_file(path, options) {
         Ok(r) => Some(r),
         Err(e) => {
@@ -172,8 +175,8 @@ fn analyze(path: &Path, options: &cleave::AnalysisOptions) -> Option<cleave::Ana
 /// a terminal, ten for the LLM, twenty-four in SARIF, every hunk in the JSON
 /// record); [`strongest`] applies a cap and returns to file order. Re-analyzing per sink is the expensive part, so this
 /// runs once per report — see [`crate::analysis::Analysis::hunks`].
-pub(crate) fn hunks(
-    pairs: &[Pair],
+pub(crate) fn hunks<'p>(
+    pairs: impl IntoIterator<Item = &'p Pair>,
     options: &cleave::AnalysisOptions,
     gained_ids: &HashSet<&str>,
     diff: &DiffReportV1,
@@ -1210,13 +1213,26 @@ impl Sides {
     pub(crate) fn changed(&self) -> bool {
         self.old != self.new
     }
+
+    /// Share of the new side's ids the change introduced, in `[0, 1]`.
+    pub(crate) fn new_share(&self) -> f32 {
+        let gained = self.new.difference(&self.old).count();
+        if self.new.is_empty() {
+            0.0
+        } else {
+            gained as f32 / self.new.len() as f32
+        }
+    }
 }
 
 /// Walk both sides, collecting capability classes and framework annotations.
 /// A file that fails to analyze contributes nothing rather than failing the
 /// run; on the base side that makes its capabilities read as new, which is the
 /// safe direction to be wrong in.
-pub(crate) fn survey(pairs: &[Pair], options: &cleave::AnalysisOptions) -> Survey {
+pub(crate) fn survey<'p>(
+    pairs: impl IntoIterator<Item = &'p Pair>,
+    options: &cleave::AnalysisOptions,
+) -> Survey {
     use cleave::Criticality;
     let mut survey = Survey::default();
     for pair in pairs {

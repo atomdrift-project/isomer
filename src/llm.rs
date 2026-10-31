@@ -150,7 +150,7 @@ pub(crate) fn config(opts: &Options) -> Result<Option<InterpretConfig>> {
         base_url: primary.base_url,
         model: primary.model,
         api_key: primary.api_key,
-        timeout: Duration::from_secs(opts.llm_timeout.unwrap_or(DEFAULT_TIMEOUT_SECS)),
+        timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         fallbacks: endpoints.collect(),
         ..InterpretConfig::default()
     }))
@@ -166,7 +166,7 @@ fn endpoint(
 
     let openrouter = is_openrouter_endpoint(&base_url);
     if openrouter && api_key.is_none() {
-        bail!("{base_url}: OpenRouter requires a key: --llm-key (env: ISOMER_LLM_KEY)");
+        bail!("{base_url}: OpenRouter requires a key: set ISOMER_LLM_KEY");
     }
     let model = match pinned {
         Some(model) => model,

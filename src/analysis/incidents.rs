@@ -410,16 +410,21 @@ fn xrpl_js_2_14_2_key_exfiltration_patch_is_high_but_a_major_upgrade_is_not() {
         "<root>!!package/dist/wallet.js",
         "javascript",
         &[
+            // The 2.14.2 build's own traits under today's taxonomy.
             (
-                "micro-behaviors/crypto/library/blockchain/wallet::renamed-wallet-api",
+                "micro-behaviors/crypto/key/representation::crypto-private-key-reference",
                 Criticality::Notable,
             ),
             (
-                "micro-behaviors/data/encode/base64::encode",
+                "micro-behaviors/data/encode/base64::btoa-symbol",
                 Criticality::Notable,
             ),
             (
-                "micro-behaviors/communications/http/url/domain::js-remote-host-url",
+                "micro-behaviors/communications/http/header/custom::fetch-header-seed-variable",
+                Criticality::Notable,
+            ),
+            (
+                "micro-behaviors/communications/url/host/http::fetch-absolute-url-target",
                 Criticality::Notable,
             ),
         ],

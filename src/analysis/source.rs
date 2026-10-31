@@ -138,6 +138,42 @@ pub(super) fn archive_member_pair<'a>(
     Some((side(FileStatus::Added)?, side(FileStatus::Removed)?))
 }
 
+/// A changed source member of an archive, with both sides extracted.
+pub(super) struct ChangedMember<'d> {
+    pub(super) entry: &'d FileDiffEntry,
+    pub(super) old: Vec<u8>,
+    pub(super) new: Vec<u8>,
+}
+
+/// Every source member `container`'s two archives both carry and the diff
+/// reports changed, read back out of the archives. `judged` is the normalized
+/// diff whose entries name the members; `raw` is the diff they came from, which
+/// holds the literal paths extraction needs.
+pub(super) fn changed_source_members<'d>(
+    container: &Pair,
+    raw: &'d DiffReportV1,
+    judged: &'d DiffReportV1,
+) -> impl Iterator<Item = ChangedMember<'d>> {
+    let archives = container.old.as_deref().zip(container.new.as_deref());
+    let roots = super::archive_roots::Roots::from_diff(raw);
+    judged
+        .files
+        .iter()
+        .filter(|entry| {
+            matches!(entry.status, FileStatus::Changed)
+                && member_type(entry).is_some_and(|file_type| file_type.is_source_code())
+        })
+        .filter_map(move |entry| {
+            let (old_archive, new_archive) = archives?;
+            let (old_member, new_member) = archive_member_pair(raw, &roots, entry)?;
+            Some(ChangedMember {
+                entry,
+                old: archive_member_bytes(old_archive, old_member)?,
+                new: archive_member_bytes(new_archive, new_member)?,
+            })
+        })
+}
+
 /// The bytes of one archive member, or `None` when it cannot be read — an
 /// absence is ordinary, a failure is worth a word on stderr.
 pub(super) fn archive_member_bytes(archive: &Path, canonical_member: &str) -> Option<Vec<u8>> {
@@ -259,37 +295,14 @@ impl Analysis<'_> {
     /// every changed source member of the container, each side extracted so the
     /// member gets the same whole line diff a plain file would.
     pub(super) fn collect_archive_source_changes(&self, container: &Pair) -> Vec<SourceChange> {
-        let (Some(old_archive), Some(new_archive)) =
-            (container.old.as_deref(), container.new.as_deref())
-        else {
-            return Vec::new();
-        };
-        let roots = super::archive_roots::Roots::from_diff(self.diff);
-        let mut out = Vec::new();
-        for entry in &self.judged_diff.files {
-            if !matches!(entry.status, FileStatus::Changed)
-                || !traits_moved(entry)
-                || !member_type(entry).is_some_and(|file_type| file_type.is_source_code())
-            {
-                continue;
-            }
-            let Some((old_member, new_member)) = archive_member_pair(self.diff, &roots, entry)
-            else {
-                continue;
-            };
-            let (Some(old_bytes), Some(new_bytes)) = (
-                archive_member_bytes(old_archive, old_member),
-                archive_member_bytes(new_archive, new_member),
-            ) else {
-                continue;
-            };
-            out.push(SourceChange {
-                label: shown_member_path(&entry.path),
-                atoms: trait_atoms(entry),
-                diff: line_diff(&old_bytes, &new_bytes),
-            });
-        }
-        out
+        changed_source_members(container, self.diff, &self.judged_diff)
+            .filter(|member| traits_moved(member.entry))
+            .map(|member| SourceChange {
+                label: shown_member_path(&member.entry.path),
+                atoms: trait_atoms(member.entry),
+                diff: line_diff(&member.old, &member.new),
+            })
+            .collect()
     }
 
     /// The gained sub-Notable atoms across every changed source file — the

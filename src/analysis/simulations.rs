@@ -16,7 +16,7 @@ use super::normalize::normalized_archive_diff;
 use super::remediation::{Remediation, remediation_cleanup_context};
 use super::verdict::{
     Proportionality, Verdicts, capability_mass_escalation, deterministic_verdicts,
-    significant_risk_escalation,
+    framework_escalation, significant_risk_escalation,
 };
 use crate::Severity;
 use crate::risk::Risk;
@@ -90,7 +90,7 @@ fn shape(diff: &DiffReportV1, kind: BumpKind) -> Severity {
 #[test]
 fn encoded_execution_cluster_uses_namespaces_and_requires_all_four_legs() {
     let ids = [
-        "metadata/file/encoded::large-literal",
+        "metadata/file/encoding::large-literal",
         "objectives/anti-static/obfuscation/string::concealed-strings",
         "micro-behaviors/process/create/child::launch",
         "micro-behaviors/fs/write/file::write",
@@ -142,7 +142,7 @@ fn encoded_execution_cluster_uses_namespaces_and_requires_all_four_legs() {
     assert!(!super::detectors::gained_encoded_execution_cluster(&noise));
     let mut lookalike = complete;
     lookalike.files[0].scopes.traits.as_mut().unwrap().added[0].id =
-        "metadata/file/encoded-unrelated::label".to_owned();
+        "metadata/file/encoding-unrelated::label".to_owned();
     assert!(!super::detectors::gained_encoded_execution_cluster(
         &lookalike
     ));
@@ -338,9 +338,10 @@ fn structural_audit_hook_requires_exact_positive_metric() {
 #[test]
 fn secret_egress_requires_file_local_secret_evidence_and_routine_release() {
     let ids = [
-        "micro-behaviors/crypto/library/blockchain/wallet::renamed-wallet-api",
-        "micro-behaviors/data/encode/base64::encode",
-        "micro-behaviors/communications/http/url/domain::js-remote-host-url",
+        "micro-behaviors/crypto/key/representation::crypto-private-key-reference",
+        "micro-behaviors/data/encode/base64::btoa-symbol",
+        "micro-behaviors/communications/http/header/custom::fetch-header-seed-variable",
+        "micro-behaviors/communications/url/host/http::fetch-absolute-url-target",
     ];
     let together = report(vec![source("wallet.js", &ids)]);
     assert_eq!(shape(&together, BumpKind::Patch), Severity::High);
@@ -348,10 +349,10 @@ fn secret_egress_requires_file_local_secret_evidence_and_routine_release() {
 
     for (baseline, expected) in [
         (
-            vec!["crypto/library", "data/encode", "communications/http"],
+            vec!["crypto/key", "data/encode", "communications/http"],
             Severity::None,
         ),
-        (vec!["crypto/library", "data/encode"], Severity::High),
+        (vec!["crypto/key", "data/encode"], Severity::High),
     ] {
         let base_classes = baseline.into_iter().map(str::to_owned).collect();
         let assessment = assess(&together, &base_classes);
@@ -389,7 +390,7 @@ fn secret_egress_requires_file_local_secret_evidence_and_routine_release() {
     let ordinary_client = report(vec![source(
         "client.js",
         &[
-            "micro-behaviors/crypto/library/blockchain/transaction::viem-wallet-client",
+            "micro-behaviors/data/transaction/construct::viem-wallet-client",
             "micro-behaviors/communications/http/url/rpc::bsc-dataseed-provider",
             ids[1],
             ids[2],
@@ -441,7 +442,7 @@ fn download_execution_chain_requires_platform_branch_not_system_information() {
             "tool.js",
             &[
                 "micro-behaviors/communications/http/download/write::script-fetches-and-writes-remote-content",
-                "micro-behaviors/fs/file/write/async::node-write-file-promise",
+                "micro-behaviors/fs/write/file::node-write-file-promise",
                 "micro-behaviors/process/create/spawn::child-process-creation-api",
                 &platform,
             ],
@@ -575,6 +576,54 @@ fn deleted_member_is_not_identity_drift_but_stripping_surviving_member_is() {
             assess(&report(vec![file]), &HashSet::new()).new_severity(),
             expected,
             "identity source: {claim_source}, status: {status:?}"
+        );
+    }
+}
+
+/// ensdomains-buffer 0.1.0 → 0.1.3: repacked with directory entries, the
+/// tarball's `package.json` identity is reported on the archive instead of the
+/// member. The claim moved; nothing was stripped. Stripping a party on the way
+/// still reads as drift.
+#[test]
+fn an_identity_moved_to_its_archive_is_not_stripped() {
+    let package = |version: &str, author: Option<&str>| {
+        let mut identity = filefacts::Identity::default();
+        identity.name = Some(filefacts::Claim::claimed("@ensdomains/buffer", "npm.name"));
+        identity.identifier = Some(filefacts::Claim::claimed("@ensdomains/buffer", "npm.name"));
+        identity.version = Some(filefacts::Claim::claimed(version, "npm.version"));
+        if let Some(author) = author {
+            identity.authors.push(
+                serde_json::from_value(serde_json::json!(
+                    {"name": author, "role": "author", "source": "npm.author"}
+                ))
+                .unwrap(),
+            );
+        }
+        identity
+    };
+    for (container_author, expected) in [(Some("ens"), Severity::None), (None, Severity::High)] {
+        let mut root = source("", &[]);
+        root.path = "<root>".to_owned();
+        root.file_type = Some("tar.gz".to_owned());
+        root.status = FileStatus::Changed;
+        root.identity = Some(cleave::types::IdentityDiff {
+            old: Some(package("0.1.0", Some("ens"))),
+            new: Some(package("0.1.3", container_author)),
+            changed: true,
+        });
+        let mut member = source("package.json", &[]);
+        member.status = FileStatus::Changed;
+        member.identity = Some(cleave::types::IdentityDiff {
+            old: Some(package("0.1.0", Some("ens"))),
+            new: None,
+            changed: true,
+        });
+        assert_eq!(
+            assess(&report(vec![root, member]), &HashSet::new())
+                .identity
+                .severity(),
+            expected,
+            "container author: {container_author:?}"
         );
     }
 }
@@ -859,7 +908,7 @@ fn external_html_diff() -> DiffReportV1 {
             &[
                 "micro-behaviors/communications/http/request/json::fetch-external-url",
                 "micro-behaviors/communications/http/request/client::fetch-then-json",
-                "micro-behaviors/ui/window/manage/html-insert::arbitrary-insert",
+                "micro-behaviors/ui/window/insert-html::arbitrary-insert",
                 "micro-behaviors/communications/http/request/plugin-install::arbitrary-endpoint",
             ],
         ),
@@ -1342,8 +1391,27 @@ fn remediation_preserves_independent_danger_signals() {
 
 #[test]
 fn decoded_offset_churn_does_not_introduce_existing_behavior() {
+    // cleave's `source##encoding@offset` views, and the older form that
+    // nested each view as a member of its source.
+    for (before, after, sideways) in [
+        (
+            "app.js##unicode-escape@100",
+            "app.js##unicode-escape@120",
+            "<root>!!package/other.js##unicode-escape@100",
+        ),
+        (
+            "app.js!!package/app.js##unicode-escape@100",
+            "app.js!!package/app.js##unicode-escape@120",
+            "<root>!!package/other.js!!package/other.js##unicode-escape@100",
+        ),
+    ] {
+        decoded_offset_churn(before, after, sideways);
+    }
+}
+
+fn decoded_offset_churn(before: &str, after: &str, sideways: &str) {
     let id = "micro-behaviors/os/console/io::silenced";
-    let mut old = source("app.js!!package/app.js##unicode-escape@100", &[]);
+    let mut old = source(before, &[]);
     old.status = FileStatus::Removed;
     old.scopes
         .traits
@@ -1351,7 +1419,7 @@ fn decoded_offset_churn_does_not_introduce_existing_behavior() {
         .unwrap()
         .removed
         .push(finding(id, Criticality::Suspicious));
-    let mut new = source("app.js!!package/app.js##unicode-escape@120", &[]);
+    let mut new = source(after, &[]);
     new.scopes
         .traits
         .as_mut()
@@ -1393,7 +1461,7 @@ fn decoded_offset_churn_does_not_introduce_existing_behavior() {
 
     // The same capability in a different source file is still new there.
     let mut other = raw.files[1].clone();
-    other.path = "<root>!!package/other.js!!package/other.js##unicode-escape@100".to_owned();
+    other.path = sideways.to_owned();
     let mut independent = raw.clone();
     independent.files.push(other);
     assert_eq!(
@@ -1470,6 +1538,95 @@ fn preexisting_escalated_behavior_is_not_new_release_pressure() {
 /// release in which most of what the package can do is new is an implant
 /// shape, even when every gained trait is merely notable and no rule names
 /// the attack. The bars scale with what the version bump promised.
+/// Framework sides with `kept` techniques on both and `gained` only on the new.
+fn techniques(kept: usize, gained: usize) -> crate::evidence::Sides {
+    let mut sides = crate::evidence::Sides::default();
+    for i in 0..kept {
+        sides.old.insert(format!("T1{i:03}"));
+        sides.new.insert(format!("T1{i:03}"));
+    }
+    for i in 0..gained {
+        sides.new.insert(format!("T2{i:03}"));
+    }
+    sides
+}
+
+#[test]
+fn a_release_that_brings_its_techniques_is_judged_against_the_release_promise() {
+    let none = crate::evidence::Sides::default();
+    let patch = Some(Bump::new(BumpKind::Patch, 1));
+    let major = Some(Bump::new(BumpKind::Major, 1));
+    // The Claude Code loader: fourteen techniques arrive beside fourteen.
+    let implant = techniques(14, 14);
+    assert_eq!(
+        framework_escalation(&implant, &none, None, true),
+        Severity::High
+    );
+    assert_eq!(
+        framework_escalation(&implant, &none, patch, true),
+        Severity::High
+    );
+    // With its five MBC behaviors beside eight, both catalogs agree that most
+    // of the program is new.
+    let behaviors = techniques(8, 5);
+    assert_eq!(
+        framework_escalation(&implant, &behaviors, patch, true),
+        Severity::Critical
+    );
+    // Both bars cleared by a minority of new techniques is a large feature.
+    assert_eq!(
+        framework_escalation(&techniques(14, 7), &behaviors, patch, true),
+        Severity::High
+    );
+    // Half new is ordinary for a major release, which may change anything.
+    assert_eq!(
+        framework_escalation(&techniques(14, 7), &none, major, true),
+        Severity::None
+    );
+    // MBC alone is enough.
+    assert_eq!(
+        framework_escalation(&none, &techniques(8, 5), patch, true),
+        Severity::High
+    );
+    // Two new MBC behaviors out of three is an ordinary plugin update.
+    assert_eq!(
+        framework_escalation(&none, &techniques(1, 2), patch, true),
+        Severity::None
+    );
+    // One or two new techniques are an ordinary feature, whatever the share.
+    assert_eq!(
+        framework_escalation(&techniques(1, 2), &none, patch, true),
+        Severity::None
+    );
+    // A large artifact gaining a few techniques is a small share of it.
+    assert_eq!(
+        framework_escalation(&techniques(40, 4), &none, patch, true),
+        Severity::None
+    );
+    // A directory comparison surveys touched files, not the release.
+    assert_eq!(
+        framework_escalation(&implant, &none, patch, false),
+        Severity::None
+    );
+}
+
+#[test]
+fn trading_techniques_is_not_introducing_them() {
+    let mut exchange = techniques(4, 6);
+    for i in 0..4 {
+        exchange.old.insert(format!("T3{i:03}"));
+    }
+    assert_eq!(
+        framework_escalation(
+            &exchange,
+            &crate::evidence::Sides::default(),
+            Some(Bump::new(BumpKind::Patch, 1)),
+            true
+        ),
+        Severity::None
+    );
+}
+
 #[test]
 fn injected_behavior_mass_is_judged_against_the_release_promise() {
     use crate::behavior_shift::Profiles;

@@ -20,6 +20,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) mod analysis;
 pub(crate) mod behavior_shift;
 pub(crate) mod binary;
+pub(crate) mod changed_lines;
 pub mod ci;
 pub(crate) mod deps;
 pub(crate) mod evidence;

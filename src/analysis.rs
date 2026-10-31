@@ -24,11 +24,17 @@ use crate::rubric::Assessment;
 use crate::{Format, Gate, Severity};
 
 mod archive_roots;
+mod arrivals;
 mod capability;
 mod decoded;
 mod detectors;
 mod hierarchy;
 mod identity;
+mod injection;
+mod install_hook;
+pub(crate) use arrivals::Arrival;
+pub(crate) use injection::Injection;
+pub(crate) use install_hook::InstallHook;
 mod llm_context;
 mod naming;
 mod normalize;
@@ -51,8 +57,8 @@ use summary::SummaryLine;
 pub(crate) use summary::{Fact, MetricMove, metric_move};
 pub(crate) use verdict::{MALWARE_BAND, SUSPICIOUS_BAND};
 use verdict::{
-    Proportionality, Verdicts, capability_mass_escalation, deterministic_verdicts, risk_band,
-    significant_risk_escalation,
+    Proportionality, Verdicts, capability_mass_escalation, deterministic_verdicts,
+    framework_escalation, risk_band, significant_risk_escalation,
 };
 
 /// The surface a comparison came in through, as the report names it.
@@ -138,6 +144,41 @@ pub(crate) fn diff(
     // row cap here would silently remove inputs from the rubric and feature
     // record before either consumer sees them.
     cleave::diff::diff_paths(old, new, options, cleave::diff::ScopeMask::all(), 0)
+}
+
+/// What a pair's added lines gained over the lines they replaced, judged by the
+/// same rubric as the whole file. A trait the old file already carried is not
+/// a gain however it reads here: only what the old side never exhibited counts,
+/// so a small edit beside existing behavior is not read as that behavior.
+fn changed_lines_assessment(
+    base: &Path,
+    lines: &Path,
+    options: &cleave::AnalysisOptions,
+    survey: &crate::evidence::Survey,
+) -> Option<Assessment> {
+    let mut report = match diff(base, lines, options) {
+        Ok(report) => report.diff?,
+        Err(e) => {
+            log::warn!("changed lines of {} not analyzed: {e:#}", lines.display());
+            return None;
+        }
+    };
+    for file in &mut report.files {
+        if let Some(traits) = file.scopes.traits.as_mut() {
+            traits
+                .added
+                .retain(|t| !survey.trait_profiles.old.contains(&t.id));
+            traits.changed.clear();
+        }
+    }
+    let assessment = crate::rubric::assess(&normalized_archive_diff(&report), &survey.base_classes);
+    log::debug!(
+        "changed lines of {}: {} capability classes, {} signatures",
+        lines.display(),
+        assessment.behavioral.categories.len(),
+        assessment.signature.ids.len(),
+    );
+    Some(assessment)
 }
 
 /// How much of a change a run actually looked at.
@@ -226,6 +267,9 @@ pub(crate) struct Analysis<'a> {
     pub judged_diff: Cow<'a, DiffReportV1>,
     /// The changed files, each with both sides — what deep analysis runs over.
     pub pairs: Vec<Pair>,
+    /// The pairs' changed lines, read apart from their files; owns the
+    /// scratch files evidence re-reads.
+    changed: crate::changed_lines::ChangedLines,
     /// What each side exhibits: base capability classes, and the ATT&CK / MBC
     /// ids present before and after.
     pub survey: crate::evidence::Survey,
@@ -245,6 +289,19 @@ pub(crate) struct Analysis<'a> {
     /// What the quantity of introduced behavior earned on its own, before the
     /// remediation suppression the verdict applies. Reported as-measured.
     pub behavior_mass: Severity,
+    /// What the share of new ATT&CK and MBC techniques earned on its own,
+    /// before the remediation suppression the verdict applies.
+    pub framework_drift: Severity,
+    /// Execution the change's own lines brought into a file, one entry per
+    /// reading that found it, gravest first — before the remediation
+    /// suppression the verdict applies.
+    pub injections: Vec<injection::Injection>,
+    /// An install-time hook the release added or re-pointed, before the
+    /// remediation suppression the verdict applies.
+    pub install_hook: Option<install_hook::InstallHook>,
+    /// Native binaries and top-level code the release brought in, gravest
+    /// first, before the remediation suppression the verdict applies.
+    pub arrivals: Vec<arrivals::Arrival>,
     /// A source-release build that gained an anomalous shape. Shared by the
     /// deterministic gate, terminal view, and LLM context.
     pub source_build: Option<SourceBuild>,
@@ -313,6 +370,15 @@ impl<'a> Analysis<'a> {
 
         let pairs = Pair::from_roots(old, new, diff);
         let judged_diff = normalized_archive_diff(diff);
+        let mut changed = crate::changed_lines::ChangedLines::extract(&pairs);
+        // An archive comparison is one pair whose changed files are members,
+        // so their lines come back out of the archives first.
+        if let [container] = pairs.as_slice() {
+            for member in source::changed_source_members(container, diff, &judged_diff) {
+                let label = shown_member_path(&member.entry.path);
+                changed.add(0, &label, &member.old, &member.new);
+            }
+        }
         let source_archive = is_source_archive(old) && is_source_archive(new);
         // A refreshed payload under a stable loader is the more specific
         // reading, so it is the one named when both shapes are present.
@@ -329,9 +395,16 @@ impl<'a> Analysis<'a> {
         // One walk over both sides: the base's capability classes (so a wholly
         // new class is distinguishable from one that merely gained a trait)
         // and the ATT&CK / MBC annotations each side carries.
-        let survey = crate::evidence::survey(&pairs, options);
+        // The changed lines join the walk, so what they exhibit apart from
+        // their file counts as the file's.
+        let survey = crate::evidence::survey(pairs.iter().chain(changed.pairs()), options);
         let shift = survey.trait_profiles.shift();
         let mut assessment = crate::rubric::assess(&judged_diff, &survey.base_classes);
+        for (base, lines) in changed.diffs() {
+            if let Some(lines) = changed_lines_assessment(base, lines, options, &survey) {
+                assessment.absorb(lines);
+            }
+        }
         crate::binary::enrich(&pairs, &judged_diff, &mut assessment);
         let naming = Naming::resolve(old, new, opts, &judged_diff)?;
 
@@ -359,7 +432,7 @@ impl<'a> Analysis<'a> {
         // Require a material move and a high
         // absolute score before risk can stand alone; the hand-coded rubric
         // remains authoritative for known or shape-only behavior.
-        let risk = crate::risk::score(&pairs);
+        let risk = crate::risk::score(&pairs, &changed);
         let risk_jump = risk.map_or(Severity::None, significant_risk_escalation);
         let remediation =
             remediation_cleanup_context(old, new, &assessment, &judged_diff, diff, risk);
@@ -384,10 +457,66 @@ impl<'a> Analysis<'a> {
             naming.bump,
             old.is_file() && new.is_file(),
         );
+        // The techniques the release introduced, counted by framework rather
+        // than graded by trait, so a suppressed or misgraded rule still counts.
+        // A package that replaced all of its code is not measured against a
+        // predecessor: every technique in it reads as introduced.
+        let replaced = arrivals::replaced_all_code(&judged_diff);
+        if replaced {
+            log::debug!("frameworks: all prior code replaced; new-technique share not read");
+        }
+        let framework_drift = framework_escalation(
+            &survey.attack,
+            &survey.mbc,
+            naming.bump,
+            old.is_file() && new.is_file() && !replaced,
+        );
+        // Execution the change's own lines brought, read by taxonomy role so
+        // it holds when the composite written for the shape does not fire.
+        // Only what the artifact does counts as a new capability here; a
+        // license line or a structural fact is not behavior.
+        let new_behaviors: HashSet<String> = assessment
+            .behavioral
+            .categories
+            .iter()
+            .filter(|c| assessment.behavioral.is_new_category(c))
+            .filter(|c| {
+                c.new_ids.iter().chain(&c.escalated_ids).any(|id| {
+                    matches!(
+                        crate::taxonomy::TraitId::new(id).root(),
+                        crate::taxonomy::Root::MicroBehaviors | crate::taxonomy::Root::Objectives
+                    )
+                })
+            })
+            .map(|c| c.class.clone())
+            .collect();
+        let injections = injection::found(
+            changed.pairs(),
+            options,
+            &injection::Context {
+                old: &survey.trait_profiles.old,
+                new_classes: &new_behaviors,
+                bump: naming.bump,
+            },
+        );
+        let injected = injections.first().map_or(Severity::None, |i| i.severity);
+        // An install-time hook the release brings in, read from the manifest's
+        // own facts rather than any trait about the script it runs.
+        let install_hook = install_hook::found(&judged_diff, naming.bump);
+        let hooked = install_hook.as_ref().map_or(Severity::None, |h| h.severity);
+        // Native binaries and top-level code a package release brings in,
+        // read from the member list rather than any trait about the files.
+        let arrivals = arrivals::found(&judged_diff, naming.bump);
+        let arrived = arrivals.first().map_or(Severity::None, |a| a.severity);
         let shape_new = if is_remediation {
             Severity::None
         } else {
-            shape_escalation.max(mass_escalation)
+            shape_escalation
+                .max(mass_escalation)
+                .max(framework_drift)
+                .max(injected)
+                .max(hooked)
+                .max(arrived)
         };
         // The human-facing deterministic verdict must include the same
         // escalation signals as the gate. Otherwise a shape-only attack fails
@@ -412,6 +541,7 @@ impl<'a> Analysis<'a> {
             diff,
             judged_diff,
             pairs,
+            changed,
             survey,
             assessment,
             naming,
@@ -420,6 +550,10 @@ impl<'a> Analysis<'a> {
             signals,
             shift,
             behavior_mass: mass_escalation,
+            framework_drift,
+            injections,
+            install_hook,
+            arrivals,
             source_build,
             remediation,
             verdict,
@@ -679,7 +813,7 @@ impl<'a> Analysis<'a> {
     pub(crate) fn hunks(&self, limit: usize) -> Vec<&Hunk> {
         let all = self.hunks.get_or_init(|| {
             crate::evidence::hunks(
-                &self.pairs,
+                self.pairs.iter().chain(self.changed.pairs()),
                 self.options,
                 &self.assessment.gained_ids(),
                 self.diff,
@@ -767,10 +901,34 @@ impl<'a> Analysis<'a> {
         if signals.opaque_runtime_payload.is_some() {
             return "runtime entrypoint gained an opaque encoded payload".to_string();
         }
+        if let Some(i) = self
+            .injections
+            .first()
+            .filter(|i| self.remediation.is_none() && i.severity >= Severity::High)
+        {
+            return i.describe();
+        }
+        if let Some(h) = self
+            .install_hook
+            .as_ref()
+            .filter(|h| self.remediation.is_none() && h.severity >= Severity::High)
+        {
+            return h.describe();
+        }
+        if let Some(a) = self
+            .arrivals
+            .first()
+            .filter(|a| self.remediation.is_none() && a.severity >= Severity::High)
+        {
+            return a.describe();
+        }
         if let Some(note) = self.prop.drift.escalation_note() {
             return note.to_string();
         }
         if let Some(note) = self.mass_note() {
+            return note;
+        }
+        if let Some(note) = self.framework_note() {
             return note;
         }
         if let Some(skew) = &self.prop.skew {
@@ -811,6 +969,27 @@ impl<'a> Analysis<'a> {
             return format!("{}: {}", f.label, f.sentence());
         }
         "no behavioral change".to_string()
+    }
+
+    /// The technique-share read, when it is the reason the gate rose: how many
+    /// of the ATT&CK techniques and MBC behaviors the artifact now shows
+    /// arrived with this release.
+    pub(crate) fn framework_note(&self) -> Option<String> {
+        if self.remediation.is_some() || self.framework_drift < Severity::High {
+            return None;
+        }
+        let release = self
+            .naming
+            .bump
+            .map_or_else(|| "this change".to_string(), crate::version::Bump::describe);
+        let (attack, mbc) = (&self.survey.attack, &self.survey.mbc);
+        Some(format!(
+            "{release} introduced {} of {} ATT&CK techniques and {} of {} MBC behaviors",
+            attack.gained().len(),
+            attack.new.len(),
+            mbc.gained().len(),
+            mbc.new.len(),
+        ))
     }
 
     /// The behavior-quantity read, when it is the reason the gate rose: how

@@ -85,11 +85,9 @@ pub struct Options {
     /// autodetected if omitted.
     pub llm_model: Option<String>,
 
-    /// Bearer token for `llm`; omit for local endpoints.
+    /// Bearer token for `llm`; omit for local endpoints. The command line
+    /// fills this from `ISOMER_LLM_KEY`, never from a flag.
     pub llm_key: Option<Secret>,
-
-    /// Per-request LLM timeout in seconds.
-    pub llm_timeout: Option<u64>,
 
     /// Override the detected base version (e.g. `1.2.3`), for proportionality
     /// when the input path carries no version token.
@@ -117,7 +115,6 @@ impl Default for Options {
             llm: None,
             llm_model: None,
             llm_key: None,
-            llm_timeout: None,
             base_version: None,
             head_version: None,
         }

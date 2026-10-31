@@ -168,6 +168,82 @@ pub fn violations(source: &str) -> Result<Vec<Violation>> {
     Ok(errors)
 }
 
+/// Taxonomy roots a hierarchy literal can name.
+const ROOTS: &[&str] = &["micro-behaviors", "objectives", "metadata", "well-known"];
+
+/// Hierarchies and capability classes production code depends on that the
+/// traits tree at `traits` does not have.
+///
+/// A scorer keyed on a hierarchy goes silent when a reorganization moves the
+/// traits under it: every test still passes, because tests build findings
+/// under the old names. Two kinds of dependency are read:
+///
+/// * a namespace literal under a taxonomy root, with no `::`;
+/// * a root-stripped capability class: a literal inside a `mod class`, or the
+///   argument of a `has_class` call.
+pub fn missing_hierarchies(source: &str, traits: &Path) -> Result<Vec<Violation>> {
+    let (tokens, _) = production_tokens(source)?;
+    let namespace = Regex::new(r"^[a-z0-9_-]+(?:/[a-z0-9_-]+)+/?$")?;
+    let present = |path: &str| {
+        let path = path.trim_end_matches('/');
+        traits.join(path).is_dir() || traits.join(format!("{path}.yaml")).is_file()
+    };
+    let mut errors = Vec::new();
+    // Brace depth inside a `mod class { … }`, while in one.
+    let mut class_module: Option<usize> = None;
+    for (i, token) in tokens.iter().enumerate() {
+        if !token.literal {
+            let value = token.value.as_str();
+            match (value, class_module.as_mut()) {
+                ("{", Some(depth)) => *depth += 1,
+                ("}", Some(depth)) => {
+                    *depth -= 1;
+                    if *depth == 0 {
+                        class_module = None;
+                    }
+                }
+                ("mod", None)
+                    if tokens.get(i + 1).is_some_and(|t| t.value == "class")
+                        && tokens.get(i + 2).is_some_and(|t| t.value == "{") =>
+                {
+                    class_module = Some(0);
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let value = token.value.as_str();
+        if !namespace.is_match(value) {
+            continue;
+        }
+        let rooted = ROOTS.iter().any(|root| {
+            value
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/'))
+        });
+        let class_argument =
+            i >= 2 && tokens[i - 2].value == "has_class" && tokens[i - 1].value == "(";
+        if rooted {
+            if !present(value) {
+                errors.push(Violation {
+                    line: token.line,
+                    reason: "hierarchy not in the traits tree",
+                    value: value.to_owned(),
+                });
+            }
+        } else if (class_module.is_some() || class_argument)
+            && !ROOTS.iter().any(|root| present(&format!("{root}/{value}")))
+        {
+            errors.push(Violation {
+                line: token.line,
+                reason: "capability class not in the traits tree",
+                value: value.to_owned(),
+            });
+        }
+    }
+    Ok(errors)
+}
+
 fn rust_sources(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     if !directory.is_dir() {
         return Ok(());
@@ -184,7 +260,8 @@ fn rust_sources(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 /// Check a source tree, resolving external test modules by their declarations.
-pub fn check_tree(root: &Path) -> Result<Vec<(PathBuf, Violation)>> {
+/// With `traits`, the hierarchies production code names must also exist there.
+pub fn check_tree(root: &Path, traits: Option<&Path>) -> Result<Vec<(PathBuf, Violation)>> {
     let mut paths = Vec::new();
     rust_sources(&root.join("src"), &mut paths)?;
     let sources: BTreeMap<_, _> = paths
@@ -215,6 +292,13 @@ pub fn check_tree(root: &Path) -> Result<Vec<(PathBuf, Violation)>> {
             for error in violations(&source).with_context(|| path.display().to_string())? {
                 errors.push((path.clone(), error));
             }
+            if let Some(traits) = traits {
+                for error in missing_hierarchies(&source, traits)
+                    .with_context(|| path.display().to_string())?
+                {
+                    errors.push((path.clone(), error));
+                }
+            }
         }
     }
     Ok(errors)
@@ -223,6 +307,50 @@ pub fn check_tree(root: &Path) -> Result<Vec<(PathBuf, Violation)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hierarchies_and_classes_must_exist_in_the_traits_tree() {
+        let traits = tempfile::tempdir().unwrap();
+        for dir in [
+            "micro-behaviors/communications/url/host",
+            "micro-behaviors/crypto/provider",
+        ] {
+            fs::create_dir_all(traits.path().join(dir)).unwrap();
+        }
+        fs::write(
+            traits
+                .path()
+                .join("micro-behaviors/crypto/provider/library.yaml"),
+            "",
+        )
+        .unwrap();
+        let source = r#"
+            const HOST: &str = "micro-behaviors/communications/url/host";
+            const GONE: &str = "micro-behaviors/communications/http/url/domain";
+            const FILE: &str = "micro-behaviors/crypto/provider/library";
+            mod class {
+                const PROVIDER: &str = "crypto/provider";
+                const LIBRARY: &str = "crypto/library";
+            }
+            fn f() { has_class("crypto/provider"); has_class("file/encoded"); }
+            const MIME: &str = "application/json";
+            #[cfg(test)]
+            mod tests { const OLD: &str = "micro-behaviors/process/create/load/script"; }
+        "#;
+        let missing: Vec<_> = missing_hierarchies(source, traits.path())
+            .unwrap()
+            .into_iter()
+            .map(|v| v.value)
+            .collect();
+        assert_eq!(
+            missing,
+            [
+                "micro-behaviors/communications/http/url/domain",
+                "crypto/library",
+                "file/encoded"
+            ]
+        );
+    }
 
     #[test]
     fn rejects_full_and_suffix_ids_including_escaped_and_raw_strings() {
@@ -344,7 +472,7 @@ mod tests {
             r#"const ID: &str = "a/b::production";"#,
         )
         .unwrap();
-        let errors = check_tree(root.path()).unwrap();
+        let errors = check_tree(root.path(), None).unwrap();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].0, src.join("simulations.rs"));
     }

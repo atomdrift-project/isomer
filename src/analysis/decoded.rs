@@ -10,21 +10,27 @@ use cleave::types::{Changed, DiffReportV1, TraitChange};
 
 use crate::member::MemberPath;
 
-/// Recognize cleave's generated `parent!!parent##encoding@offset` names.
-/// Requiring the repeated source name avoids interpreting ordinary archive
-/// filenames containing `##` as decoded views.
+/// The source a decoded view was decoded from. cleave names a view
+/// `source##encoding@offset`; older releases nested it as a member of its
+/// source (`source!!source##encoding@offset`). Requiring a well-formed
+/// encoding and offset avoids interpreting ordinary archive filenames
+/// containing `##` as decoded views.
 fn owner(path: &str) -> Option<&str> {
-    let (parent, leaf) = MemberPath::new(path).parent()?;
-    let (source, location) = leaf.rsplit_once("##")?;
+    let (source, location) = path.rsplit_once("##")?;
     let (encoding, offset) = location.split_once('@')?;
-    (source == parent.leaf()
-        && !encoding.is_empty()
-        && encoding
+    if encoding.is_empty()
+        || !encoding
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'+')
-        && !offset.is_empty()
-        && offset.bytes().all(|b| b.is_ascii_digit()))
-    .then_some(parent.as_str())
+        || offset.is_empty()
+        || !offset.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    match MemberPath::new(source).parent() {
+        Some((parent, leaf)) if leaf == parent.leaf() => Some(parent.as_str()),
+        _ => Some(source),
+    }
 }
 
 pub(super) fn reconcile_traits(mut diff: Cow<'_, DiffReportV1>) -> Cow<'_, DiffReportV1> {

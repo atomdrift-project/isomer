@@ -320,7 +320,7 @@ fn baseline_chain_is_attached_once_per_subject_and_compares_adjacent_releases() 
             .iter()
             .map(|a| a.baseline.len())
             .collect::<Vec<_>>(),
-        [3, 0]
+        [2, 0]
     );
     let work: Vec<_> = artifacts
         .iter()
@@ -329,6 +329,38 @@ fn baseline_chain_is_attached_once_per_subject_and_compares_adjacent_releases() 
         .collect();
     assert_eq!(work.iter().filter(|w| w.kind.starts_with("bb")).count(), 2);
     assert_eq!(work.iter().filter(|w| w.kind == "bd").count(), 2);
+}
+
+#[test]
+fn baseline_compares_only_declared_steps_across_a_restarted_series() {
+    let root = tempfile::tempdir().unwrap();
+    write_tree(
+        root.path(),
+        &[
+            pair(
+                "baseline",
+                side("demo", "before", Some("2.14.1"), "2.14.1.zip"),
+                side("demo", "before", Some("2.14.2"), "2.14.2.zip"),
+            ),
+            pair(
+                "baseline",
+                side("demo", "before", Some("v1.0.0"), "v1.0.0.zip"),
+                side("demo", "before", Some("v1.0.1"), "v1.0.1.zip"),
+            ),
+        ],
+    );
+    let artifacts = load_artifacts(root.path()).unwrap();
+    let steps: Vec<_> = transitions_of(0, &artifacts[0])
+        .into_iter()
+        .map(|w| (w.old.logical_name, w.new.logical_name))
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            ("2.14.1.zip".to_owned(), "2.14.2.zip".to_owned()),
+            ("v1.0.0.zip".to_owned(), "v1.0.1.zip".to_owned()),
+        ]
+    );
 }
 
 #[test]

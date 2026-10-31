@@ -49,7 +49,7 @@ lint: lint-trait-ids
 # No legacy allowlist: scorer dependencies on local trait names must migrate.
 .PHONY: lint-trait-ids
 lint-trait-ids:
-	$(CARGO) run --quiet --locked -p isomer-tools --bin lint-trait-ids
+	@CLEAVE_TRAITS_DIR="$(TRAITS_DIR)" $(CARGO) run --quiet --locked -p isomer-tools --bin lint-trait-ids
 
 # Auto-fix what clippy and rustfmt can fix on their own; fmt last so it tidies
 # any code clippy rewrote. Same target set as `lint`.

@@ -90,6 +90,10 @@ baseline. An unavailable lookup is reported as unknown, not as a missing or
 clean package. Use `--no-follow` to skip these checks, or `--offline` to prohibit
 all network access. `--deps` additionally fetches and analyzes newly added
 dependency payloads; registry following itself does not download those payloads.
+`--uplink` (or `ATOMDRIFT_UPLINK=1`) connects to Atomdrift Uplink for zero-hour
+rules the moment they clear QA, remote dependency verdicts, and a default hosted
+LLM endpoint (`ISOTOPE13_TOKEN` supplies a token non-interactively; `--offline`
+keeps everything local).
 
 Dependency additions alone remain Medium. With `--deps`, changed dependency
 versions and single-removal/single-addition replacements within one manifest

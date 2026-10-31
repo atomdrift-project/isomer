@@ -36,7 +36,10 @@ pub struct Artifact {
     pub before: Option<SampleFile>,
     pub during: Option<SampleFile>,
     pub after: Option<SampleFile>,
-    pub baseline: Vec<SampleFile>,
+    /// Declared clean steps, old then new. Steps, not a chain of files: the
+    /// corpus may skip releases or restart a series (`2.14.2`, then `v1.0.0`),
+    /// and joining across the gap would judge a comparison nobody declared.
+    pub baseline: Vec<(SampleFile, SampleFile)>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -171,30 +174,27 @@ struct Document {
     pairs: Option<Vec<Pair>>,
 }
 
-fn chain_for(
+fn baseline_steps(
     subject: &str,
     baselines: &BTreeMap<String, Vec<&Pair>>,
     chained: &mut BTreeSet<String>,
     tree: &Path,
     record: &str,
-) -> Vec<SampleFile> {
+) -> Vec<(SampleFile, SampleFile)> {
     if !chained.insert(subject.into()) {
         return Vec::new();
     }
-    let mut chain = Vec::new();
-    if let Some(steps) = baselines.get(subject) {
-        for (index, pair) in steps.iter().enumerate() {
-            if index == 0
-                && let Some(first) = pair.old.resolve(tree, record)
-            {
-                chain.push(first);
-            }
-            if let Some(next) = pair.new.resolve(tree, record) {
-                chain.push(next);
-            }
-        }
-    }
-    chain
+    baselines
+        .get(subject)
+        .into_iter()
+        .flatten()
+        .filter_map(|pair| {
+            Some((
+                pair.old.resolve(tree, record)?,
+                pair.new.resolve(tree, record)?,
+            ))
+        })
+        .collect()
 }
 
 pub fn load_artifacts(tree: &Path) -> Result<Vec<Artifact>> {
@@ -256,7 +256,8 @@ pub fn load_artifacts(tree: &Path) -> Result<Vec<Artifact>> {
             let after = fixed_for
                 .get(&pair.new.key())
                 .and_then(|side| side.resolve(tree, &record));
-            let baseline = chain_for(&pair.new.subject, &baselines, &mut chained, tree, &record);
+            let baseline =
+                baseline_steps(&pair.new.subject, &baselines, &mut chained, tree, &record);
             out.push(Artifact {
                 name: artifact_name(&record, &pair.new),
                 year,
@@ -292,12 +293,12 @@ pub fn load_artifacts(tree: &Path) -> Result<Vec<Artifact>> {
             });
         }
         for subject in baselines.keys() {
-            let baseline = chain_for(subject, &baselines, &mut chained, tree, &record);
-            if baseline.len() > 1 {
+            let baseline = baseline_steps(subject, &baselines, &mut chained, tree, &record);
+            if let Some((first, _)) = baseline.first() {
                 out.push(Artifact {
                     name: format!("{record}/{subject}"),
                     year,
-                    before: baseline.first().cloned(),
+                    before: Some(first.clone()),
                     during: None,
                     after: None,
                     baseline,
@@ -334,12 +335,12 @@ pub fn transitions_of(artifact_index: usize, artifact: &Artifact) -> Vec<Compari
             });
         }
     }
-    for (index, sides) in artifact.baseline.windows(2).enumerate() {
+    for (index, (old, new)) in artifact.baseline.iter().enumerate() {
         work.push(Comparison {
             artifact_index,
             kind: format!("bb{index}"),
-            old: sides[0].clone(),
-            new: sides[1].clone(),
+            old: old.clone(),
+            new: new.clone(),
         });
     }
     work

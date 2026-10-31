@@ -19,6 +19,10 @@ impl Profile {
                 .or_insert(weight);
         }
     }
+
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.0.contains_key(id)
+    }
 }
 
 #[derive(Debug, Default)]
