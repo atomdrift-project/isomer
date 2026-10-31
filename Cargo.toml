@@ -134,6 +134,8 @@ significant_drop_tightening = "warn"
 # compile without unwinding, since aborting would let one malformed file kill
 # the whole analysis.
 [profile.dev]
+# `false` still permits local Thin LTO in optimized crates.
+lto = "off"
 # Full DWARF for 500+ dependencies is what made target/debug tens of gigabytes
 # and slowed every link. Line tables still give file:line in backtraces, which
 # is all a `Result`-only codebase ever needs from a debug build.
