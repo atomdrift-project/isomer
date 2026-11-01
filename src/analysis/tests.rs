@@ -256,6 +256,20 @@ fn patch_public_api_expansion_requires_floating_young_dependency() {
     assert!(dependency_backed_public_api_anomaly(&report("^0.1.0"), patch, &entrypoints).is_some());
     assert!(dependency_backed_public_api_anomaly(&report("0.1.0"), patch, &entrypoints).is_none());
     assert!(dependency_backed_public_api_anomaly(&report("^0.1.0"), minor, &entrypoints).is_none());
+
+    // What cleave extracts from the real index.js (`var es = exports` ...
+    // `es.flatmap = flatmap`): the import, and `flatmap` as an export.
+    let mut exported = report("^0.1.0");
+    exported.files[1].scopes.symbols.as_mut().unwrap().added[1] = SymbolChange {
+        symbol: "flatmap".to_string(),
+        kind: cleave::types::SymbolKind::Export,
+        library: None,
+    };
+    assert!(dependency_backed_public_api_anomaly(&exported, patch, &entrypoints).is_some());
+    // The same bare name as a call is not a member the module publishes.
+    exported.files[1].scopes.symbols.as_mut().unwrap().added[1].kind =
+        cleave::types::SymbolKind::Import;
+    assert!(dependency_backed_public_api_anomaly(&exported, patch, &entrypoints).is_none());
 }
 
 #[test]

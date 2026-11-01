@@ -19,11 +19,50 @@ pub(crate) struct Finding {
     severity: Severity,
 }
 
+/// What the registry says about a coordinate's package itself, apart from
+/// any finding about it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Standing {
+    /// The lookup did not establish either way.
+    #[default]
+    Unknown,
+    /// The registry serves the package.
+    Listed,
+    /// The registry's security team took the package down and left a
+    /// tombstone (npm's `0.0.1-security`): it was malware.
+    SecurityHold,
+    /// The registry answered that it has no such package: never published,
+    /// unpublished, or free for anyone to claim.
+    Missing,
+}
+
+impl Standing {
+    /// What declaring a dependency in this standing is worth when the
+    /// declaration is new: a taken-down package is the attack itself, and
+    /// one that does not exist cannot be what the release was built and
+    /// tested against: an unpublished payload or a name left to be claimed.
+    fn dependency_severity(self) -> Option<(Severity, &'static str)> {
+        match self {
+            Self::SecurityHold => Some((
+                Severity::Critical,
+                "dependency is held by its registry for security (a taken-down package)",
+            )),
+            Self::Missing => Some((
+                Severity::High,
+                "dependency is not in its registry (unpublished, or a name left to be claimed)",
+            )),
+            Self::Unknown | Self::Listed => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Observation {
     pub coordinate: String,
     pub findings: Vec<Finding>,
     pub error: Option<String>,
+    pub standing: Standing,
     /// Lossless registry/provider envelope, not just the selected findings.
     document: Option<serde_json::Value>,
 }
@@ -161,13 +200,31 @@ fn compare(
         .map(|f| f.severity)
         .max()
         .unwrap_or(Severity::None);
-    Comparison {
+    let mut row = Comparison {
         subject,
         old,
         new,
         new_severity,
         policy_reason: None,
+    };
+    // A dependency that newly declares a taken-down or missing package. The
+    // package itself is left out: a release under review is routinely not
+    // published yet, and a takedown covers its baseline too.
+    let prior = row.old.as_ref().map(|o| o.standing);
+    if matches!(row.subject, Subject::Dependency { .. })
+        && let Some(standing) = row.new.as_ref().map(|n| n.standing)
+        && prior.is_none_or(|prior| prior != Standing::Unknown && prior != standing)
+        && let Some((severity, reason)) = standing.dependency_severity()
+        && severity > row.new_severity
+    {
+        log::debug!(
+            "registry: {} {standing:?} (before: {prior:?}) -> {severity:?}",
+            row.subject
+        );
+        row.new_severity = severity;
+        row.policy_reason = Some(reason.to_owned());
     }
+    row
 }
 
 /// Subjects and the coordinate each names, for one side.
@@ -231,6 +288,7 @@ pub(crate) fn audit(
                             error: Some(format!(
                                 "could not discover registry references: {error:#}"
                             )),
+                            standing: Standing::Unknown,
                             document: None,
                         })),
                     ));
@@ -321,15 +379,31 @@ fn pair_replacements(old: &mut Coordinates, new: &Coordinates) {
 }
 
 fn collect(report: &cleave::AnalysisReport, label: &str, out: &mut Coordinates) {
-    for file in &report.files {
-        let member = crate::member::MemberPath::new(&file.path)
+    // A single-file analysis (a bare `package.json` under `fs`/`git`/`ci`)
+    // keeps its facts on the report itself; an archive's are per file.
+    let root = report.files.is_empty().then(|| {
+        (
+            report.target.path.as_str(),
+            report.target.file_type.as_str(),
+            report.identity.as_ref(),
+            report.filefacts.as_ref(),
+        )
+    });
+    let files = report.files.iter().map(|file| {
+        (
+            file.path.as_str(),
+            file.file_type.as_str(),
+            file.identity.as_ref(),
+            file.filefacts.as_ref(),
+        )
+    });
+    for (path, file_type, identity, filefacts) in root.into_iter().chain(files) {
+        let member = crate::member::MemberPath::new(path)
             .member()
             .unwrap_or_default();
         // Embedded package identities are authoritative over archive filenames.
-        if matches!(
-            file.file_type.as_str(),
-            "npm" | "package.json" | "package_json"
-        ) && let Some(identity) = &file.identity
+        if matches!(file_type, "npm" | "package.json" | "package_json")
+            && let Some(identity) = identity
             && let (Some(name), Some(version)) = (&identity.name, &identity.version)
             && !crate::rubric::filename_only_identity(identity)
             && let Ok(purl) =
@@ -343,7 +417,11 @@ fn collect(report: &cleave::AnalysisReport, label: &str, out: &mut Coordinates) 
                 purl,
             );
         }
-        if let Some(facts) = &file.filefacts {
+        if let Some(facts) = filefacts {
+            log::debug!(
+                "registry: {label} {path} ({file_type}): {} references",
+                facts.references.len()
+            );
             for reference in &facts.references {
                 if reference.kind != filefacts::RefKind::Dependency {
                     continue;
@@ -353,10 +431,14 @@ fn collect(report: &cleave::AnalysisReport, label: &str, out: &mut Coordinates) 
                     // filefacts itself emits versionless locators for them.
                     // A range is not a purl version, so it rides after the `@`
                     // as written, and `lookup` resolves it before querying.
-                    let name = purl
+                    // The subject is the package: a version or a purl
+                    // qualifier (`?version_requirement=^1.0`) is what changed
+                    // about it, so a range bump pairs with its predecessor.
+                    let base = purl.split_once('?').map_or(purl.as_str(), |(base, _)| base);
+                    let name = base
                         .rsplit_once('@')
                         .filter(|(name, _)| !name.ends_with('/'))
-                        .map_or(purl.as_str(), |(name, _)| name);
+                        .map_or(base, |(name, _)| name);
                     let mut coordinate = purl.clone();
                     if name == purl
                         && let Some(package) = name.strip_prefix("pkg:npm/")
@@ -403,16 +485,33 @@ fn lookup(coordinate: &str, options: &cleave::AnalysisOptions) -> Observation {
         coordinate: coordinate.to_owned(),
         findings: vec![],
         error: None,
+        standing: Standing::Unknown,
         document: None,
     };
     let locator = filefacts::RefLocator::Purl(coordinate.to_owned());
-    let (record, sources) = scan::fetch::registry_with_sources(&locator);
-    let Some(mut record) = record else {
-        observation.error = Some(
-            "registry lookup unavailable; status unknown (not evidence of a missing package)"
-                .to_owned(),
-        );
-        return observation;
+    let (mut record, sources) = match scan::fetch::registry_lookup(&locator) {
+        Some((Ok(record), sources)) => (record, sources),
+        Some((Err(fletch::RegistryError::NotFound), _)) => {
+            log::debug!("registry: {coordinate} is not in its registry");
+            observation.standing = Standing::Missing;
+            return observation;
+        }
+        unavailable => {
+            let why = unavailable
+                .and_then(|(record, _)| record.err())
+                .map_or_else(|| "no fetcher".to_owned(), |error| error.to_string());
+            observation.error = Some(format!(
+                "registry lookup unavailable ({why}); status unknown (not evidence of a missing package)"
+            ));
+            return observation;
+        }
+    };
+    // A takedown is the package's standing, whatever version a range would
+    // have resolved to: npm's tombstone leaves no version a range can match.
+    observation.standing = if record.security_hold == Some(true) {
+        Standing::SecurityHold
+    } else {
+        Standing::Listed
     };
     // The registry API accepts exact versions, not semver requirements. Resolve
     // ranges against the retained packument, then query the exact result.
@@ -525,6 +624,11 @@ mod tests {
                 }]
             },
             error: error.map(str::to_owned),
+            standing: if error.is_some() {
+                Standing::Unknown
+            } else {
+                Standing::Listed
+            },
             document: None,
         }
     }
@@ -787,5 +891,100 @@ mod tests {
         assert_eq!(result.new_severity, Severity::None);
         assert_eq!(result.severity(), Severity::High);
         assert!(result.old.as_ref().is_some_and(|o| o.error.is_some()));
+    }
+
+    #[test]
+    fn a_dependency_newly_on_a_taken_down_or_missing_package_escalates() {
+        let standing = |standing: Standing, error: Option<&str>| {
+            let mut o = observation("pkg:npm/flatmap-stream@0.1.1", "", error);
+            o.standing = standing;
+            Some(Rc::new(o))
+        };
+        let dep = || dependency("package.json", "flatmap-stream");
+        let added = |s| compare(dep(), None, standing(s, None));
+        // event-stream 3.3.6 adding flatmap-stream, held by npm since.
+        let held = added(Standing::SecurityHold);
+        assert_eq!(held.new_severity, Severity::Critical);
+        assert!(held.policy_reason.as_deref().is_some_and(|r| r.contains("security")));
+        assert_eq!(added(Standing::Missing).new_severity, Severity::High);
+        assert_eq!(added(Standing::Listed).new_severity, Severity::None);
+        // A changed coordinate that newly lands on a takedown counts too.
+        let moved = compare(
+            dep(),
+            standing(Standing::Listed, None),
+            standing(Standing::SecurityHold, None),
+        );
+        assert_eq!(moved.new_severity, Severity::Critical);
+        // Not new: the baseline already declared it, or its standing is unknown.
+        for prior in [Standing::SecurityHold, Standing::Unknown] {
+            let row = compare(dep(), standing(prior, None), standing(Standing::SecurityHold, None));
+            assert_eq!(row.new_severity, Severity::None, "{prior:?}");
+        }
+        // The package under review is routinely unpublished.
+        let package = compare(
+            Subject::DiffPackage {
+                path: "<root>".into(),
+            },
+            standing(Standing::Listed, None),
+            standing(Standing::Missing, None),
+        );
+        assert_eq!(package.new_severity, Severity::None);
+    }
+
+    #[test]
+    fn a_range_change_pairs_with_its_predecessor() {
+        let report = |spec: &str| -> cleave::AnalysisReport {
+            let mut report: cleave::AnalysisReport = serde_json::from_value(serde_json::json!({
+                "version":"3", "files":[{"id":0,"path":"sample.tgz","depth":0,"file_type":"npm","sha256":"a".repeat(64),"size":100}]
+            })).unwrap();
+            report.files[0].filefacts = Some(cleave::types::FilefactsView {
+                references: vec![filefacts::Reference::new(
+                    filefacts::RefLocator::Purl(format!(
+                        "pkg:npm/duplexer?version_requirement={spec}"
+                    )),
+                    filefacts::RefKind::Dependency,
+                    "package.json",
+                    &format!("duplexer@{spec}"),
+                )],
+                ..Default::default()
+            });
+            report
+        };
+        let (mut old, mut new) = (Coordinates::new(), Coordinates::new());
+        collect(&report("~0.1.1"), "sample", &mut old);
+        collect(&report("%5E0.1.1"), "sample", &mut new);
+        assert_eq!(old.keys().collect::<Vec<_>>(), new.keys().collect::<Vec<_>>());
+        assert_eq!(
+            new.keys().next().map(ToString::to_string).as_deref(),
+            Some("sample/dependency//pkg:npm/duplexer")
+        );
+    }
+
+    #[test]
+    fn a_bare_manifest_declares_its_dependencies() {
+        // `fs`/`git`/`ci` analyze a changed package.json on its own: cleave
+        // keeps a single file's facts on the report, with no member files.
+        let mut report = cleave::AnalysisReport::new(cleave::types::TargetInfo {
+            path: "package.json".into(),
+            file_type: "package.json".into(),
+            size_bytes: 10,
+            sha256: String::new(),
+            architectures: None,
+        });
+        report.filefacts = Some(cleave::types::FilefactsView {
+            references: vec![filefacts::Reference::new(
+                filefacts::RefLocator::Purl("pkg:npm/absent?version_requirement=%5E1.0.0".into()),
+                filefacts::RefKind::Dependency,
+                "package.json",
+                "absent@^1.0.0",
+            )],
+            ..Default::default()
+        });
+        let mut collected = Coordinates::new();
+        collect(&report, "package.json", &mut collected);
+        assert_eq!(
+            collected.keys().map(ToString::to_string).collect::<Vec<_>>(),
+            ["package.json/dependency//pkg:npm/absent"]
+        );
     }
 }

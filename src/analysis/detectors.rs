@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use cleave::types::{DiffReportV1, DiffSummary, FileDiffEntry, FileStatus};
+use cleave::types::{DiffReportV1, DiffSummary, FileDiffEntry, FileStatus, SymbolKind};
 
 use crate::Severity;
 use crate::member::MemberPath;
@@ -1198,19 +1198,19 @@ pub(super) fn dependency_backed_public_api_anomaly(
             let Some(symbols) = entrypoint.scopes.symbols.as_ref() else {
                 continue;
             };
-            let added: Vec<&str> = symbols
+            let imports_dependency = symbols
                 .added
                 .iter()
-                .map(|symbol| symbol.symbol.as_str())
-                .collect();
-            let imports_dependency = added
-                .iter()
-                .any(|symbol| normalize_api_name(symbol) == normalized_dependency);
-            let exposes_matching_member = added.iter().any(|symbol| {
-                let Some((_, member)) = symbol.rsplit_once('.') else {
-                    return false;
+                .any(|symbol| normalize_api_name(&symbol.symbol) == normalized_dependency);
+            // A new member is an export the module now publishes
+            // (`es.flatmap = …` reads as export `flatmap`), or the member of a
+            // dotted call it now makes.
+            let exposes_matching_member = symbols.added.iter().any(|symbol| {
+                let member = match symbol.kind {
+                    SymbolKind::Export => Some(symbol.symbol.as_str()),
+                    _ => symbol.symbol.rsplit_once('.').map(|(_, member)| member),
                 };
-                meaningful_tokens.contains(&normalize_api_name(member))
+                member.is_some_and(|member| meaningful_tokens.contains(&normalize_api_name(member)))
             });
             if imports_dependency && exposes_matching_member {
                 return Some(DependencyApiExpansion {
