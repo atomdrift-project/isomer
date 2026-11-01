@@ -377,13 +377,18 @@ pub(super) fn change_shape_escalation(shape: &Shape<'_>, signals: &Signals) -> S
         .filter(|c| a.behavioral.is_new_category(c))
         .filter(|c| c.new_ids.iter().any(|id| !TraitId::new(id).is_metadata()))
         .count();
-    let focused_source = routine_release(bump) && FOCUSED_SOURCE.fits(s, new_classes);
+    // A focused implant hides among code the package kept. A release that
+    // removed every code file it had (a build output swapped for its sources,
+    // a module tree moved) is a rewrite: every class in it reads as new, and
+    // there is no surrounding code for an implant to be focused within.
+    let rewrite = super::arrivals::replaced_all_code(diff);
+    let focused_source = routine_release(bump) && !rewrite && FOCUSED_SOURCE.fits(s, new_classes);
     // A release can also delete a modest amount of stale package content
     // while concentrating several new capabilities in a few changed files.
     // Keep this separate from the small focused branch: the higher movement
     // and four-class floor prevent routine patch cleanup from escalating.
     let focused_source_with_cleanup =
-        routine_release(bump) && FOCUSED_SOURCE_WITH_CLEANUP.fits(s, new_classes);
+        routine_release(bump) && !rewrite && FOCUSED_SOURCE_WITH_CLEANUP.fits(s, new_classes);
     // A compact cross-domain capability cluster is suspicious even when the
     // individual rules remain medium: HTTP plus scheduling and serialization
     // in a small patch is a common dormant-loader shape. The class count and
@@ -547,33 +552,50 @@ pub(super) fn change_shape_escalation(shape: &Shape<'_>, signals: &Signals) -> S
     let binary_replacement = signals.binary_replacement.is_some();
     let opaque_runtime_payload = signals.opaque_runtime_payload.is_some();
     let runtime_graft = signals.runtime_graft.is_some();
-    if focused_source
-        || focused_source_with_cleanup
-        || source_build_anomaly
-        || cross_domain_cluster
-        || external_admin_html
-        || endgame
-        || dependency_with_fallback_load
-        || dependency_backed_api
-        || source_download_execute
-        || remote_script_loader
-        || added_encrypted_payload_archive
-        || same_version_archive_replacement
-        || nested_payload_cluster
-        || nested_capability_cluster
-        || encoded_payload_cluster
-        || native_hook_cluster
-        || native_build_hook_cluster
-        || secret_egress_cluster
-        || binary_replacement
-        || opaque_runtime_payload
-        || runtime_graft
-        || executable_capability_bundle >= Severity::High
-    {
-        Severity::High
-    } else {
-        Severity::None
+    let fired: Vec<&str> = [
+        ("focused_source", focused_source),
+        ("focused_source_with_cleanup", focused_source_with_cleanup),
+        ("source_build_anomaly", source_build_anomaly),
+        ("cross_domain_cluster", cross_domain_cluster),
+        ("external_admin_html", external_admin_html),
+        ("endgame", endgame),
+        (
+            "dependency_with_fallback_load",
+            dependency_with_fallback_load,
+        ),
+        ("dependency_backed_api", dependency_backed_api),
+        ("source_download_execute", source_download_execute),
+        ("remote_script_loader", remote_script_loader),
+        (
+            "added_encrypted_payload_archive",
+            added_encrypted_payload_archive,
+        ),
+        (
+            "same_version_archive_replacement",
+            same_version_archive_replacement,
+        ),
+        ("nested_payload_cluster", nested_payload_cluster),
+        ("nested_capability_cluster", nested_capability_cluster),
+        ("encoded_payload_cluster", encoded_payload_cluster),
+        ("native_hook_cluster", native_hook_cluster),
+        ("native_build_hook_cluster", native_build_hook_cluster),
+        ("secret_egress_cluster", secret_egress_cluster),
+        ("binary_replacement", binary_replacement),
+        ("opaque_runtime_payload", opaque_runtime_payload),
+        ("runtime_graft", runtime_graft),
+        (
+            "executable_capability_bundle",
+            executable_capability_bundle >= Severity::High,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, fired)| fired.then_some(name))
+    .collect();
+    if fired.is_empty() {
+        return Severity::None;
     }
+    log::debug!("shape: change shape fired {fired:?}");
+    Severity::High
 }
 
 #[derive(Debug)]

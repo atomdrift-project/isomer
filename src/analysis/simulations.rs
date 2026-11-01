@@ -519,6 +519,66 @@ fn generic_capability_churn_is_release_pressure_not_a_major_upgrade_blocker() {
     }
 }
 
+/// monade 0.0.6 → 0.0.8: the package dropped its built `cjs/` and `esm/`
+/// trees for `src/`, a build script and tests. Every class in the new code
+/// reads as gained, and the release fits the focused-with-cleanup movement,
+/// but nothing survived for an implant to be focused within.
+#[test]
+fn a_release_that_replaced_all_its_code_is_not_a_focused_implant() {
+    let mut package = source("package.json", &[]);
+    package.status = FileStatus::Changed;
+    let removed = |path: &str| FileDiffEntry {
+        status: FileStatus::Removed,
+        ..source(path, &[])
+    };
+    let mut files = vec![package];
+    files.extend(
+        [
+            "cjs/index.js",
+            "cjs/monade.js",
+            "esm/index.js",
+            "esm/monade.js",
+        ]
+        .map(removed),
+    );
+    files.extend([
+        source(
+            "make.js",
+            &[
+                "micro-behaviors/fs/read/file::read-file-sync",
+                "micro-behaviors/fs/delete/directory::rm-recursive",
+                "micro-behaviors/data/serialize/json::json-stringify-call",
+            ],
+        ),
+        source(
+            "src/monade.js",
+            &[
+                "micro-behaviors/os/random/prng::math-random",
+                "micro-behaviors/communications/url/http-scheme::http-url-literal",
+            ],
+        ),
+    ]);
+    let mut diff = report(files);
+    diff.summary = DiffSummary {
+        files_added: 2,
+        files_removed: 4,
+        files_changed: 1,
+        overall_roc: 1.0,
+        scope_roc: ScopeRocs {
+            traits: 1.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(shape(&diff, BumpKind::Patch), Severity::None);
+
+    // The same gains beside code the release kept are the focused shape.
+    diff.files[1].status = FileStatus::Changed;
+    diff.summary.files_removed = 3;
+    diff.summary.files_changed = 2;
+    assert_eq!(shape(&diff, BumpKind::Patch), Severity::High);
+}
+
 #[test]
 fn author_credit_replacement_is_reviewable_not_a_publisher_takeover() {
     let mut file = source("package.json", &[]);
