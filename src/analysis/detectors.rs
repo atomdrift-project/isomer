@@ -1530,7 +1530,7 @@ pub(super) fn source_build_macro_anomaly(new_root: &Path, diff: &DiffReportV1) -
         if !(lower.contains("/m4/") && lower.ends_with(".m4")) {
             return false;
         }
-        let Ok(Some(bytes)) = cleave::extract_member(new_root, member) else {
+        let Ok(Some(bytes)) = crate::extract::member(new_root, member) else {
             return false;
         };
         source_build_macro_score(&bytes)
@@ -1579,10 +1579,10 @@ pub(super) fn stable_source_loader_payload_refresh(
         let (Some(old_member), Some(new_member)) = (*old_member, *new_member) else {
             return false;
         };
-        let Ok(Some(old_bytes)) = cleave::extract_member(old_root, old_member) else {
+        let Ok(Some(old_bytes)) = crate::extract::member(old_root, old_member) else {
             return false;
         };
-        let Ok(Some(new_bytes)) = cleave::extract_member(new_root, new_member) else {
+        let Ok(Some(new_bytes)) = crate::extract::member(new_root, new_member) else {
             return false;
         };
         old_bytes == new_bytes && source_build_macro_score(&new_bytes)

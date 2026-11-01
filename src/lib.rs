@@ -24,6 +24,7 @@ pub(crate) mod changed_lines;
 pub mod ci;
 pub(crate) mod deps;
 pub(crate) mod evidence;
+mod extract;
 pub mod fetch;
 pub(crate) mod frameworks;
 pub mod fs;

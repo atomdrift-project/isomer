@@ -78,6 +78,8 @@ similar = "2.7"
 [dev-dependencies]
 # Renderer snapshots: the whole report, reviewed as a diff when it moves.
 insta = "1.49"
+# Archive fixtures for member extraction. Already in the graph via cleave.
+tar = "0.4"
 
 # Mirrors scan's [workspace.lints], plus `unsafe_code = "deny"` — isomer has no
 # reason to write any unsafe at all, so it forbids the block outright rather

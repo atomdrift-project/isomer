@@ -178,7 +178,7 @@ pub(super) fn changed_source_members<'d>(
 /// absence is ordinary, a failure is worth a word on stderr.
 pub(super) fn archive_member_bytes(archive: &Path, canonical_member: &str) -> Option<Vec<u8>> {
     for candidate in archive_member_candidates(archive, canonical_member) {
-        match cleave::extract_member(archive, &candidate) {
+        match crate::extract::member(archive, &candidate) {
             Ok(Some(bytes)) => return Some(bytes),
             Ok(None) => {}
             Err(error) => {
@@ -340,7 +340,7 @@ impl Analysis<'_> {
             FileStatus::Removed => pair.old.as_deref().or(pair.new.as_deref()),
             FileStatus::Unchanged => None,
         }?;
-        let bytes = cleave::extract_member(archive, member).ok().flatten()?;
+        let bytes = crate::extract::member(archive, member).ok().flatten()?;
         Some(filefacts::FileId::from_bytes(&bytes).file_type())
     }
 }

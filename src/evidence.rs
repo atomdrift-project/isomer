@@ -521,7 +521,7 @@ fn member_source(archive_or_file: Option<&Path>, member: Option<&str>) -> Option
         None => std::fs::read(p)
             .inspect_err(|e| log::warn!("could not read {} for evidence: {e}", p.display()))
             .ok(),
-        Some(m) => cleave::extract_member(p, m)
+        Some(m) => crate::extract::member(p, m)
             .inspect_err(|e| {
                 log::warn!(
                     "could not extract {m} from {} for evidence: {e:#}",

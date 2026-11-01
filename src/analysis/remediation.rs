@@ -214,7 +214,7 @@ pub(super) fn newly_disabled_source_functions(
 
 pub(super) fn diff_source_bytes(root: &Path, diff_path: &str) -> Option<Vec<u8>> {
     if let Some(member) = MemberPath::new(diff_path).member() {
-        return cleave::extract_member(root, member)
+        return crate::extract::member(root, member)
             .inspect_err(|e| {
                 log::warn!("could not extract {member} from {}: {e:#}", root.display())
             })
