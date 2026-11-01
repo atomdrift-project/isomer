@@ -858,6 +858,16 @@ impl<'a> Analysis<'a> {
             }
             None => {}
         }
+        // A registry takedown is the registry's own verdict: it outranks
+        // whatever content change happened to come with it.
+        if let Some((coordinate, reason)) = self
+            .registry
+            .iter()
+            .filter(|row| row.new_severity == Severity::Critical)
+            .find_map(|row| Some((&row.new.as_ref()?.coordinate, row.policy_reason.as_ref()?)))
+        {
+            return format!("{}: {reason}", crate::printable(coordinate));
+        }
         if let Some(dependency) = self
             .deps
             .iter()

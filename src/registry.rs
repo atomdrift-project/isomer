@@ -32,7 +32,8 @@ pub(crate) enum Standing {
     /// The registry serves the package.
     Listed,
     /// The registry's security team took the package down and left a
-    /// tombstone (npm's `0.0.1-security`): it was malware.
+    /// tombstone (npm's `0.0.1-security`), or deleted this version under a
+    /// malware advisory: it was malware.
     SecurityHold,
     /// The registry answered that it has no such package: never published,
     /// unpublished, or free for anyone to claim.
@@ -209,14 +210,25 @@ fn compare(
         new_severity,
         policy_reason: None,
     };
-    // A dependency that newly declares a taken-down or missing package. The
-    // package itself is left out: a release under review is routinely not
-    // published yet, and a takedown covers its baseline too.
+    // A dependency that newly declares a taken-down or missing package, or a
+    // release newly taken down. A release that is merely missing is left
+    // out: one under review is routinely not published yet. A package-wide
+    // takedown holds the baseline too, so only a version's own counts.
     let prior = row.old.as_ref().map(|o| o.standing);
-    if matches!(row.subject, Subject::Dependency { .. })
-        && let Some(standing) = row.new.as_ref().map(|n| n.standing)
+    if let Some(standing) = row.new.as_ref().map(|n| n.standing)
         && prior.is_none_or(|prior| prior != Standing::Unknown && prior != standing)
-        && let Some((severity, reason)) = standing.dependency_severity()
+        && let Some((severity, reason)) = match row.subject {
+            Subject::Dependency { .. } => standing.dependency_severity(),
+            Subject::DiffPackage { .. } | Subject::Package { .. }
+                if standing == Standing::SecurityHold =>
+            {
+                Some((
+                    Severity::Critical,
+                    "release is withdrawn by its registry for security (a malware takedown)",
+                ))
+            }
+            _ => None,
+        }
         && severity > row.new_severity
     {
         log::debug!(
@@ -956,14 +968,33 @@ mod tests {
             assert_eq!(row.new_severity, Severity::None, "{prior:?}");
         }
         // The package under review is routinely unpublished.
-        let package = compare(
-            Subject::DiffPackage {
-                path: "<root>".into(),
-            },
-            standing(Standing::Listed, None),
-            standing(Standing::Missing, None),
+        let package = |old, new| {
+            compare(
+                Subject::DiffPackage {
+                    path: "<root>".into(),
+                },
+                standing(old, None),
+                standing(new, None),
+            )
+        };
+        assert_eq!(
+            package(Standing::Listed, Standing::Missing).new_severity,
+            Severity::None
         );
-        assert_eq!(package.new_severity, Severity::None);
+        // color 5.0.0 -> 5.0.1: the release itself was taken down.
+        let taken_down = package(Standing::Listed, Standing::SecurityHold);
+        assert_eq!(taken_down.new_severity, Severity::Critical);
+        assert!(
+            taken_down
+                .policy_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("security"))
+        );
+        // A package-wide takedown holds the baseline too: nothing new.
+        assert_eq!(
+            package(Standing::SecurityHold, Standing::SecurityHold).new_severity,
+            Severity::None
+        );
     }
 
     #[test]
