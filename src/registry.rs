@@ -383,7 +383,7 @@ fn pair_replacements(old: &mut Coordinates, new: &Coordinates) {
 fn collect(report: &cleave::AnalysisReport, label: &str, out: &mut Coordinates) {
     // A single-file analysis (a bare `package.json` under `fs`/`git`/`ci`)
     // keeps its facts on the report itself; an archive's are per file.
-    let root = report.files.is_empty().then(|| {
+    let root = report.files.is_empty().then_some({
         (
             report.target.path.as_str(),
             report.target.file_type.as_str(),
@@ -979,7 +979,7 @@ mod tests {
                     )),
                     filefacts::RefKind::Dependency,
                     "package.json",
-                    &format!("duplexer@{spec}"),
+                    format!("duplexer@{spec}"),
                 )],
                 ..Default::default()
             });
