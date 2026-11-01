@@ -5,6 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::rc::Rc;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -480,6 +482,31 @@ fn catalogue(sources: &[fletch::fetch::RecordedSource]) -> Option<serde_json::Va
         .find(|doc| doc.get("versions").is_some())
 }
 
+// Scan's public registry helper discards errors, but callers need NotFound to
+// distinguish a missing package from an unavailable registry.
+fn registry_lookup(
+    locator: &filefacts::RefLocator,
+) -> Option<(
+    Result<filefacts::Registry, fletch::RegistryError>,
+    Vec<fletch::fetch::RecordedSource>,
+)> {
+    static RESOURCES: OnceLock<(fletch::fetch::HttpFetch, fletch::fetch::BlobCache)> =
+        OnceLock::new();
+    let resources = if let Some(resources) = RESOURCES.get() {
+        resources
+    } else {
+        let net = fletch::fetch::HttpFetch::new().ok()?;
+        let cache = scan::fetch::open_blob_cache().ok()?;
+        RESOURCES.get_or_init(|| (net, cache))
+    };
+    let (record, sources) = fletch::registry::lookup_recorded(locator, &resources.0, &resources.1);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Some((record.map(|record| record.with_age(now)), sources))
+}
+
 fn lookup(coordinate: &str, options: &cleave::AnalysisOptions) -> Observation {
     let mut observation = Observation {
         coordinate: coordinate.to_owned(),
@@ -489,7 +516,7 @@ fn lookup(coordinate: &str, options: &cleave::AnalysisOptions) -> Observation {
         document: None,
     };
     let locator = filefacts::RefLocator::Purl(coordinate.to_owned());
-    let (mut record, sources) = match scan::fetch::registry_lookup(&locator) {
+    let (mut record, sources) = match registry_lookup(&locator) {
         Some((Ok(record), sources)) => (record, sources),
         Some((Err(fletch::RegistryError::NotFound), _)) => {
             log::debug!("registry: {coordinate} is not in its registry");
