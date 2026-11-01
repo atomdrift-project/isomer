@@ -905,7 +905,11 @@ mod tests {
         // event-stream 3.3.6 adding flatmap-stream, held by npm since.
         let held = added(Standing::SecurityHold);
         assert_eq!(held.new_severity, Severity::Critical);
-        assert!(held.policy_reason.as_deref().is_some_and(|r| r.contains("security")));
+        assert!(
+            held.policy_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("security"))
+        );
         assert_eq!(added(Standing::Missing).new_severity, Severity::High);
         assert_eq!(added(Standing::Listed).new_severity, Severity::None);
         // A changed coordinate that newly lands on a takedown counts too.
@@ -917,7 +921,11 @@ mod tests {
         assert_eq!(moved.new_severity, Severity::Critical);
         // Not new: the baseline already declared it, or its standing is unknown.
         for prior in [Standing::SecurityHold, Standing::Unknown] {
-            let row = compare(dep(), standing(prior, None), standing(Standing::SecurityHold, None));
+            let row = compare(
+                dep(),
+                standing(prior, None),
+                standing(Standing::SecurityHold, None),
+            );
             assert_eq!(row.new_severity, Severity::None, "{prior:?}");
         }
         // The package under review is routinely unpublished.
@@ -953,7 +961,10 @@ mod tests {
         let (mut old, mut new) = (Coordinates::new(), Coordinates::new());
         collect(&report("~0.1.1"), "sample", &mut old);
         collect(&report("%5E0.1.1"), "sample", &mut new);
-        assert_eq!(old.keys().collect::<Vec<_>>(), new.keys().collect::<Vec<_>>());
+        assert_eq!(
+            old.keys().collect::<Vec<_>>(),
+            new.keys().collect::<Vec<_>>()
+        );
         assert_eq!(
             new.keys().next().map(ToString::to_string).as_deref(),
             Some("sample/dependency//pkg:npm/duplexer")
@@ -983,7 +994,10 @@ mod tests {
         let mut collected = Coordinates::new();
         collect(&report, "package.json", &mut collected);
         assert_eq!(
-            collected.keys().map(ToString::to_string).collect::<Vec<_>>(),
+            collected
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
             ["package.json/dependency//pkg:npm/absent"]
         );
     }
