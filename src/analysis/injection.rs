@@ -42,7 +42,6 @@ const INPUT: &[&str] = &[
 const DYNAMIC: &[&str] = &[
     "micro-behaviors/metaprogramming/reflection/invoke",
     "micro-behaviors/process/interpreter/eval",
-    "micro-behaviors/process/create/eval",
 ];
 
 /// A program started at run time.
