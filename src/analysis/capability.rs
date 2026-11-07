@@ -293,7 +293,7 @@ pub(super) const EXEC_PATH_MARKERS: [&str; 5] = [
 pub(super) fn capability_shape(file: &FileDiffEntry) -> CapabilityShape {
     let lower_path = file.path.to_ascii_lowercase();
     let mut shape = CapabilityShape {
-        executable: super::member_type(file).is_some_and(|t| t.is_binary())
+        executable: super::member_type(file).is_some_and(|t| t.is_executable_code())
             || EXEC_PATH_MARKERS.iter().any(|m| lower_path.contains(m)),
         resource_path: [
             "/resources/",

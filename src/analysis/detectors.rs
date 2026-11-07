@@ -625,7 +625,7 @@ pub(super) fn binary_replacement_anomaly(
     diff.files
         .iter()
         .filter(|file| matches!(file.status, FileStatus::Changed))
-        .filter(|file| member_type(file).is_some_and(|t| t.is_binary()))
+        .filter(|file| member_type(file).is_some_and(|t| t.is_executable_code()))
         .filter_map(|file| {
             use cleave::types::Scope;
 
@@ -1485,7 +1485,7 @@ pub(super) fn executable_capability_escalation(
 /// native object files as well as executables, so user-facing text must call
 /// these binary members rather than claiming every one is executable.
 pub(super) fn is_compiled_binary_file_type(file_type: filefacts::FileType) -> bool {
-    file_type.is_binary()
+    file_type.is_executable_code()
 }
 
 /// Conservative fallback when member extraction is unavailable. This uses
