@@ -429,7 +429,18 @@ pub fn run_transition(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn()?;
+    let mut child = {
+        // macOS has no pipe2(O_CLOEXEC): std creates each pipe and then sets
+        // close-on-exec separately. Concurrent spawns can inherit another
+        // scanner's pipe in that window, preventing EOF until that unrelated
+        // scanner exits. Serialize pipe creation through exec, not execution.
+        #[cfg(target_os = "macos")]
+        let _spawn_guard = {
+            static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            SPAWN_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+        };
+        command.spawn()?
+    };
     let stdout = child.stdout.take().context("missing stdout pipe")?;
     let stderr = child.stderr.take().context("missing stderr pipe")?;
     std::thread::scope(|scope| {

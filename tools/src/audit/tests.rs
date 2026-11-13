@@ -766,6 +766,16 @@ esac
             let code = execute(&args, &mut output).unwrap();
             (code, output)
         });
+        // Release the detector processes even if an assertion panics, so the
+        // scoped thread can finish instead of waiting for their timeout.
+        struct ReleasesOnDrop<'a>(&'a Path, &'a Path);
+        impl Drop for ReleasesOnDrop<'_> {
+            fn drop(&mut self) {
+                let _ = fs::write(self.0, "go");
+                let _ = fs::write(self.1, "go");
+            }
+        }
+        let _releases = ReleasesOnDrop(&release_bd, &release_da);
         let started = Instant::now();
         let mut changed = false;
         loop {
@@ -776,7 +786,11 @@ esac
                 .filter_map(|line| serde_json::from_str(line).ok())
                 .collect();
             if records.len() >= 2 && !changed {
-                assert_eq!(records[1]["issue"], "FP-NET");
+                assert_eq!(
+                    records[1]["issue"], "FP-NET",
+                    "unexpected record: {}",
+                    records[1]
+                );
                 // The remaining runs must use captured bytes after inputs and detector change.
                 for artifact in load_artifacts(root.path()).unwrap() {
                     for sample in [artifact.before, artifact.during, artifact.after]
@@ -791,7 +805,11 @@ esac
                 changed = true;
             }
             if records.len() >= 3 {
-                assert_eq!(records[2]["issue"], "MISS");
+                assert_eq!(
+                    records[2]["issue"], "MISS",
+                    "unexpected record: {}",
+                    records[2]
+                );
                 fs::write(&release_da, "go").unwrap();
                 break;
             }
