@@ -43,22 +43,14 @@ struct Cli {
     #[arg(long, global = true)]
     offline: bool,
 
-    /// Insist on Atomdrift Uplink: zero-hour rules the moment they clear QA,
-    /// remote dependency verdicts, and a default hosted LLM endpoint. A
-    /// computer that holds a token (`ISOTOPE13_TOKEN`, or the one saved when
-    /// it was connected) uses Uplink without this flag. With it, a computer
-    /// that holds none is connected — a terminal shows a code to approve at
-    /// dash.isotope13.io — and a refused token stops the run instead of
-    /// falling back to the open-source rules. Ignored under `--offline`. Also
-    /// settable via `ATOMDRIFT_UPLINK=1`; `=0` keeps the open-source rules.
-    #[arg(
-        long,
-        alias = "enriched",
-        global = true,
-        env = "ATOMDRIFT_UPLINK",
-        value_parser = clap::builder::FalseyValueParser::new()
-    )]
-    uplink: bool,
+    /// Rule feed for this run: zero-day, supporter, or oss-delayed. Overrides
+    /// the feed saved by `cleave feed <name>` (shared with scan). A paid feed
+    /// with no token held connects this computer on a terminal — a code to
+    /// approve at dash.isotope13.io — and a refusal stops the run instead of
+    /// falling back. Ignored under `--offline`. Also settable via
+    /// `ATOMDRIFT_FEED`.
+    #[arg(long, global = true, value_enum, env = "ATOMDRIFT_FEED")]
+    feed: Option<cleave::feed::Feed>,
 
     /// When to colorize output. `auto` (the default) colors only when stdout
     /// is a terminal; `always` forces color through pipes (e.g. into a pager
@@ -367,16 +359,23 @@ fn run(cli: &Cli) -> anyhow::Result<Outcome> {
 /// the attempt and moves on, so an offline host degrades to whatever it has
 /// rather than blocking.
 fn refresh_rules(cli: &Cli) -> anyhow::Result<()> {
-    cleave::enriched::resolve(!cli.offline && cli.uplink)?;
-    if !cli.uplink && uplink_opted_out() {
-        cleave::enriched::set_enabled(false);
-    }
+    // The rule feed — `--feed`, the saved choice, or what a held token
+    // implies — decided before anything resolves a rules tree.
+    cleave::feed::resolve(cli.feed)?;
     if cli.offline {
-        let installed = cleave::traits_repo::installed_dir(true);
-        if cleave::enriched::enabled() && cleave::rule_update::installed(&installed).is_none() {
-            cleave::enriched::set_enabled(false);
+        // Nothing may be fetched, so a feed whose rules are not installed
+        // cannot be used; an unnamed one yields to the open-source rules.
+        let current = cleave::feed::current();
+        let installed = cleave::traits_repo::installed_dir(current);
+        if current.needs_token()
+            && !cleave::feed::explicit()
+            && cleave::rule_update::installed(&installed).is_none()
+        {
+            cleave::feed::fall_back(&[], false, "offline, and its rules are not installed");
         }
-    } else if cleave::enriched::required() {
+    } else {
+        // A paid feed named with `--feed` needs a token before the refresh
+        // below would ask for one mid-download; asked here, once.
         cleave::rule_update::sign_in().map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     scan::traits_repo::prepare_runtime_env();
@@ -390,7 +389,7 @@ fn refresh_rules(cli: &Cli) -> anyhow::Result<()> {
         scan::Mode::default(),
         cli.format == Format::Terminal,
     ) {
-        if cleave::enriched::required() {
+        if cleave::feed::explicit() {
             return Err(e);
         }
         eprintln!("isomer: rules refresh failed, using the installed rules: {e:#}");
@@ -405,18 +404,6 @@ fn refresh_rules(cli: &Cli) -> anyhow::Result<()> {
         eprintln!("isomer: ML model unavailable, risk scoring skipped: {e:#}");
     }
     Ok(())
-}
-
-/// Whether `ATOMDRIFT_UPLINK` explicitly opted out (`0`, `false`, `no`, `off`),
-/// so `--uplink`'s env switch disables a held token even before cleave's own
-/// `ENABLE_ENV` advances in `Cargo.lock`.
-fn uplink_opted_out() -> bool {
-    std::env::var("ATOMDRIFT_UPLINK").is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off" | "n" | "f"
-        )
-    })
 }
 
 #[cfg(test)]
@@ -466,15 +453,20 @@ mod tests {
     }
 
     #[test]
-    fn uplink_and_legacy_enriched_alias_parse() {
+    fn feed_flag_parses_and_coexists_with_offline() {
         use clap::Parser;
-        for flag in ["--uplink", "--enriched"] {
-            let cli = Cli::try_parse_from(["isomer", flag, "fs", "a", "b"]).unwrap();
-            assert!(cli.uplink, "{flag}");
+        for (name, feed) in [
+            ("zero-day", cleave::feed::Feed::ZeroDay),
+            ("supporter", cleave::feed::Feed::Supporter),
+            ("oss-delayed", cleave::feed::Feed::OssDelayed),
+        ] {
+            let cli = Cli::try_parse_from(["isomer", "--feed", name, "fs", "a", "b"]).unwrap();
+            assert_eq!(cli.feed, Some(feed), "{name}");
         }
-        // `--offline` and `--uplink` do not conflict at parse time so
-        // `ATOMDRIFT_UPLINK=1` in the environment never breaks `--offline`.
-        let cli = Cli::try_parse_from(["isomer", "--offline", "--uplink", "fs", "a", "b"]).unwrap();
-        assert!(cli.offline && cli.uplink);
+        // `--offline` and `--feed` do not conflict at parse time so
+        // `ATOMDRIFT_FEED` in the environment never breaks `--offline`.
+        let cli = Cli::try_parse_from(["isomer", "--offline", "--feed", "zero-day", "fs", "a", "b"])
+            .unwrap();
+        assert!(cli.offline && cli.feed.is_some());
     }
 }
