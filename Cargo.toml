@@ -190,6 +190,8 @@ incremental = true
 
 [patch.crates-io]
 # Inherited from a sibling by update-deps: [patch] applies only in the root.
+regex-syntax = { git = "https://github.com/tstromberg/regex" }
+# Inherited from a sibling by update-deps: [patch] applies only in the root.
 tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
 # Mirrors cleave's patch section — patches only apply at the workspace root,
 # so isomer must carry them itself. tree-sitter 0.28 is unpublished
