@@ -465,8 +465,9 @@ mod tests {
         }
         // `--offline` and `--feed` do not conflict at parse time so
         // `ATOMDRIFT_FEED` in the environment never breaks `--offline`.
-        let cli = Cli::try_parse_from(["isomer", "--offline", "--feed", "zero-day", "fs", "a", "b"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["isomer", "--offline", "--feed", "zero-day", "fs", "a", "b"])
+                .unwrap();
         assert!(cli.offline && cli.feed.is_some());
     }
 }
