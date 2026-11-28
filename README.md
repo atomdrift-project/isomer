@@ -90,10 +90,10 @@ baseline. An unavailable lookup is reported as unknown, not as a missing or
 clean package. Use `--no-follow` to skip these checks, or `--offline` to prohibit
 all network access. `--deps` additionally fetches and analyzes newly added
 dependency payloads; registry following itself does not download those payloads.
-`--feed zero-day|supporter|oss-delayed` (or `ATOMDRIFT_FEED`) picks the rule
-feed; a paid feed gets rules the moment they clear QA or 72 hours after
-(`ISOTOPE13_TOKEN` supplies a token non-interactively; `--offline` keeps
-everything local). `cleave feed <name>` saves the choice for every Atomdrift tool.
+`--feed` (or `ISOMER_FEED`) picks the rule feed: `auto` (the default, the best
+your plan opens), `zero-day`, `supporter` or `oss`. A paid feed gets rules the
+moment they clear QA or 48 hours after. `isomer login` signs this computer in
+(shared with every Atomdrift tool); in CI, `ISOMER_TOKEN` supplies the token.
 
 Dependency additions alone remain Medium. With `--deps`, changed dependency
 versions and single-removal/single-addition replacements within one manifest

@@ -15,7 +15,7 @@ All notable changes to isomer. Versions follow [semantic versioning](https://sem
 - Treat registry takedowns and npm security tombstones as malware, whatever content change came with them.
 - Check registry metadata for packages and declared dependencies by default; `--no-follow` skips it.
 - Profile changed and replaced dependencies with `--deps`, raising new categories or higher risk to High.
-- Choose a rule feed with `--feed` (zero-day, supporter or oss-delayed); paid feeds connect to Atomdrift on first use.
+- Choose a rule feed with `--feed` (auto, zero-day, supporter or oss), and sign in with `isomer login`; CI supplies `ISOMER_TOKEN`.
 - Accept a comma-separated chain of LLM endpoints, failing over when one is unusable.
 - Name the MITRE ATT&CK and MBC techniques a change moved, without network access.
 - Pair Composer Git exports whose wrapper directories differ but name the same package.

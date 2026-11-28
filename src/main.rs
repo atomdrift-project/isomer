@@ -43,14 +43,19 @@ struct Cli {
     #[arg(long, global = true)]
     offline: bool,
 
-    /// Rule feed for this run: zero-day, supporter, or oss-delayed. Overrides
-    /// the feed saved by `cleave feed <name>` (shared with scan). A paid feed
-    /// with no token held connects this computer on a terminal — a code to
-    /// approve at dash.isotope13.io — and a refusal stops the run instead of
-    /// falling back. Ignored under `--offline`. Also settable via
-    /// `ATOMDRIFT_FEED`.
-    #[arg(long, global = true, value_enum, env = "ATOMDRIFT_FEED")]
-    feed: Option<cleave::feed::Feed>,
+    /// Rule feed: auto (the best your plan opens), zero-day, supporter, or
+    /// oss. A named paid feed asks you to sign in on a terminal when this
+    /// computer is not signed in; one your plan does not include stops the
+    /// run instead of falling back. Also settable via `ISOMER_FEED`.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        env = "ISOMER_FEED",
+        default_value_t,
+        value_name = "FEED"
+    )]
+    feed: cleave::feed::Choice,
 
     /// When to colorize output. `auto` (the default) colors only when stdout
     /// is a terminal; `always` forces color through pipes (e.g. into a pager
@@ -220,9 +225,14 @@ enum Command {
         /// New (head) image reference.
         new: String,
     },
+    /// Sign in to Atomdrift, for the zero-day and supporter feeds. Shared
+    /// with atomscan, cleave and hood.
+    Login,
 }
 
 fn main() -> ExitCode {
+    // CI supplies a sign-in as `ISOMER_TOKEN`, isomer's own variable.
+    cleave::feed::set_token_env("ISOMER_TOKEN");
     Diagnostics::install();
     disable_analysis_cache_if_requested();
     let cli = Cli::parse();
@@ -316,6 +326,9 @@ fn disable_analysis_cache_if_requested() {
 /// Runs the selected verb: its report, and whether the delta is clean at
 /// `--fail-on`.
 fn run(cli: &Cli) -> anyhow::Result<Outcome> {
+    if matches!(cli.command, Command::Login) {
+        return login(cli);
+    }
     refresh_rules(cli)?;
     let opts = Options::from(cli);
     match &cli.command {
@@ -344,7 +357,23 @@ fn run(cli: &Cli) -> anyhow::Result<Outcome> {
         Command::Git { .. } => anyhow::bail!("`isomer git` is not implemented yet"),
         Command::Purl { old, new } => fetch::purl(old, new, &opts),
         Command::Oci { old, new } => fetch::oci(old, new, &opts),
+        Command::Login => login(cli),
     }
+}
+
+/// `isomer login`: sign this computer in. The feed is resolved first so the
+/// sign-in opens the console that sells it.
+fn login(cli: &Cli) -> anyhow::Result<Outcome> {
+    anyhow::ensure!(
+        !cli.offline,
+        "`isomer login` needs the network, which --offline forbids"
+    );
+    cleave::feed::resolve(cli.feed)?;
+    cleave::rule_update::login()?;
+    Ok(Outcome {
+        report: String::new(),
+        clean: true,
+    })
 }
 
 /// Bring cleave's trait bundle current before the first comparison, exactly the
@@ -359,8 +388,8 @@ fn run(cli: &Cli) -> anyhow::Result<Outcome> {
 /// the attempt and moves on, so an offline host degrades to whatever it has
 /// rather than blocking.
 fn refresh_rules(cli: &Cli) -> anyhow::Result<()> {
-    // The rule feed — `--feed`, the saved choice, or what a held token
-    // implies — decided before anything resolves a rules tree.
+    // The rule feed — `--feed`, else the best the sign-in opens — decided
+    // before anything resolves a rules tree.
     cleave::feed::resolve(cli.feed)?;
     if cli.offline {
         // Nothing may be fetched, so a feed whose rules are not installed
@@ -455,19 +484,31 @@ mod tests {
     #[test]
     fn feed_flag_parses_and_coexists_with_offline() {
         use clap::Parser;
-        for (name, feed) in [
-            ("zero-day", cleave::feed::Feed::ZeroDay),
-            ("supporter", cleave::feed::Feed::Supporter),
-            ("oss-delayed", cleave::feed::Feed::OssDelayed),
+        use cleave::feed::Choice;
+        let cli = Cli::try_parse_from(["isomer", "fs", "a", "b"]).unwrap();
+        assert_eq!(cli.feed, Choice::Auto, "auto is the default");
+        for (name, choice) in [
+            ("auto", Choice::Auto),
+            ("zero-day", Choice::ZeroDay),
+            ("supporter", Choice::Supporter),
+            ("oss", Choice::Oss),
         ] {
             let cli = Cli::try_parse_from(["isomer", "--feed", name, "fs", "a", "b"]).unwrap();
-            assert_eq!(cli.feed, Some(feed), "{name}");
+            assert_eq!(cli.feed, choice, "{name}");
         }
+        assert!(Cli::try_parse_from(["isomer", "--feed", "oss-delayed", "fs", "a", "b"]).is_err());
         // `--offline` and `--feed` do not conflict at parse time so
-        // `ATOMDRIFT_FEED` in the environment never breaks `--offline`.
+        // `ISOMER_FEED` in the environment never breaks `--offline`.
         let cli =
             Cli::try_parse_from(["isomer", "--offline", "--feed", "zero-day", "fs", "a", "b"])
                 .unwrap();
-        assert!(cli.offline && cli.feed.is_some());
+        assert!(cli.offline && cli.feed == Choice::ZeroDay);
+    }
+
+    #[test]
+    fn login_parses() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["isomer", "--feed", "zero-day", "login"]).unwrap();
+        assert!(matches!(cli.command, Command::Login));
     }
 }
